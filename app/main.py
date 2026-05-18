@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+import redis.asyncio as aioredis
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
@@ -10,6 +11,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.v1.router import router as api_v1_router
+from app.api.ws.voxa import router as ws_router
 from app.config import get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
@@ -29,10 +31,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.db_engine = engine
     app.state.db_session_factory = build_session_factory(engine)
+
+    redis_client: aioredis.Redis = aioredis.from_url(
+        settings.REDIS_URL, decode_responses=True
+    )
+    app.state.redis = redis_client
+
     logger.info("Forgefy backend starting up (env=%s)", settings.APP_ENV)
-    # Redis async client will be wired here in Step 5
     yield
     logger.info("Forgefy backend shutting down")
+    await redis_client.aclose()
     await engine.dispose()
 
 
@@ -68,10 +76,7 @@ def create_app() -> FastAPI:
 
     # ── Routers ───────────────────────────────────────────────────────────────
     app.include_router(api_v1_router, prefix="/api/v1")
-
-    # WebSocket gateway registered in Step 5
-    # from app.api.ws.voxa import router as ws_router
-    # app.include_router(ws_router)
+    app.include_router(ws_router)
 
     # ── Ops endpoints ─────────────────────────────────────────────────────────
     @app.get("/health", tags=["ops"], summary="Liveness probe")
