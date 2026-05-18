@@ -5,16 +5,15 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from slowapi.util import get_remote_address
 
 from app.api.v1.router import router as api_v1_router
 from app.config import get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
+from app.core.rate_limit import limiter
 from app.db.session import build_engine, build_session_factory
 
 configure_logging()
@@ -50,8 +49,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # ── Rate limiting ─────────────────────────────────────────────────────────
-    limiter = Limiter(key_func=get_remote_address, default_limits=["300/minute"])
+    # ── Rate limiting (shared singleton from core.rate_limit) ─────────────────
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
     app.add_middleware(SlowAPIMiddleware)

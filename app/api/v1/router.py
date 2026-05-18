@@ -1,15 +1,11 @@
-"""Aggregated v1 API router.
-
-Auth, session, and blueprint sub-routers are registered here
-as they are implemented in subsequent build steps.
-"""
+"""Aggregated v1 API router."""
 from fastapi import APIRouter
+
+from app.api.v1 import auth
 
 router = APIRouter()
 
-# Step 3 — Auth
-# from app.api.v1 import auth
-# router.include_router(auth.router, prefix="/auth", tags=["auth"])
+router.include_router(auth.router, prefix="/auth", tags=["auth"])
 
 # Step 4 — Sessions
 # from app.api.v1 import sessions
