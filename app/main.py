@@ -15,6 +15,7 @@ from app.api.v1.router import router as api_v1_router
 from app.config import get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
+from app.db.session import build_engine, build_session_factory
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -23,10 +24,17 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan — startup and shutdown hooks."""
-    logger.info("Forgefy backend starting up")
-    # DB engine and Redis pool will be initialised here in Steps 2 & 5
+    settings = get_settings()
+    engine = build_engine(
+        settings.DATABASE_URL, echo=(settings.APP_ENV == "development")
+    )
+    app.state.db_engine = engine
+    app.state.db_session_factory = build_session_factory(engine)
+    logger.info("Forgefy backend starting up (env=%s)", settings.APP_ENV)
+    # Redis async client will be wired here in Step 5
     yield
     logger.info("Forgefy backend shutting down")
+    await engine.dispose()
 
 
 def create_app() -> FastAPI:
