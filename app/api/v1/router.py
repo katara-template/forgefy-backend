@@ -1,15 +1,12 @@
 """Aggregated v1 API router."""
 from fastapi import APIRouter
 
-from app.api.v1 import auth
+from app.api.v1 import auth, sessions
 
 router = APIRouter()
 
 router.include_router(auth.router, prefix="/auth", tags=["auth"])
-
-# Step 4 — Sessions
-# from app.api.v1 import sessions
-# router.include_router(sessions.router, prefix="/voxa/session", tags=["sessions"])
+router.include_router(sessions.router, prefix="/voxa/session", tags=["sessions"])
 
 # Step 8 — Blueprints
 # from app.api.v1 import blueprints
