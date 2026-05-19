@@ -108,15 +108,31 @@ class TranscriptionSession:
         text = alternatives[0].transcript
         if not text:
             return
+        is_final = bool(message.is_final)
         payload = json.dumps(
             {
                 "type": "transcript",
                 "session_id": self._session_id,
                 "text": text,
-                "is_final": bool(message.is_final),
+                "is_final": is_final,
             }
         )
         try:
             self._redis.publish(self._channel, payload)
         except Exception as exc:
             logger.warning("Redis publish failed session=%s: %s", self._session_id, exc)
+            return
+
+        # Enqueue the LangGraph extraction pipeline for every final segment.
+        if is_final:
+            try:
+                from app.workers.extraction_worker import extract_requirements
+                extract_requirements.apply_async(
+                    args=[self._session_id, text],
+                    queue="meeting.transcribe",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to enqueue extraction for session=%s: %s",
+                    self._session_id, exc
+                )
