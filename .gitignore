@@ -6,7 +6,8 @@ __pycache__/
 *.egg
 *.egg-info/
 dist/
-build/
+# Exclude top-level build/ artifacts but keep app/build/ source package
+/build/
 .eggs/
 
 # Virtual environments

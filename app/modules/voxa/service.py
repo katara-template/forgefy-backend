@@ -97,8 +97,11 @@ class VoxaService:
         session = await self._sm.transition(session_id, SessionStatus.PROCESSING)
         session.end_time = datetime.now(timezone.utc)
 
-        # TODO (Step 8): blueprint_worker.generate_blueprint.delay(str(session_id))
-        logger.info("TODO: enqueue blueprint generation for session %s", session_id)
+        from app.workers.blueprint_worker import generate_blueprint
+        generate_blueprint.apply_async(
+            args=[str(session_id)],
+            queue="meeting.extract",
+        )
         return session
 
     async def get_session(

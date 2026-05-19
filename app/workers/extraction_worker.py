@@ -1,15 +1,19 @@
 """Extraction worker — runs the LangGraph agent pipeline on transcript segments.
 
 Receives finalized transcript text on the ``meeting.transcribe`` queue,
-runs the four-agent pipeline, and publishes each extraction event to
-Redis so the WS gateway can push ``featureDetected`` events to clients.
+runs the four-agent pipeline, publishes each extraction event to Redis
+(for real-time WS delivery), and persists each event to meeting_events
+(for blueprint aggregation in Step 8).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import uuid
 
 import redis as sync_redis
+from sqlalchemy.pool import NullPool
 
 from app.ai.pipeline import run_pipeline
 from app.config import get_settings
@@ -20,12 +24,38 @@ logger = logging.getLogger(__name__)
 _CHANNEL_PREFIX = "voxa:session:"
 
 
+async def _persist_events(
+    session_id: str, events: list[dict], database_url: str
+) -> None:
+    """Write extraction events to meeting_events inside an async session."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.db.models.meeting_event import MeetingEvent
+
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as db:
+            for event in events:
+                db.add(
+                    MeetingEvent(
+                        session_id=uuid.UUID(session_id),
+                        event_type=event["sub_state"],
+                        payload=event["payload"],
+                    )
+                )
+            await db.commit()
+    finally:
+        await engine.dispose()
+
+
 @celery_app.task(name="app.workers.extraction_worker.extract_requirements")
 def extract_requirements(session_id: str, transcript_segment: str) -> None:
     """Run the LangGraph pipeline on a finalized transcript segment.
 
-    Each extraction event (FEATURE_FOUND, QUESTION_FOUND, etc.) is published
-    to the session's Redis channel so the WS gateway forwards it to browsers.
+    Each extraction event (FEATURE_FOUND, QUESTION_FOUND, etc.) is:
+    - Published to the session's Redis channel for real-time WS delivery
+    - Persisted to meeting_events for blueprint aggregation
     """
     settings = get_settings()
     events = run_pipeline(
@@ -38,6 +68,7 @@ def extract_requirements(session_id: str, transcript_segment: str) -> None:
         logger.debug("No events extracted for session=%s", session_id)
         return
 
+    # Publish to Redis for real-time delivery.
     r = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
     channel = f"{_CHANNEL_PREFIX}{session_id}"
     try:
@@ -51,8 +82,12 @@ def extract_requirements(session_id: str, transcript_segment: str) -> None:
                 }
             )
             r.publish(channel, payload)
-            logger.debug(
-                "Published %s for session=%s", event["sub_state"], session_id
-            )
+            logger.debug("Published %s for session=%s", event["sub_state"], session_id)
     finally:
         r.close()
+
+    # Persist to DB for blueprint aggregation.
+    try:
+        asyncio.run(_persist_events(session_id, events, settings.DATABASE_URL))
+    except Exception as exc:
+        logger.warning("Failed to persist extraction events session=%s: %s", session_id, exc)
