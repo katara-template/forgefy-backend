@@ -72,11 +72,10 @@ class VoxaService:
                 payload={"action": "join", "user_id": str(user_id)},
             )
         )
-        # TODO (Step 9): dispatch connector bot
-        logger.info(
-            "TODO: dispatch %s connector for session %s",
-            session.platform.value,
-            session_id,
+        from app.workers.connector_worker import dispatch_connector
+        dispatch_connector.apply_async(
+            args=[str(session_id), session.platform.value, session.meeting_url],
+            queue="meeting.audio",
         )
         return session
 
