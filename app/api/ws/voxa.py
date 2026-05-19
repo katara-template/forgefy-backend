@@ -24,6 +24,10 @@ from pydantic import TypeAdapter, ValidationError
 from app.api.ws.connection_manager import manager
 from app.config import get_settings
 from app.core.security import decode_access_token
+from app.workers.transcription_worker import (
+    close_transcription_session,
+    process_audio_chunk,
+)
 from app.schemas.ws_events import (
     ClientEvent,
     EndMeetingEvent,
@@ -123,17 +127,22 @@ async def ws_voxa(
                 logger.info("WS joined session=%s user=%s", session_id, user_id_str)
 
             elif isinstance(event, StreamAudioEvent):
-                # Audio chunks are forwarded to Redis so the transcription worker picks them up.
-                # The worker consumes from the Celery queue, not this channel — see Step 6.
                 if session_id is None:
                     await manager.send_to(ws, {"type": "error", "code": "not_joined", "detail": "Send joinSession first"})
                     continue
-                # TODO Step 6 — enqueue audio chunk to Celery meeting.audio queue
+                process_audio_chunk.apply_async(
+                    args=[str(session_id), event.chunk],
+                    queue="meeting.audio",
+                )
 
             elif isinstance(event, EndMeetingEvent):
                 if session_id is None:
                     await manager.send_to(ws, {"type": "error", "code": "not_joined", "detail": "Send joinSession first"})
                     continue
+                close_transcription_session.apply_async(
+                    args=[str(session_id)],
+                    queue="meeting.audio",
+                )
                 await manager.send_to(ws, {
                     "type": "meetingStatus",
                     "session_id": str(session_id),
