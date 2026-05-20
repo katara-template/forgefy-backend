@@ -25,9 +25,12 @@ _CHANNEL_PREFIX = "voxa:session:"
 
 
 async def _persist_events(
-    session_id: str, events: list[dict], database_url: str
+    session_id: str,
+    events: list[dict],
+    database_url: str,
+    transcript_segment: str = "",
 ) -> None:
-    """Write extraction events to meeting_events inside an async session."""
+    """Write extraction events (and transcript segment) to meeting_events."""
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     from app.db.models.meeting_event import MeetingEvent
@@ -36,6 +39,14 @@ async def _persist_events(
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with factory() as db:
+            # Always store the raw transcript segment so the blueprint generator
+            # can use it as a fallback if extraction yielded nothing.
+            if transcript_segment:
+                db.add(MeetingEvent(
+                    session_id=uuid.UUID(session_id),
+                    event_type="transcript.segment",
+                    payload={"text": transcript_segment},
+                ))
             for event in events:
                 db.add(
                     MeetingEvent(
@@ -88,6 +99,8 @@ def extract_requirements(session_id: str, transcript_segment: str) -> None:
 
     # Persist to DB for blueprint aggregation.
     try:
-        asyncio.run(_persist_events(session_id, events, settings.DATABASE_URL))
+        asyncio.run(
+            _persist_events(session_id, events, settings.DATABASE_URL, transcript_segment)
+        )
     except Exception as exc:
         logger.warning("Failed to persist extraction events session=%s: %s", session_id, exc)

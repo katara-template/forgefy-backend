@@ -47,7 +47,15 @@ services:
       CELERY_RESULT_BACKEND: redis://redis:6379/2
     volumes:
       - .:/app
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: >
+      sh -c "
+        if [ -z \"$(ls -A alembic/versions/ 2>/dev/null)\" ]; then
+          echo 'No migrations found — generating initial migration...' &&
+          alembic revision --autogenerate -m 'initial';
+        fi &&
+        alembic upgrade head &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      "
 
   worker:
     build: .

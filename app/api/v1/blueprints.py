@@ -39,6 +39,36 @@ async def _get_owned_blueprint(
     return blueprint
 
 
+@router.get("/session/{session_id}", response_model=BlueprintOut)
+async def get_blueprint_by_session(
+    session_id: uuid.UUID,
+    db: DBSession,
+    user: CurrentUser,
+) -> BlueprintOut:
+    """Return the blueprint for a session (ownership-checked)."""
+    sess_result = await db.execute(
+        select(MeetingSession).where(
+            MeetingSession.id == session_id,
+            MeetingSession.user_id == user.id,
+        )
+    )
+    session = sess_result.scalar_one_or_none()
+    if session is None:
+        raise NotFoundError(f"Session {session_id} not found")
+
+    result = await db.execute(
+        select(Blueprint)
+        .where(Blueprint.session_id == session_id)
+        .order_by(Blueprint.created_at.desc())
+        .limit(1)
+    )
+    blueprint = result.scalar_one_or_none()
+    if blueprint is None:
+        raise NotFoundError(f"No blueprint found for session {session_id}")
+
+    return BlueprintOut.model_validate(blueprint)
+
+
 @router.get("/{blueprint_id}", response_model=BlueprintOut)
 async def get_blueprint(
     blueprint_id: uuid.UUID,

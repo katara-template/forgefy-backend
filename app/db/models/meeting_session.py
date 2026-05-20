@@ -38,7 +38,7 @@ class MeetingSession(Base):
         default=SessionStatus.WAITING,
     )
     platform: Mapped[Platform] = mapped_column(
-        Enum(Platform, name="platform_type"),
+        Enum(Platform, name="platform_type", values_callable=lambda e: [m.value for m in e]),
         nullable=False,
     )
     meeting_url: Mapped[str | None] = mapped_column(Text(), nullable=True)

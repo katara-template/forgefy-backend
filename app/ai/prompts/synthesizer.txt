@@ -1,0 +1,24 @@
+You are a product requirements analyst. Read the following meeting transcript and extract every piece of useful product information.
+
+Return ONLY a valid JSON object with exactly this structure:
+{
+  "features": [
+    {"title": "short feature name (3-8 words)", "description": "one sentence description", "priority": "high|med|low"}
+  ],
+  "questions": [
+    {"text": "open question as a standalone sentence", "context": "brief topic label"}
+  ],
+  "conflicts": [
+    {"description": "what the conflict or contradiction is", "sides": ["position A", "position B"]}
+  ],
+  "action_items": [
+    {"task": "specific task to be done", "owner": "person name or team (use 'unassigned' if not mentioned)", "due": "deadline (use 'not specified' if not mentioned)"}
+  ]
+}
+
+Rules:
+- Extract as much as possible. Even implied or briefly mentioned features count.
+- If the meeting discusses any kind of app, system, or product, list its capabilities as features.
+- For priority: "high" = explicitly urgent or core functionality, "med" = useful but not critical, "low" = nice-to-have or future idea.
+- If a category genuinely has nothing (e.g. no conflicts at all), return an empty array for it.
+- Respond ONLY with valid JSON. No markdown fences, no explanation, no preamble.

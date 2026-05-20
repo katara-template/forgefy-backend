@@ -3,6 +3,10 @@
 Reads FEATURE_FOUND / QUESTION_FOUND / CONFLICT_FOUND / ACTION_ITEM_FOUND
 events from meeting_events, structures them into a JSON document, saves a
 Blueprint row, and transitions the session to BLUEPRINT_READY.
+
+If no extraction events exist (extraction pipeline failed or produced nothing),
+falls back to synthesising from raw transcript.segment events stored by the
+extraction worker.
 """
 from __future__ import annotations
 
@@ -57,7 +61,10 @@ class BlueprintAggregator:
         )
         events = list(events_result.scalars())
 
-        json_output = _build_blueprint_json(session, events)
+        if not events:
+            json_output = await self._synthesize_from_segments(session_id, session)
+        else:
+            json_output = _build_blueprint_json(session, events)
 
         blueprint = Blueprint(
             session_id=session_id,
@@ -80,6 +87,64 @@ class BlueprintAggregator:
             len(json_output.get("features", [])),
         )
         return blueprint
+
+    async def _synthesize_from_segments(
+        self,
+        session_id: uuid.UUID,
+        session: MeetingSession,
+    ) -> dict[str, Any]:
+        """Fallback: concatenate stored transcript segments and run single-call synthesis."""
+        from app.config import get_settings
+        from app.ai.agents.synthesizer import run as synthesize
+
+        segs_result = await self._db.execute(
+            select(MeetingEvent)
+            .where(
+                MeetingEvent.session_id == session_id,
+                MeetingEvent.event_type == "transcript.segment",
+            )
+            .order_by(MeetingEvent.timestamp.asc())
+        )
+        segments = list(segs_result.scalars())
+
+        if not segments:
+            logger.warning("No transcript segments found for session=%s — blueprint will be empty", session_id)
+            return _build_blueprint_json(session, [])
+
+        transcript = " ".join(
+            s.payload.get("text", "") for s in segments if s.payload
+        ).strip()
+
+        if not transcript:
+            return _build_blueprint_json(session, [])
+
+        logger.info(
+            "Synthesising blueprint from %d segments (%d chars) session=%s",
+            len(segments), len(transcript), session_id,
+        )
+        settings = get_settings()
+        try:
+            events = synthesize(transcript, settings.ANTHROPIC_API_KEY, settings.ANTHROPIC_MODEL)
+        except Exception as exc:
+            logger.error("Synthesis failed for session=%s: %s", session_id, exc, exc_info=True)
+            return _build_blueprint_json(session, [])
+
+        features = [e["payload"] for e in events if e["sub_state"] == "FEATURE_FOUND"]
+        questions = [e["payload"] for e in events if e["sub_state"] == "QUESTION_FOUND"]
+        conflicts = [e["payload"] for e in events if e["sub_state"] == "CONFLICT_FOUND"]
+        action_items = [e["payload"] for e in events if e["sub_state"] == "ACTION_ITEM_FOUND"]
+
+        return {
+            "version": "1.0",
+            "session_id": str(session_id),
+            "session_platform": session.platform.value,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "features": features,
+            "open_questions": questions,
+            "conflicts": conflicts,
+            "action_items": action_items,
+            "requirements_count": len(features) + len(questions) + len(conflicts) + len(action_items),
+        }
 
 
 def _build_blueprint_json(

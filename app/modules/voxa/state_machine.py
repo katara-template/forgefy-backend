@@ -21,7 +21,7 @@ from app.db.models.meeting_event import MeetingEvent
 from app.db.models.meeting_session import MeetingSession
 
 _TRANSITIONS: dict[SessionStatus, frozenset[SessionStatus]] = {
-    SessionStatus.WAITING: frozenset({SessionStatus.JOINING}),
+    SessionStatus.WAITING: frozenset({SessionStatus.JOINING, SessionStatus.LISTENING, SessionStatus.PROCESSING}),
     SessionStatus.JOINING: frozenset({SessionStatus.LISTENING, SessionStatus.PROCESSING}),
     SessionStatus.LISTENING: frozenset({SessionStatus.PROCESSING}),
     SessionStatus.PROCESSING: frozenset({SessionStatus.BLUEPRINT_READY}),

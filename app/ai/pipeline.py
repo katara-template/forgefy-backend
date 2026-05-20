@@ -128,4 +128,9 @@ def run_pipeline(transcript: str, api_key: str, model: str) -> list[dict]:
             "errors": [],
         }
     )
-    return final_state.get("events", []) if final_state else []
+    if not final_state:
+        return []
+    errors = final_state.get("errors", [])
+    if errors:
+        logger.error("Pipeline agent errors: %s", errors)
+    return final_state.get("events", [])

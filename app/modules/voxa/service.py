@@ -55,7 +55,11 @@ class VoxaService:
         session_id: uuid.UUID,
         user_id: uuid.UUID,
     ) -> MeetingSession:
-        """Transition to JOINING and schedule the platform connector bot."""
+        """Transition to JOINING and schedule the platform connector bot.
+
+        For physical sessions the bot is not dispatched — the browser streams
+        audio directly via WebSocket instead.
+        """
         await self._require_owned(session_id, user_id)
 
         session = await self._sm.transition(
@@ -72,11 +76,36 @@ class VoxaService:
                 payload={"action": "join", "user_id": str(user_id)},
             )
         )
-        from app.workers.connector_worker import dispatch_connector
-        dispatch_connector.apply_async(
-            args=[str(session_id), session.platform.value, session.meeting_url],
-            queue="meeting.audio",
+        if session.platform != Platform.PHYSICAL:
+            from app.workers.connector_worker import dispatch_connector
+            dispatch_connector.apply_async(
+                args=[str(session_id), session.platform.value, session.meeting_url],
+                queue="meeting.audio",
+            )
+        return session
+
+    async def start_live_transcription(
+        self,
+        session_id: uuid.UUID,
+        user_id: uuid.UUID,
+    ) -> MeetingSession:
+        """Transition a physical session to LISTENING so the browser can stream audio.
+
+        Only valid for physical sessions in WAITING state.
+        """
+        session = await self._require_owned(session_id, user_id)
+
+        if session.platform != Platform.PHYSICAL:
+            raise ValidationError("Live transcription is only available for physical sessions.")
+        if session.status != SessionStatus.WAITING:
+            raise ValidationError("Session is not in WAITING state.")
+
+        session = await self._sm.transition(
+            session_id,
+            SessionStatus.LISTENING,
+            extra_payload={"initiated_by": str(user_id)},
         )
+        session.start_time = datetime.now(timezone.utc)
         return session
 
     async def end_session(
@@ -95,6 +124,11 @@ class VoxaService:
 
         session = await self._sm.transition(session_id, SessionStatus.PROCESSING)
         session.end_time = datetime.now(timezone.utc)
+
+        # Remove Recall.ai bot if one exists for this session (non-blocking task)
+        if session.platform != Platform.PHYSICAL:
+            from app.workers.connector_worker import recall_remove_bot
+            recall_remove_bot.apply_async(args=[str(session_id)], queue="meeting.audio")
 
         from app.workers.blueprint_worker import generate_blueprint
         generate_blueprint.apply_async(

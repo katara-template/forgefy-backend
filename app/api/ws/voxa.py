@@ -6,12 +6,18 @@ accepting the connection; invalid tokens are rejected with close code 4001.
 Client→Server events: joinSession, streamAudio, endMeeting, ping
 Server→Client events: transcript, featureDetected, blueprintReady, meetingStatus, pong, error
 
+Audio path (physical live sessions):
+  streamAudio chunks are decoded and forwarded directly to a per-session
+  DeepgramLiveSession.  Transcripts are published to Redis, which the Redis
+  subscriber task picks up and broadcasts to all connected browsers.
+
 Redis pub/sub bridge: workers PUBLISH to voxa:session:{session_id};
 this handler SUBSCRIBES and forwards each message to local WS connections.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import uuid
@@ -24,10 +30,7 @@ from pydantic import TypeAdapter, ValidationError
 from app.api.ws.connection_manager import manager
 from app.config import get_settings
 from app.core.security import decode_access_token
-from app.workers.transcription_worker import (
-    close_transcription_session,
-    process_audio_chunk,
-)
+from app.transcription.deepgram_live import DeepgramLiveSession
 from app.schemas.ws_events import (
     ClientEvent,
     EndMeetingEvent,
@@ -42,8 +45,11 @@ router = APIRouter()
 
 _client_event_adapter: TypeAdapter[ClientEvent] = TypeAdapter(ClientEvent)
 
-# Redis channel prefix — workers publish here, WS handler subscribes.
 _CHANNEL_PREFIX = "voxa:session:"
+
+# Per-process registry of active Deepgram live sessions (physical mic path).
+# Keyed by session_id UUID.
+_live_sessions: dict[uuid.UUID, DeepgramLiveSession] = {}
 
 
 def _channel(session_id: uuid.UUID) -> str:
@@ -86,7 +92,6 @@ async def ws_voxa(
     """Bidirectional WebSocket gateway for live meeting sessions."""
     settings = get_settings()
 
-    # Validate JWT before accepting — keeps unauthenticated sockets out.
     try:
         user_id_str = decode_access_token(token, settings)
     except Exception:
@@ -108,7 +113,6 @@ async def ws_voxa(
                 continue
 
             if isinstance(event, JoinSessionEvent):
-                # Allow re-join (idempotent) — cancel previous subscriber first.
                 if subscriber_task and not subscriber_task.done():
                     subscriber_task.cancel()
                 if session_id:
@@ -130,25 +134,43 @@ async def ws_voxa(
                 if session_id is None:
                     await manager.send_to(ws, {"type": "error", "code": "not_joined", "detail": "Send joinSession first"})
                     continue
-                process_audio_chunk.apply_async(
-                    args=[str(session_id), event.chunk],
-                    queue="meeting.audio",
-                )
+
+                # Create Deepgram session on first chunk (lazy init)
+                if session_id not in _live_sessions:
+                    dg_session = DeepgramLiveSession(
+                        session_id=str(session_id),
+                        api_key=settings.DEEPGRAM_API_KEY,
+                        model=settings.DEEPGRAM_MODEL,
+                        redis_url=settings.REDIS_URL,
+                    )
+                    try:
+                        await dg_session.start()
+                        _live_sessions[session_id] = dg_session
+                    except Exception as exc:
+                        logger.error("Failed to start Deepgram session=%s: %s", session_id, exc)
+                        await manager.send_to(ws, {"type": "error", "code": "deepgram_error", "detail": "Could not start transcription"})
+                        continue
+
+                try:
+                    audio_bytes = base64.b64decode(event.chunk)
+                    await _live_sessions[session_id].send(audio_bytes)
+                except Exception as exc:
+                    logger.warning("Audio send error session=%s: %s", session_id, exc)
 
             elif isinstance(event, EndMeetingEvent):
                 if session_id is None:
                     await manager.send_to(ws, {"type": "error", "code": "not_joined", "detail": "Send joinSession first"})
                     continue
-                close_transcription_session.apply_async(
-                    args=[str(session_id)],
-                    queue="meeting.audio",
-                )
+
+                dg_session = _live_sessions.pop(session_id, None)
+                if dg_session:
+                    await dg_session.finish()
+
                 await manager.send_to(ws, {
                     "type": "meetingStatus",
                     "session_id": str(session_id),
                     "status": "ending",
                 })
-                # TODO Step 9 — call VoxaService.end_session and dispatch to Celery
 
             elif isinstance(event, PingEvent):
                 await manager.send_to(ws, PongEvent().model_dump())
@@ -156,6 +178,12 @@ async def ws_voxa(
     except WebSocketDisconnect:
         logger.info("WS disconnected user=%s session=%s", user_id_str, session_id)
     finally:
+        # Clean up Deepgram session if still open
+        if session_id:
+            dg_session = _live_sessions.pop(session_id, None)
+            if dg_session:
+                await dg_session.finish()
+
         if subscriber_task and not subscriber_task.done():
             subscriber_task.cancel()
         if session_id:

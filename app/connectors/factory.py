@@ -5,18 +5,31 @@ from app.db.models.enums import Platform
 
 
 def get_connector(platform: Platform):
-    """Return an instantiated connector for platform.
+    """Return an instantiated connector for the given platform.
 
-    Raises NotImplementedError for platforms without a live implementation.
+    Meet, Zoom, and Teams use the Recall.ai cloud bot service.
+    Physical sessions have no bot (browser streams audio directly).
     """
-    if platform == Platform.MEET:
-        from app.connectors.meet import MeetConnector
-        return MeetConnector()
-    if platform == Platform.ZOOM:
-        from app.connectors.zoom import ZoomConnector
-        return ZoomConnector()
-    if platform == Platform.TEAMS:
-        from app.connectors.teams import TeamsConnector
-        return TeamsConnector()
-    # PHYSICAL sessions have no bot
-    raise NotImplementedError(f"No connector available for platform '{platform.value}'")
+    if platform == Platform.PHYSICAL:
+        raise NotImplementedError("Physical sessions have no bot connector.")
+
+    from app.config import get_settings
+    from app.connectors.recall import RecallConnector
+
+    settings = get_settings()
+    if not settings.RECALL_API_KEY:
+        raise RuntimeError(
+            "RECALL_API_KEY is not configured. Set it in the backend .env to enable live meeting bots."
+        )
+    if not settings.PUBLIC_API_BASE_URL:
+        raise RuntimeError(
+            "PUBLIC_API_BASE_URL is not configured. Set it to the publicly reachable URL of this API "
+            "so Recall.ai can deliver webhook events (e.g. https://yourapi.ngrok.io)."
+        )
+
+    return RecallConnector(
+        api_key=settings.RECALL_API_KEY,
+        region=settings.RECALL_REGION,
+        redis_url=settings.REDIS_URL,
+        webhook_base_url=settings.PUBLIC_API_BASE_URL,
+    )

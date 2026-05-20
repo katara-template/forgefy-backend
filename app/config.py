@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_API_KEY: str = ""
 
+    # Recall.ai
+    RECALL_API_KEY: str = ""
+    RECALL_REGION: str = "us-east-1"
+    RECALL_WORKSPACE_VERIFICATION_SECRET: str = ""
+    PUBLIC_API_BASE_URL: str = ""  # e.g. https://yourapi.ngrok.io
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def parse_cors_origins(cls, v: Any) -> list[str]:
