@@ -1,16 +1,19 @@
-"""Async Deepgram live transcription session — used directly by the WebSocket gateway.
+"""Async Deepgram live transcription — deepgram-sdk 6.x API.
 
-Audio chunks arrive from the browser via WebSocket, are forwarded here without
-any Celery intermediary, and transcripts are published to Redis so the existing
-Redis→WebSocket bridge delivers them to the browser in real time.
+Uses AsyncDeepgramClient.listen.v1.connect() (asynccontextmanager) to open
+a streaming WebSocket, then forwards audio bytes and publishes transcripts
+to Redis so the existing Redis→WebSocket bridge delivers them to the browser.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
 import redis.asyncio as aioredis
-from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
+from deepgram import AsyncDeepgramClient
+from deepgram.core.events import EventType
+from deepgram.listen.v1.types.listen_v1results import ListenV1Results
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +34,13 @@ class DeepgramLiveSession:
         self._api_key = api_key
         self._model = model
         self._redis_url = redis_url
+        self._cm = None
         self._connection = None
+        self._listen_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
     async def start(self) -> None:
-        dg = DeepgramClient(self._api_key)
-        self._connection = dg.listen.asynclive.v("1")
-        self._connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
-        options = LiveOptions(
+        dg = AsyncDeepgramClient(api_key=self._api_key)
+        self._cm = dg.listen.v1.connect(
             model=self._model,
             encoding="linear16",
             sample_rate=16000,
@@ -45,34 +48,52 @@ class DeepgramLiveSession:
             punctuate=True,
             endpointing=300,
         )
-        started = await self._connection.start(options)
-        if not started:
-            raise RuntimeError(f"Deepgram failed to start session={self._session_id}")
-        logger.info("Deepgram live session started session=%s model=%s", self._session_id, self._model)
+        self._connection = await self._cm.__aenter__()
+        self._connection.on(EventType.MESSAGE, self._on_transcript)
+        # Run the listener loop as a background task
+        self._listen_task = asyncio.create_task(self._connection.start_listening())
+        logger.info("Deepgram live started session=%s model=%s", self._session_id, self._model)
 
     async def send(self, audio_bytes: bytes) -> None:
         if self._connection is not None:
-            await self._connection.send(audio_bytes)
+            await self._connection.send_media(audio_bytes)
 
     async def finish(self) -> None:
         if self._connection is not None:
             try:
-                await self._connection.finish()
+                await self._connection.send_close_stream()
             except Exception as exc:
-                logger.warning("Deepgram finish error session=%s: %s", self._session_id, exc)
-            finally:
-                self._connection = None
-        logger.info("Deepgram live session finished session=%s", self._session_id)
+                logger.warning("send_close_stream error session=%s: %s", self._session_id, exc)
 
-    async def _on_transcript(self, result, **kwargs) -> None:
+        if self._listen_task and not self._listen_task.done():
+            self._listen_task.cancel()
+            try:
+                await self._listen_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        if self._cm is not None:
+            try:
+                await self._cm.__aexit__(None, None, None)
+            except Exception as exc:
+                logger.warning("Deepgram context exit error session=%s: %s", self._session_id, exc)
+            finally:
+                self._cm = None
+                self._connection = None
+
+        logger.info("Deepgram live finished session=%s", self._session_id)
+
+    async def _on_transcript(self, data) -> None:
         try:
-            alternatives = result.channel.alternatives if result.channel else []
+            if not isinstance(data, ListenV1Results):
+                return
+            alternatives = data.channel.alternatives if data.channel else []
             if not alternatives:
                 return
             text = alternatives[0].transcript
             if not text:
                 return
-            is_final = bool(result.is_final)
+            is_final = bool(data.is_final)
 
             msg = {
                 "type": "transcript",
