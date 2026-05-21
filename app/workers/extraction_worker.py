@@ -15,7 +15,6 @@ import uuid
 import redis as sync_redis
 from sqlalchemy.pool import NullPool
 
-from app.ai.pipeline import run_pipeline
 from app.config import get_settings
 from app.workers.celery_app import celery_app
 
@@ -60,6 +59,25 @@ async def _persist_events(
         await engine.dispose()
 
 
+def _run_extraction(transcript: str, settings) -> list[dict]:
+    """Dispatch to Gemini or Claude pipeline based on BP_MODEL setting."""
+    if settings.BP_MODEL == "gemini":
+        from app.ai.agents.gemini_synthesizer import run as gemini_run
+        return gemini_run(transcript, settings.GEMINI_API_KEY, settings.GEMINI_MODEL)
+
+    # Claude: LangGraph multi-agent pipeline with single-call fallback
+    from app.ai.pipeline import run_pipeline
+    events = run_pipeline(
+        transcript=transcript,
+        api_key=settings.ANTHROPIC_API_KEY,
+        model=settings.ANTHROPIC_MODEL,
+    )
+    if not events:
+        from app.ai.agents.synthesizer import run as claude_run
+        events = claude_run(transcript, settings.ANTHROPIC_API_KEY, settings.ANTHROPIC_MODEL)
+    return events
+
+
 @celery_app.task(name="app.workers.extraction_worker.extract_requirements")
 def extract_requirements(session_id: str, transcript_segment: str) -> None:
     """Run the LangGraph pipeline on a finalized transcript segment.
@@ -69,11 +87,7 @@ def extract_requirements(session_id: str, transcript_segment: str) -> None:
     - Persisted to meeting_events for blueprint aggregation
     """
     settings = get_settings()
-    events = run_pipeline(
-        transcript=transcript_segment,
-        api_key=settings.ANTHROPIC_API_KEY,
-        model=settings.ANTHROPIC_MODEL,
-    )
+    events = _run_extraction(transcript_segment, settings)
 
     if not events:
         logger.debug("No events extracted for session=%s", session_id)

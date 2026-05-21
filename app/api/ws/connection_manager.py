@@ -51,7 +51,10 @@ class ConnectionManager:
 
     async def send_to(self, ws: WebSocket, payload: dict) -> None:
         """Send payload to a single WebSocket connection."""
-        await ws.send_text(json.dumps(payload))
+        try:
+            await ws.send_text(json.dumps(payload))
+        except (RuntimeError, Exception) as exc:
+            logger.debug("send_to skipped (socket closed?): %s", exc)
 
 
 # Module-level singleton shared across the process lifetime.

@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     ANTHROPIC_MODEL: str = "claude-sonnet-4-5"
 
+    # Gemini
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+
+    # Blueprint generation backend: "claude" | "gemini"
+    BP_MODEL: str = "claude"
+
     # Embeddings
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_API_KEY: str = ""

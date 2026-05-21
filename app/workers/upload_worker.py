@@ -57,33 +57,17 @@ def transcribe_upload(session_id: str, file_path: str) -> None:
         "is_final": True,
     }, settings)
 
-    # 3. Run LangGraph extraction pipeline
+    # 3. Run extraction pipeline (Gemini or Claude based on BP_MODEL)
     logger.info(
         "Transcript preview session=%s: %.200s…", session_id, transcript.replace("\n", " ")
     )
-    from app.ai.pipeline import run_pipeline
-    events = run_pipeline(
-        transcript=transcript,
-        api_key=settings.ANTHROPIC_API_KEY,
-        model=settings.ANTHROPIC_MODEL,
-    )
-    logger.info("Extraction done session=%s events=%d", session_id, len(events))
-
-    # Fallback: if per-segment pipeline extracted nothing, synthesise from the full transcript
-    if not events:
-        logger.warning(
-            "Pipeline returned 0 events — running synthesis fallback session=%s", session_id
-        )
-        try:
-            from app.ai.agents.synthesizer import run as synthesize
-            events = synthesize(transcript, settings.ANTHROPIC_API_KEY, settings.ANTHROPIC_MODEL)
-            logger.info(
-                "Synthesis fallback done session=%s events=%d", session_id, len(events)
-            )
-        except Exception as exc:
-            logger.error(
-                "Synthesis fallback failed session=%s: %s", session_id, exc, exc_info=True
-            )
+    from app.workers.extraction_worker import _run_extraction
+    try:
+        events = _run_extraction(transcript, settings)
+    except Exception as exc:
+        logger.error("Extraction failed session=%s: %s", session_id, exc, exc_info=True)
+        events = []
+    logger.info("Extraction done session=%s events=%d backend=%s", session_id, len(events), settings.BP_MODEL)
 
     # 4. Publish feature events for real-time UI, persist to DB, generate blueprint
     for ev in events:
@@ -112,20 +96,25 @@ def transcribe_upload(session_id: str, file_path: str) -> None:
 
 def _transcribe(file_path: str, settings) -> str:
     """Call Deepgram pre-recorded API and return the full transcript string."""
-    from deepgram import DeepgramClient, PrerecordedOptions
+    import asyncio
+    from deepgram import AsyncDeepgramClient
 
-    dg = DeepgramClient(api_key=settings.DEEPGRAM_API_KEY)
-    with open(file_path, "rb") as f:
-        buffer = f.read()
+    async def _run() -> str:
+        dg = AsyncDeepgramClient(api_key=settings.DEEPGRAM_API_KEY)
+        with open(file_path, "rb") as f:
+            buffer = f.read()
+        response = await dg.listen.v1.media.transcribe_file(
+            request=buffer,
+            model=settings.DEEPGRAM_MODEL,
+            punctuate=True,
+            smart_format=True,
+        )
+        if not (response.results and response.results.channels):
+            return ""
+        alts = response.results.channels[0].alternatives
+        return alts[0].transcript if alts else ""
 
-    options = PrerecordedOptions(
-        model=settings.DEEPGRAM_MODEL,
-        punctuate=True,
-        smart_format=True,
-        paragraphs=True,
-    )
-    response = dg.listen.prerecorded.v("1").transcribe_file({"buffer": buffer}, options)
-    return response.results.channels[0].alternatives[0].transcript
+    return asyncio.run(_run())
 
 
 def _publish(session_id: str, payload: dict, settings) -> None:

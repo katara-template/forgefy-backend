@@ -1,27 +1,41 @@
-"""Async Deepgram live transcription — deepgram-sdk 6.x API.
+"""Deepgram transcription via chunked pre-recorded API.
 
-Uses AsyncDeepgramClient.listen.v1.connect() (asynccontextmanager) to open
-a streaming WebSocket, then forwards audio bytes and publishes transcripts
-to Redis so the existing Redis→WebSocket bridge delivers them to the browser.
+Instead of a WebSocket (which the SDK 6.x live path rejects with 400), audio
+is accumulated in a buffer and flushed to Deepgram's pre-recorded endpoint
+every FLUSH_INTERVAL seconds.  Results are published to Redis so the existing
+Redis→WebSocket bridge delivers them to the browser.
 """
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
+import wave
 
 import redis.asyncio as aioredis
 from deepgram import AsyncDeepgramClient
-from deepgram.core.events import EventType
-from deepgram.listen.v1.types.listen_v1results import ListenV1Results
 
 logger = logging.getLogger(__name__)
 
 _CHANNEL_PREFIX = "voxa:session:"
+_FLUSH_INTERVAL = 4.0          # seconds between automatic flushes
+_MIN_CHUNK_BYTES = 16_000 * 2  # 1 second of 16 kHz mono PCM-16 (32 kB) — skip smaller
+
+
+def _pcm16_to_wav(pcm_bytes: bytes, sample_rate: int = 16000, channels: int = 1) -> bytes:
+    """Wrap raw PCM-16 bytes in a WAV container so Deepgram can parse them."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)  # 16-bit = 2 bytes
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
 
 
 class DeepgramLiveSession:
-    """One Deepgram async streaming connection per physical meeting session."""
+    """Buffers PCM-16 audio and transcribes in periodic chunks via pre-recorded API."""
 
     def __init__(
         self,
@@ -34,75 +48,85 @@ class DeepgramLiveSession:
         self._api_key = api_key
         self._model = model
         self._redis_url = redis_url
-        self._cm = None
-        self._connection = None
-        self._listen_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._buffer = bytearray()
+        self._lock = asyncio.Lock()
+        self._flush_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._running = False
 
     async def start(self) -> None:
-        dg = AsyncDeepgramClient(api_key=self._api_key)
-        self._cm = dg.listen.v1.connect(
-            model=self._model,
-            encoding="linear16",
-            sample_rate=16000,
-            interim_results=True,
-            punctuate=True,
-            endpointing=300,
-        )
-        self._connection = await self._cm.__aenter__()
-        self._connection.on(EventType.MESSAGE, self._on_transcript)
-        # Run the listener loop as a background task
-        self._listen_task = asyncio.create_task(self._connection.start_listening())
-        logger.info("Deepgram live started session=%s model=%s", self._session_id, self._model)
+        self._running = True
+        self._flush_task = asyncio.create_task(self._flush_loop())
+        logger.info("Deepgram chunked session started session=%s model=%s", self._session_id, self._model)
 
     async def send(self, audio_bytes: bytes) -> None:
-        if self._connection is not None:
-            await self._connection.send_media(audio_bytes)
+        if not self._running:
+            return
+        async with self._lock:
+            self._buffer.extend(audio_bytes)
 
     async def finish(self) -> None:
-        if self._connection is not None:
-            try:
-                await self._connection.send_close_stream()
-            except Exception as exc:
-                logger.warning("send_close_stream error session=%s: %s", self._session_id, exc)
+        self._running = False
 
-        if self._listen_task and not self._listen_task.done():
-            self._listen_task.cancel()
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
             try:
-                await self._listen_task
-            except (asyncio.CancelledError, Exception):
+                await self._flush_task
+            except asyncio.CancelledError:
                 pass
 
-        if self._cm is not None:
-            try:
-                await self._cm.__aexit__(None, None, None)
-            except Exception as exc:
-                logger.warning("Deepgram context exit error session=%s: %s", self._session_id, exc)
-            finally:
-                self._cm = None
-                self._connection = None
+        # Flush whatever remains in the buffer
+        async with self._lock:
+            remaining = bytes(self._buffer)
+            self._buffer.clear()
 
-        logger.info("Deepgram live finished session=%s", self._session_id)
+        if len(remaining) >= _MIN_CHUNK_BYTES:
+            await self._transcribe_chunk(remaining)
 
-    async def _on_transcript(self, data) -> None:
+        logger.info("Deepgram chunked session finished session=%s", self._session_id)
+
+    # ── internal ──────────────────────────────────────────────────────────────
+
+    async def _flush_loop(self) -> None:
+        while self._running:
+            await asyncio.sleep(_FLUSH_INTERVAL)
+            await self._flush()
+
+    async def _flush(self) -> None:
+        async with self._lock:
+            if not self._buffer:
+                return
+            chunk = bytes(self._buffer)
+            self._buffer.clear()
+
+        if len(chunk) >= _MIN_CHUNK_BYTES:
+            await self._transcribe_chunk(chunk)
+
+    async def _transcribe_chunk(self, audio_bytes: bytes) -> None:
         try:
-            if not isinstance(data, ListenV1Results):
+            wav_bytes = _pcm16_to_wav(audio_bytes)
+            dg = AsyncDeepgramClient(api_key=self._api_key)
+            response = await dg.listen.v1.media.transcribe_file(
+                request=wav_bytes,
+                model=self._model,
+                punctuate=True,
+            )
+
+            if not (response.results and response.results.channels):
                 return
-            alternatives = data.channel.alternatives if data.channel else []
-            if not alternatives:
+            alts = response.results.channels[0].alternatives
+            if not alts:
                 return
-            text = alternatives[0].transcript
+            text = alts[0].transcript
             if not text:
                 return
-            is_final = bool(data.is_final)
 
             msg = {
                 "type": "transcript",
                 "session_id": self._session_id,
                 "text": text,
-                "is_final": is_final,
+                "is_final": True,
             }
 
-            # Publish to Redis — the WS gateway's Redis subscriber broadcasts to browsers
             r = aioredis.from_url(self._redis_url, decode_responses=True)
             try:
                 await r.publish(
@@ -112,15 +136,17 @@ class DeepgramLiveSession:
             finally:
                 await r.aclose()
 
-            # Enqueue LangGraph extraction for every final segment
-            if is_final:
-                from app.workers.extraction_worker import extract_requirements
-                extract_requirements.apply_async(
-                    args=[self._session_id, text],
-                    queue="meeting.transcribe",
-                )
+            # Enqueue LangGraph extraction
+            from app.workers.extraction_worker import extract_requirements
+            extract_requirements.apply_async(
+                args=[self._session_id, text],
+                queue="meeting.transcribe",
+            )
+
+            logger.debug("Chunk transcribed session=%s chars=%d", self._session_id, len(text))
+
         except Exception as exc:
             logger.warning(
-                "Deepgram transcript handler error session=%s: %s",
+                "Chunk transcription error session=%s: %s",
                 self._session_id, exc, exc_info=True,
             )
