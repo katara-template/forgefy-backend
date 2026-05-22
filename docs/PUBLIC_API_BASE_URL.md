@@ -44,7 +44,7 @@ After the bot joins the meeting it needs to send two types of events back to you
 | `transcript.data` | Real-time transcript chunks as people speak |
 | `bot.status_change` | Bot lifecycle — joining, recording started, call ended |
 
-Recall.ai delivers these events by making **HTTP POST requests** (webhooks) to your server. For this to work, your server must be reachable from Recall's cloud servers. When you run the backend locally on `localhost:8000`, Recall cannot reach it because `localhost` is only accessible from your own computer.
+Recall.ai delivers these events by making **HTTP POST requests** (webhooks) to your server. For this to work, your server must be reachable from Recall's cloud servers. When you run the backend locally on `localhost:5000`, Recall cannot reach it because `localhost` is only accessible from your own computer.
 
 `PUBLIC_API_BASE_URL` tells the Recall.ai bot exactly where to send those webhooks.
 
@@ -83,7 +83,7 @@ Without `PUBLIC_API_BASE_URL` set, the webhook URL is empty or wrong and Recall 
 
 ## Getting Your Public URL with ngrok
 
-ngrok is a free tool that creates a secure tunnel from the internet to your local machine. It gives you a real `https://` URL that forwards to `localhost:8000`.
+ngrok is a free tool that creates a secure tunnel from the internet to your local machine. It gives you a real `https://` URL that forwards to `localhost:5000`.
 
 ### Step 1 — Install ngrok
 
@@ -169,7 +169,7 @@ Version                       3.x.x
 Region                        United States (us)
 Latency                       23ms
 Web Interface                 http://127.0.0.1:4040
-Forwarding                    https://a1b2-203-0-113-42.ngrok-free.app -> http://localhost:8000
+Forwarding                    https://a1b2-203-0-113-42.ngrok-free.app -> http://localhost:5000
 
 Connections                   ttl     opn     rt1     rt5     p50     p90
                               0       0       0.00    0.00    0.00    0.00

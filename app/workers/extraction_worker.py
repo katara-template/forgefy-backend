@@ -60,7 +60,11 @@ async def _persist_events(
 
 
 def _run_extraction(transcript: str, settings) -> list[dict]:
-    """Dispatch to Gemini or Claude pipeline based on BP_MODEL setting."""
+    """Dispatch to Ollama, Gemini, or Claude pipeline based on BP_MODEL setting."""
+    if settings.BP_MODEL == "Qwen3":
+        from app.ai.agents.ollama_synthesizer import run as ollama_run
+        return ollama_run(transcript, settings.OLLAMA_URL, settings.OLLAMA_MODEL, timeout=settings.OLLAMA_TIMEOUT)
+
     if settings.BP_MODEL == "gemini":
         from app.ai.agents.gemini_synthesizer import run as gemini_run
         return gemini_run(transcript, settings.GEMINI_API_KEY, settings.GEMINI_MODEL)

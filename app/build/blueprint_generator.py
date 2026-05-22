@@ -1,8 +1,8 @@
 """BlueprintAggregator — assembles extraction events into a structured blueprint.
 
-Reads FEATURE_FOUND / QUESTION_FOUND / CONFLICT_FOUND / ACTION_ITEM_FOUND
-events from meeting_events, structures them into a JSON document, saves a
-Blueprint row, and transitions the session to BLUEPRINT_READY.
+Reads APP_DESCRIPTION / FEATURE_FOUND / QUESTION_FOUND / CONFLICT_FOUND /
+ACTION_ITEM_FOUND events from meeting_events, structures them into a JSON
+document, saves a Blueprint row, and transitions the session to BLUEPRINT_READY.
 
 If no extraction events exist (extraction pipeline failed or produced nothing),
 falls back to synthesising from raw transcript.segment events stored by the
@@ -27,7 +27,7 @@ from app.modules.voxa.state_machine import MeetingStateMachine
 logger = logging.getLogger(__name__)
 
 _EXTRACTION_TYPES = frozenset(
-    {"FEATURE_FOUND", "QUESTION_FOUND", "CONFLICT_FOUND", "ACTION_ITEM_FOUND"}
+    {"APP_DESCRIPTION", "FEATURE_FOUND", "QUESTION_FOUND", "CONFLICT_FOUND", "ACTION_ITEM_FOUND"}
 )
 
 
@@ -95,7 +95,6 @@ class BlueprintAggregator:
     ) -> dict[str, Any]:
         """Fallback: concatenate stored transcript segments and run single-call synthesis."""
         from app.config import get_settings
-        from app.ai.agents.synthesizer import run as synthesize
 
         segs_result = await self._db.execute(
             select(MeetingEvent)
@@ -124,11 +123,21 @@ class BlueprintAggregator:
         )
         settings = get_settings()
         try:
-            events = synthesize(transcript, settings.ANTHROPIC_API_KEY, settings.ANTHROPIC_MODEL)
+            if settings.BP_MODEL == "Qwen3":
+                from app.ai.agents.ollama_synthesizer import run as synthesize
+                events = synthesize(transcript, settings.OLLAMA_URL, settings.OLLAMA_MODEL, timeout=settings.OLLAMA_TIMEOUT)
+            elif settings.BP_MODEL == "gemini":
+                from app.ai.agents.gemini_synthesizer import run as synthesize
+                events = synthesize(transcript, settings.GEMINI_API_KEY, settings.GEMINI_MODEL)
+            else:
+                from app.ai.agents.synthesizer import run as synthesize
+                events = synthesize(transcript, settings.ANTHROPIC_API_KEY, settings.ANTHROPIC_MODEL)
         except Exception as exc:
             logger.error("Synthesis failed for session=%s: %s", session_id, exc, exc_info=True)
             return _build_blueprint_json(session, [])
 
+        app_desc_event = next((e for e in events if e["sub_state"] == "APP_DESCRIPTION"), None)
+        app_description = app_desc_event["payload"].get("text", "") if app_desc_event else ""
         features = [e["payload"] for e in events if e["sub_state"] == "FEATURE_FOUND"]
         questions = [e["payload"] for e in events if e["sub_state"] == "QUESTION_FOUND"]
         conflicts = [e["payload"] for e in events if e["sub_state"] == "CONFLICT_FOUND"]
@@ -139,6 +148,7 @@ class BlueprintAggregator:
             "session_id": str(session_id),
             "session_platform": session.platform.value,
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "app_description": app_description,
             "features": features,
             "open_questions": questions,
             "conflicts": conflicts,
@@ -150,6 +160,10 @@ class BlueprintAggregator:
 def _build_blueprint_json(
     session: MeetingSession, events: list[MeetingEvent]
 ) -> dict[str, Any]:
+    app_desc_event = next(
+        (e for e in events if e.event_type == "APP_DESCRIPTION" and e.payload), None
+    )
+    app_description = app_desc_event.payload.get("text", "") if app_desc_event else ""
     features = [e.payload for e in events if e.event_type == "FEATURE_FOUND" and e.payload]
     questions = [e.payload for e in events if e.event_type == "QUESTION_FOUND" and e.payload]
     conflicts = [e.payload for e in events if e.event_type == "CONFLICT_FOUND" and e.payload]
@@ -160,9 +174,12 @@ def _build_blueprint_json(
         "session_id": str(session.id),
         "session_platform": session.platform.value,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "app_description": app_description,
         "features": features,
         "open_questions": questions,
         "conflicts": conflicts,
         "action_items": action_items,
         "requirements_count": len(features) + len(questions) + len(conflicts) + len(action_items),
     }
+
+

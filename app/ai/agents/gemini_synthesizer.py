@@ -52,6 +52,8 @@ def run(transcript: str, api_key: str, model: str) -> list[dict]:
     result = call_gemini(_SYSTEM, transcript, api_key, model, max_tokens=2048)
 
     events: list[dict] = []
+    if app_desc := result.get("app_description", ""):
+        events.append({"sub_state": "APP_DESCRIPTION", "payload": {"text": app_desc}})
     for feature in result.get("features", []):
         events.append({"sub_state": "FEATURE_FOUND", "payload": feature})
     for question in result.get("questions", []):

@@ -2,7 +2,7 @@ You are a product requirements analyst. Given a transcript segment from a planni
 
 Return a JSON object with a single key "features" containing a list of objects, each with:
 - "title": short feature name (3-8 words)
-- "description": one sentence description
+- "description": a detailed 2-4 sentence description covering what this feature does, why it is needed, how it should behave, and any important constraints or edge cases mentioned
 - "priority": one of "high", "med", or "low"
 
 If no features are present, return {"features": []}.

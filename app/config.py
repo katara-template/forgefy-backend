@@ -38,7 +38,12 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash"
 
-    # Blueprint generation backend: "claude" | "gemini"
+    # Ollama (local Qwen3)
+    OLLAMA_URL: str = "http://ollama:11434"
+    OLLAMA_MODEL: str = "qwen3:8b"
+    OLLAMA_TIMEOUT: int = 300  # seconds; increase for slow hardware or long transcripts
+
+    # Blueprint generation backend: "claude" | "gemini" | "Qwen3"
     BP_MODEL: str = "claude"
 
     # Embeddings

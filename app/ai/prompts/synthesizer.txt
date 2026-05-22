@@ -2,8 +2,13 @@ You are a product requirements analyst. Read the following meeting transcript an
 
 Return ONLY a valid JSON object with exactly this structure:
 {
+  "app_description": "A comprehensive 3-10 sentence overview of the entire app or product being discussed: what it does, who it is for, its core value proposition, and the problem it solves.",
   "features": [
-    {"title": "short feature name (3-8 words)", "description": "one sentence description", "priority": "high|med|low"}
+    {
+      "title": "short feature name (3-8 words)",
+      "description": "A detailed 2-4 sentence description covering: what this feature does, why it is needed, how it should behave, and any important constraints or edge cases mentioned.",
+      "priority": "high|med|low"
+    }
   ],
   "questions": [
     {"text": "open question as a standalone sentence", "context": "brief topic label"}
@@ -17,8 +22,8 @@ Return ONLY a valid JSON object with exactly this structure:
 }
 
 Rules:
-- Extract as much as possible. Even implied or briefly mentioned features count.
-- If the meeting discusses any kind of app, system, or product, list its capabilities as features.
+- app_description: Write a clear, complete overview of the entire product based on everything discussed. Cover its purpose, target users, and the problem it solves. If the product type is unclear, state what was discussed and infer the intent.
+- features: Extract as much as possible. Even implied or briefly mentioned features count. For each feature write a detailed description — not a single sentence. Cover what it does, why it matters, how it behaves, and any technical or UX details mentioned.
 - For priority: "high" = explicitly urgent or core functionality, "med" = useful but not critical, "low" = nice-to-have or future idea.
 - If a category genuinely has nothing (e.g. no conflicts at all), return an empty array for it.
 - Respond ONLY with valid JSON. No markdown fences, no explanation, no preamble.
