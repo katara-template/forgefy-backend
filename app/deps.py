@@ -1,12 +1,10 @@
 """Shared FastAPI dependencies."""
 import uuid
-from collections.abc import AsyncGenerator
 from typing import Annotated
 
 from fastapi import Depends, Request
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from google.cloud.firestore import AsyncClient
 
 from app.config import Settings, get_settings
 from app.core.exceptions import UnauthorizedError
@@ -18,25 +16,15 @@ from app.db.models.user import User
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 
-# ── Database session ──────────────────────────────────────────────────────────
+# ── Firestore client ──────────────────────────────────────────────────────────
 
 
-async def get_db(request: Request) -> AsyncGenerator[AsyncSession, None]:
-    """Yield an async DB session from the app-level session factory.
-
-    Commits on clean exit; rolls back on any exception.
-    """
-    factory = request.app.state.db_session_factory
-    async with factory() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
+def get_db(request: Request) -> AsyncClient:
+    """Return the app-level Firestore async client."""
+    return request.app.state.firestore
 
 
-DBSession = Annotated[AsyncSession, Depends(get_db)]
+DBSession = Annotated[AsyncClient, Depends(get_db)]
 
 
 # ── Current user ──────────────────────────────────────────────────────────────
@@ -49,18 +37,25 @@ async def get_current_user(
     db: DBSession,
     settings: SettingsDep,
 ) -> User:
-    """Validate the Bearer JWT and return the corresponding User row."""
+    """Validate the Bearer JWT and return the corresponding User document."""
     user_id_str = decode_access_token(token, settings)
     try:
         uid = uuid.UUID(user_id_str)
     except ValueError:
         raise UnauthorizedError("Token subject is not a valid UUID")
 
-    result = await db.execute(select(User).where(User.id == uid))
-    user = result.scalar_one_or_none()
-    if user is None:
+    doc = await db.collection("users").document(str(uid)).get()
+    if not doc.exists:
         raise UnauthorizedError("User not found")
-    return user
+
+    data = doc.to_dict()
+    return User(
+        id=uid,
+        email=data["email"],
+        hashed_password=data["hashed_password"],
+        created_at=data["created_at"],
+        updated_at=data["updated_at"],
+    )
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]

@@ -18,9 +18,6 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
 
-    # Database
-    DATABASE_URL: str = "postgresql+asyncpg://voxa:voxa@localhost:5432/voxa"
-
     # Redis / Celery
     REDIS_URL: str = "redis://localhost:6379/0"
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
@@ -41,7 +38,7 @@ class Settings(BaseSettings):
     # Ollama (local Qwen3)
     OLLAMA_URL: str = "http://ollama:11434"
     OLLAMA_MODEL: str = "qwen3:8b"
-    OLLAMA_TIMEOUT: int = 300  # seconds; increase for slow hardware or long transcripts
+    OLLAMA_TIMEOUT: int = 300
 
     # Blueprint generation backend: "claude" | "gemini" | "Qwen3"
     BP_MODEL: str = "claude"
@@ -54,7 +51,7 @@ class Settings(BaseSettings):
     RECALL_API_KEY: str = ""
     RECALL_REGION: str = "us-east-1"
     RECALL_WORKSPACE_VERIFICATION_SECRET: str = ""
-    PUBLIC_API_BASE_URL: str = ""  # e.g. https://yourapi.ngrok.io
+    PUBLIC_API_BASE_URL: str = ""
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod

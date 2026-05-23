@@ -3,8 +3,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from google.cloud.firestore import AsyncClient
 
 from app.core.exceptions import NotFoundError, ValidationError
 from app.db.models.enums import Platform, SessionStatus
@@ -15,10 +14,35 @@ from app.modules.voxa.state_machine import MeetingStateMachine
 logger = logging.getLogger(__name__)
 
 
+def _doc_to_session(doc) -> MeetingSession:
+    data = doc.to_dict()
+    return MeetingSession(
+        id=uuid.UUID(doc.id),
+        user_id=uuid.UUID(data["user_id"]),
+        status=SessionStatus(data["status"]),
+        platform=Platform(data["platform"]),
+        meeting_url=data.get("meeting_url"),
+        start_time=data.get("start_time"),
+        end_time=data.get("end_time"),
+        created_at=data["created_at"],
+    )
+
+
+def _doc_to_event(doc) -> MeetingEvent:
+    data = doc.to_dict()
+    return MeetingEvent(
+        id=uuid.UUID(doc.id),
+        session_id=uuid.UUID(data["session_id"]),
+        event_type=data["event_type"],
+        payload=data.get("payload"),
+        timestamp=data["timestamp"],
+    )
+
+
 class VoxaService:
     """Orchestrates session lifecycle for the Voxa meeting-mode module."""
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(self, db: AsyncClient) -> None:
         self._db = db
         self._sm = MeetingStateMachine(db)
 
@@ -31,35 +55,52 @@ class VoxaService:
         meeting_url: str | None = None,
     ) -> MeetingSession:
         """Create a session in WAITING state and log the creation event."""
-        session = MeetingSession(
+        session_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+
+        session_data = {
+            "user_id": str(user_id),
+            "status": SessionStatus.WAITING.value,
+            "platform": platform.value,
+            "meeting_url": meeting_url,
+            "start_time": None,
+            "end_time": None,
+            "created_at": now,
+        }
+        await self._db.collection("sessions").document(session_id).set(session_data)
+
+        event_id = str(uuid.uuid4())
+        await (
+            self._db.collection("sessions")
+            .document(session_id)
+            .collection("events")
+            .document(event_id)
+            .set({
+                "session_id": session_id,
+                "event_type": "session.created",
+                "payload": {"platform": platform.value, "meeting_url": meeting_url},
+                "timestamp": now,
+            })
+        )
+
+        logger.info("Session created: id=%s platform=%s", session_id, platform.value)
+        return MeetingSession(
+            id=uuid.UUID(session_id),
             user_id=user_id,
+            status=SessionStatus.WAITING,
             platform=platform,
             meeting_url=meeting_url,
-            status=SessionStatus.WAITING,
+            start_time=None,
+            end_time=None,
+            created_at=now,
         )
-        self._db.add(session)
-        await self._db.flush()  # populate session.id
-
-        self._db.add(
-            MeetingEvent(
-                session_id=session.id,
-                event_type="session.created",
-                payload={"platform": platform.value, "meeting_url": meeting_url},
-            )
-        )
-        logger.info("Session created: id=%s platform=%s", session.id, platform.value)
-        return session
 
     async def join_session(
         self,
         session_id: uuid.UUID,
         user_id: uuid.UUID,
     ) -> MeetingSession:
-        """Transition to JOINING and schedule the platform connector bot.
-
-        For physical sessions the bot is not dispatched — the browser streams
-        audio directly via WebSocket instead.
-        """
+        """Transition to JOINING and schedule the platform connector bot."""
         await self._require_owned(session_id, user_id)
 
         session = await self._sm.transition(
@@ -67,15 +108,26 @@ class VoxaService:
             SessionStatus.JOINING,
             extra_payload={"initiated_by": str(user_id)},
         )
-        session.start_time = datetime.now(timezone.utc)
-
-        self._db.add(
-            MeetingEvent(
-                session_id=session_id,
-                event_type="access",
-                payload={"action": "join", "user_id": str(user_id)},
-            )
+        start_time = datetime.now(timezone.utc)
+        await self._db.collection("sessions").document(str(session_id)).update(
+            {"start_time": start_time}
         )
+        session.start_time = start_time
+
+        event_id = str(uuid.uuid4())
+        await (
+            self._db.collection("sessions")
+            .document(str(session_id))
+            .collection("events")
+            .document(event_id)
+            .set({
+                "session_id": str(session_id),
+                "event_type": "access",
+                "payload": {"action": "join", "user_id": str(user_id)},
+                "timestamp": datetime.now(timezone.utc),
+            })
+        )
+
         if session.platform != Platform.PHYSICAL:
             from app.workers.connector_worker import dispatch_connector
             dispatch_connector.apply_async(
@@ -89,10 +141,7 @@ class VoxaService:
         session_id: uuid.UUID,
         user_id: uuid.UUID,
     ) -> MeetingSession:
-        """Transition a physical session to LISTENING so the browser can stream audio.
-
-        Only valid for physical sessions in WAITING state.
-        """
+        """Transition a physical session to LISTENING."""
         session = await self._require_owned(session_id, user_id)
 
         if session.platform != Platform.PHYSICAL:
@@ -105,7 +154,11 @@ class VoxaService:
             SessionStatus.LISTENING,
             extra_payload={"initiated_by": str(user_id)},
         )
-        session.start_time = datetime.now(timezone.utc)
+        start_time = datetime.now(timezone.utc)
+        await self._db.collection("sessions").document(str(session_id)).update(
+            {"start_time": start_time}
+        )
+        session.start_time = start_time
         return session
 
     async def end_session(
@@ -123,9 +176,12 @@ class VoxaService:
             )
 
         session = await self._sm.transition(session_id, SessionStatus.PROCESSING)
-        session.end_time = datetime.now(timezone.utc)
+        end_time = datetime.now(timezone.utc)
+        await self._db.collection("sessions").document(str(session_id)).update(
+            {"end_time": end_time}
+        )
+        session.end_time = end_time
 
-        # Remove Recall.ai bot if one exists for this session (non-blocking task)
         if session.platform != Platform.PHYSICAL:
             from app.workers.connector_worker import recall_remove_bot
             recall_remove_bot.apply_async(args=[str(session_id)], queue="meeting.audio")
@@ -145,21 +201,28 @@ class VoxaService:
         """Return session + 20 most-recent events; log the access."""
         session = await self._require_owned(session_id, user_id)
 
-        events_result = await self._db.execute(
-            select(MeetingEvent)
-            .where(MeetingEvent.session_id == session_id)
-            .order_by(MeetingEvent.timestamp.desc())
+        event_docs = (
+            await self._db.collection("sessions")
+            .document(str(session_id))
+            .collection("events")
+            .order_by("timestamp", direction="DESCENDING")
             .limit(20)
+            .get()
         )
-        events = list(events_result.scalars())
+        events = [_doc_to_event(d) for d in event_docs]
 
-        # Security requirement: log every read access
-        self._db.add(
-            MeetingEvent(
-                session_id=session_id,
-                event_type="access",
-                payload={"action": "read", "user_id": str(user_id)},
-            )
+        event_id = str(uuid.uuid4())
+        await (
+            self._db.collection("sessions")
+            .document(str(session_id))
+            .collection("events")
+            .document(event_id)
+            .set({
+                "session_id": str(session_id),
+                "event_type": "access",
+                "payload": {"action": "read", "user_id": str(user_id)},
+                "timestamp": datetime.now(timezone.utc),
+            })
         )
         return session, events
 
@@ -170,18 +233,13 @@ class VoxaService:
         session_id: uuid.UUID,
         user_id: uuid.UUID,
     ) -> MeetingSession:
-        """Return the session only if it exists and is owned by user_id.
-
-        Returns the same 404 for missing *or* unowned sessions to avoid
-        leaking existence of other users' sessions.
-        """
-        result = await self._db.execute(
-            select(MeetingSession).where(
-                MeetingSession.id == session_id,
-                MeetingSession.user_id == user_id,
-            )
-        )
-        session = result.scalar_one_or_none()
-        if session is None:
+        """Return the session only if it exists and is owned by user_id."""
+        doc = await self._db.collection("sessions").document(str(session_id)).get()
+        if not doc.exists:
             raise NotFoundError(f"Session {session_id} not found")
-        return session
+
+        data = doc.to_dict()
+        if uuid.UUID(data["user_id"]) != user_id:
+            raise NotFoundError(f"Session {session_id} not found")
+
+        return _doc_to_session(doc)

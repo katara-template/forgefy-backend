@@ -1,19 +1,13 @@
-"""Extraction worker — runs the LangGraph agent pipeline on transcript segments.
-
-Receives finalized transcript text on the ``meeting.transcribe`` queue,
-runs the four-agent pipeline, publishes each extraction event to Redis
-(for real-time WS delivery), and persists each event to meeting_events
-(for blueprint aggregation in Step 8).
-"""
+"""Extraction worker — runs the LangGraph agent pipeline on transcript segments."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 
 import redis as sync_redis
-from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 from app.workers.celery_app import celery_app
@@ -26,37 +20,30 @@ _CHANNEL_PREFIX = "voxa:session:"
 async def _persist_events(
     session_id: str,
     events: list[dict],
-    database_url: str,
     transcript_segment: str = "",
 ) -> None:
-    """Write extraction events (and transcript segment) to meeting_events."""
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    """Write extraction events (and transcript segment) to Firestore."""
+    from app.db.firebase import get_firestore_client
 
-    from app.db.models.meeting_event import MeetingEvent
+    db = get_firestore_client()
+    events_ref = db.collection("sessions").document(session_id).collection("events")
+    now = datetime.now(timezone.utc)
 
-    engine = create_async_engine(database_url, poolclass=NullPool)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    try:
-        async with factory() as db:
-            # Always store the raw transcript segment so the blueprint generator
-            # can use it as a fallback if extraction yielded nothing.
-            if transcript_segment:
-                db.add(MeetingEvent(
-                    session_id=uuid.UUID(session_id),
-                    event_type="transcript.segment",
-                    payload={"text": transcript_segment},
-                ))
-            for event in events:
-                db.add(
-                    MeetingEvent(
-                        session_id=uuid.UUID(session_id),
-                        event_type=event["sub_state"],
-                        payload=event["payload"],
-                    )
-                )
-            await db.commit()
-    finally:
-        await engine.dispose()
+    if transcript_segment:
+        await events_ref.document(str(uuid.uuid4())).set({
+            "session_id": session_id,
+            "event_type": "transcript.segment",
+            "payload": {"text": transcript_segment},
+            "timestamp": now,
+        })
+
+    for event in events:
+        await events_ref.document(str(uuid.uuid4())).set({
+            "session_id": session_id,
+            "event_type": event["sub_state"],
+            "payload": event["payload"],
+            "timestamp": now,
+        })
 
 
 def _run_extraction(transcript: str, settings) -> list[dict]:
@@ -69,7 +56,6 @@ def _run_extraction(transcript: str, settings) -> list[dict]:
         from app.ai.agents.gemini_synthesizer import run as gemini_run
         return gemini_run(transcript, settings.GEMINI_API_KEY, settings.GEMINI_MODEL)
 
-    # Claude: LangGraph multi-agent pipeline with single-call fallback
     from app.ai.pipeline import run_pipeline
     events = run_pipeline(
         transcript=transcript,
@@ -84,12 +70,7 @@ def _run_extraction(transcript: str, settings) -> list[dict]:
 
 @celery_app.task(name="app.workers.extraction_worker.extract_requirements")
 def extract_requirements(session_id: str, transcript_segment: str) -> None:
-    """Run the LangGraph pipeline on a finalized transcript segment.
-
-    Each extraction event (FEATURE_FOUND, QUESTION_FOUND, etc.) is:
-    - Published to the session's Redis channel for real-time WS delivery
-    - Persisted to meeting_events for blueprint aggregation
-    """
+    """Run the LangGraph pipeline on a finalized transcript segment."""
     settings = get_settings()
     events = _run_extraction(transcript_segment, settings)
 
@@ -97,7 +78,6 @@ def extract_requirements(session_id: str, transcript_segment: str) -> None:
         logger.debug("No events extracted for session=%s", session_id)
         return
 
-    # Publish to Redis for real-time delivery.
     r = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
     channel = f"{_CHANNEL_PREFIX}{session_id}"
     try:
@@ -115,10 +95,9 @@ def extract_requirements(session_id: str, transcript_segment: str) -> None:
     finally:
         r.close()
 
-    # Persist to DB for blueprint aggregation.
     try:
         asyncio.run(
-            _persist_events(session_id, events, settings.DATABASE_URL, transcript_segment)
+            _persist_events(session_id, events, transcript_segment)
         )
     except Exception as exc:
         logger.warning("Failed to persist extraction events session=%s: %s", session_id, exc)

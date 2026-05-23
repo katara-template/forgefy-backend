@@ -10,14 +10,13 @@ we reject anything that doesn't match.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Header, HTTPException, Request
-from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 
@@ -26,7 +25,6 @@ router = APIRouter()
 
 _CHANNEL_PREFIX = "voxa:session:"
 
-# Recall bot status → session status mapping
 _STATUS_TO_SESSION = {
     "in_call_recording": "LISTENING",
     "joining_call": "JOINING",
@@ -43,7 +41,6 @@ async def recall_webhook(
     """Receive and process Recall.ai webhook events."""
     settings = get_settings()
 
-    # Verify shared secret when configured
     if settings.RECALL_WORKSPACE_VERIFICATION_SECRET:
         if x_recall_workspace_verification_secret != settings.RECALL_WORKSPACE_VERIFICATION_SECRET:
             raise HTTPException(status_code=401, detail="Invalid webhook secret")
@@ -87,7 +84,6 @@ async def _handle_transcript(data: dict, settings) -> None:
         logger.warning("No session found for bot_id=%s", bot_id)
         return
 
-    # Forward to WebSocket clients via Redis pub/sub
     r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
     try:
         await r.publish(
@@ -103,7 +99,6 @@ async def _handle_transcript(data: dict, settings) -> None:
     finally:
         await r.aclose()
 
-    # Enqueue LangGraph extraction for every final segment
     if is_final:
         from app.workers.extraction_worker import extract_requirements
         extract_requirements.apply_async(
@@ -130,7 +125,6 @@ async def _handle_status_change(data: dict, settings) -> None:
         await _try_transition_session(session_id, target, settings)
 
     elif status_code in _TERMINAL_STATUSES:
-        # Meeting ended — transition to PROCESSING and generate blueprint
         await _end_session_from_bot(session_id, settings)
         await _clear_mapping(bot_id, session_id, settings.REDIS_URL)
 
@@ -141,60 +135,47 @@ async def _try_transition_session(
     settings,
 ) -> None:
     """Attempt a session status transition; ignore invalid-transition errors."""
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from app.db.firebase import get_firestore_client
     from app.db.models.enums import SessionStatus
     from app.modules.voxa.state_machine import MeetingStateMachine
     from app.core.exceptions import InvalidStateTransition
 
+    db = get_firestore_client()
     target = SessionStatus(target_status_value)
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
+    sm = MeetingStateMachine(db)
     try:
-        async with factory() as db:
-            sm = MeetingStateMachine(db)
-            try:
-                await sm.transition(uuid.UUID(session_id), target)
-                await db.commit()
-            except InvalidStateTransition:
-                pass  # already in target or ahead
-    finally:
-        await engine.dispose()
+        await sm.transition(uuid.UUID(session_id), target)
+    except InvalidStateTransition:
+        pass  # already in target or ahead
 
 
 async def _end_session_from_bot(session_id: str, settings) -> None:
     """Transition session to PROCESSING and dispatch blueprint generation."""
-    from datetime import datetime, timezone
-    from sqlalchemy import select
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from app.db.firebase import get_firestore_client
     from app.db.models.enums import SessionStatus
-    from app.db.models.meeting_session import MeetingSession
     from app.modules.voxa.state_machine import MeetingStateMachine
     from app.core.exceptions import InvalidStateTransition
 
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    try:
-        async with factory() as db:
-            result = await db.execute(
-                select(MeetingSession).where(MeetingSession.id == uuid.UUID(session_id))
-            )
-            session = result.scalar_one_or_none()
-            if session is None:
-                return
-            endable = {SessionStatus.JOINING, SessionStatus.LISTENING}
-            if session.status not in endable:
-                return  # already ended or not yet started
-            sm = MeetingStateMachine(db)
-            try:
-                session = await sm.transition(uuid.UUID(session_id), SessionStatus.PROCESSING)
-                session.end_time = datetime.now(timezone.utc)
-                await db.commit()
-            except InvalidStateTransition:
-                return
-    finally:
-        await engine.dispose()
+    db = get_firestore_client()
 
-    # Dispatch blueprint generation outside the DB context
+    doc = await db.collection("sessions").document(session_id).get()
+    if not doc.exists:
+        return
+
+    current_status = SessionStatus(doc.to_dict()["status"])
+    endable = {SessionStatus.JOINING, SessionStatus.LISTENING}
+    if current_status not in endable:
+        return
+
+    sm = MeetingStateMachine(db)
+    try:
+        await sm.transition(uuid.UUID(session_id), SessionStatus.PROCESSING)
+        await db.collection("sessions").document(session_id).update(
+            {"end_time": datetime.now(timezone.utc)}
+        )
+    except InvalidStateTransition:
+        return
+
     from app.workers.blueprint_worker import generate_blueprint
     generate_blueprint.apply_async(args=[session_id], queue="meeting.extract")
     logger.info("Blueprint enqueued from bot end session=%s", session_id)

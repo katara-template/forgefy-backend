@@ -116,22 +116,21 @@ async def get_session_transcript(
     user: CurrentUser,
 ) -> dict:
     """Return all transcript segments for a session as a single text block."""
-    from sqlalchemy import select as sa_select
-    from app.db.models.meeting_event import MeetingEvent
-
     service = VoxaService(db)
     await service._require_owned(session_id, user.id)
 
-    result = await db.execute(
-        sa_select(MeetingEvent)
-        .where(
-            MeetingEvent.session_id == session_id,
-            MeetingEvent.event_type == "transcript.segment",
-        )
-        .order_by(MeetingEvent.timestamp.asc())
+    segment_docs = (
+        await db.collection("sessions")
+        .document(str(session_id))
+        .collection("events")
+        .where("event_type", "==", "transcript.segment")
+        .order_by("timestamp", direction="ASCENDING")
+        .get()
     )
-    segments = list(result.scalars())
-    text = " ".join(s.payload.get("text", "") for s in segments if s.payload).strip()
+    segments = [d.to_dict() for d in segment_docs]
+    text = " ".join(
+        s.get("payload", {}).get("text", "") for s in segments
+    ).strip()
     return {"session_id": str(session_id), "transcript": text, "segments": len(segments)}
 
 

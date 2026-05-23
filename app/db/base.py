@@ -1,6 +1,1 @@
-"""SQLAlchemy declarative base shared by all ORM models."""
-from sqlalchemy.orm import DeclarativeBase
-
-
-class Base(DeclarativeBase):
-    """All ORM models extend this."""
+# Retained for import compatibility — no longer used after Firebase migration.

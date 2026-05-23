@@ -22,6 +22,9 @@ ENV/
 .env.local
 .env.*.local
 
+# Firebase service account — never commit
+firebase-credentials.json
+
 # IDEs
 .vscode/
 .idea/

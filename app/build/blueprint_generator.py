@@ -1,12 +1,16 @@
 """BlueprintAggregator — assembles extraction events into a structured blueprint.
 
-Reads APP_DESCRIPTION / FEATURE_FOUND / QUESTION_FOUND / CONFLICT_FOUND /
-ACTION_ITEM_FOUND events from meeting_events, structures them into a JSON
-document, saves a Blueprint row, and transitions the session to BLUEPRINT_READY.
+Reads FEATURE_FOUND / QUESTION_FOUND / CONFLICT_FOUND / ACTION_ITEM_FOUND /
+APP_DESCRIPTION events from the session's events subcollection, structures them
+into a JSON document, saves a Blueprint document, and transitions the session
+to BLUEPRINT_READY.
 
-If no extraction events exist (extraction pipeline failed or produced nothing),
-falls back to synthesising from raw transcript.segment events stored by the
-extraction worker.
+If no extraction events exist, falls back to synthesising from raw
+transcript.segment events stored by the extraction worker.
+
+Firestore collections used:
+  sessions/{session_id}/events/  — event documents
+  blueprints/{blueprint_id}      — blueprint documents (top-level)
 """
 from __future__ import annotations
 
@@ -15,13 +19,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from google.cloud.firestore import AsyncClient
 
 from app.db.models.blueprint import Blueprint
-from app.db.models.meeting_event import MeetingEvent
+from app.db.models.enums import SessionStatus, Platform
 from app.db.models.meeting_session import MeetingSession
-from app.db.models.enums import SessionStatus
 from app.modules.voxa.state_machine import MeetingStateMachine
 
 logger = logging.getLogger(__name__)
@@ -34,84 +36,94 @@ _EXTRACTION_TYPES = frozenset(
 class BlueprintAggregator:
     """Queries extraction events and produces a structured blueprint."""
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(self, db: AsyncClient) -> None:
         self._db = db
         self._sm = MeetingStateMachine(db)
 
     async def generate(self, session_id: uuid.UUID) -> Blueprint:
-        """Aggregate extraction events, write a Blueprint row, transition session.
-
-        Returns the created Blueprint object.
-        """
-        session_result = await self._db.execute(
-            select(MeetingSession).where(MeetingSession.id == session_id)
-        )
-        session = session_result.scalar_one_or_none()
-        if session is None:
+        """Aggregate extraction events, write a Blueprint document, transition session."""
+        sess_doc = await self._db.collection("sessions").document(str(session_id)).get()
+        if not sess_doc.exists:
             raise ValueError(f"Session {session_id} not found")
 
-        # Fetch all extraction events for this session.
-        events_result = await self._db.execute(
-            select(MeetingEvent)
-            .where(
-                MeetingEvent.session_id == session_id,
-                MeetingEvent.event_type.in_(_EXTRACTION_TYPES),
-            )
-            .order_by(MeetingEvent.timestamp.asc())
+        sess_data = sess_doc.to_dict()
+        session = MeetingSession(
+            id=session_id,
+            user_id=uuid.UUID(sess_data["user_id"]),
+            status=SessionStatus(sess_data["status"]),
+            platform=Platform(sess_data["platform"]),
+            meeting_url=sess_data.get("meeting_url"),
+            start_time=sess_data.get("start_time"),
+            end_time=sess_data.get("end_time"),
+            created_at=sess_data["created_at"],
         )
-        events = list(events_result.scalars())
 
-        if not events:
-            json_output = await self._synthesize_from_segments(session_id, session)
+        event_docs = (
+            await self._db.collection("sessions")
+            .document(str(session_id))
+            .collection("events")
+            .order_by("timestamp", direction="ASCENDING")
+            .get()
+        )
+        extraction_events = [
+            d.to_dict() for d in event_docs
+            if d.to_dict().get("event_type") in _EXTRACTION_TYPES
+        ]
+
+        if not extraction_events:
+            json_output = await self._synthesize_from_segments(session_id, session, event_docs)
         else:
-            json_output = _build_blueprint_json(session, events)
+            json_output = _build_blueprint_json(session, extraction_events)
 
-        blueprint = Blueprint(
-            session_id=session_id,
-            json_output=json_output,
-            approved=False,
-        )
-        self._db.add(blueprint)
-        await self._db.flush()  # populate blueprint.id
+        blueprint_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        await self._db.collection("blueprints").document(blueprint_id).set({
+            "session_id": str(session_id),
+            "json_output": json_output,
+            "approved": False,
+            "created_at": now,
+        })
 
         await self._sm.transition(
             session_id,
             SessionStatus.BLUEPRINT_READY,
-            extra_payload={"blueprint_id": str(blueprint.id)},
+            extra_payload={"blueprint_id": blueprint_id},
         )
 
         logger.info(
             "Blueprint generated session=%s blueprint=%s features=%d",
             session_id,
-            blueprint.id,
+            blueprint_id,
             len(json_output.get("features", [])),
         )
-        return blueprint
+        return Blueprint(
+            id=uuid.UUID(blueprint_id),
+            session_id=session_id,
+            json_output=json_output,
+            approved=False,
+            created_at=now,
+        )
 
     async def _synthesize_from_segments(
         self,
         session_id: uuid.UUID,
         session: MeetingSession,
+        all_event_docs,
     ) -> dict[str, Any]:
         """Fallback: concatenate stored transcript segments and run single-call synthesis."""
         from app.config import get_settings
 
-        segs_result = await self._db.execute(
-            select(MeetingEvent)
-            .where(
-                MeetingEvent.session_id == session_id,
-                MeetingEvent.event_type == "transcript.segment",
-            )
-            .order_by(MeetingEvent.timestamp.asc())
-        )
-        segments = list(segs_result.scalars())
+        segments = [
+            d.to_dict() for d in all_event_docs
+            if d.to_dict().get("event_type") == "transcript.segment"
+        ]
 
         if not segments:
-            logger.warning("No transcript segments found for session=%s — blueprint will be empty", session_id)
+            logger.warning("No transcript segments for session=%s — blueprint will be empty", session_id)
             return _build_blueprint_json(session, [])
 
         transcript = " ".join(
-            s.payload.get("text", "") for s in segments if s.payload
+            s.get("payload", {}).get("text", "") for s in segments
         ).strip()
 
         if not transcript:
@@ -158,16 +170,16 @@ class BlueprintAggregator:
 
 
 def _build_blueprint_json(
-    session: MeetingSession, events: list[MeetingEvent]
+    session: MeetingSession, events: list[dict]
 ) -> dict[str, Any]:
     app_desc_event = next(
-        (e for e in events if e.event_type == "APP_DESCRIPTION" and e.payload), None
+        (e for e in events if e.get("event_type") == "APP_DESCRIPTION" and e.get("payload")), None
     )
-    app_description = app_desc_event.payload.get("text", "") if app_desc_event else ""
-    features = [e.payload for e in events if e.event_type == "FEATURE_FOUND" and e.payload]
-    questions = [e.payload for e in events if e.event_type == "QUESTION_FOUND" and e.payload]
-    conflicts = [e.payload for e in events if e.event_type == "CONFLICT_FOUND" and e.payload]
-    action_items = [e.payload for e in events if e.event_type == "ACTION_ITEM_FOUND" and e.payload]
+    app_description = app_desc_event["payload"].get("text", "") if app_desc_event else ""
+    features = [e["payload"] for e in events if e.get("event_type") == "FEATURE_FOUND" and e.get("payload")]
+    questions = [e["payload"] for e in events if e.get("event_type") == "QUESTION_FOUND" and e.get("payload")]
+    conflicts = [e["payload"] for e in events if e.get("event_type") == "CONFLICT_FOUND" and e.get("payload")]
+    action_items = [e["payload"] for e in events if e.get("event_type") == "ACTION_ITEM_FOUND" and e.get("payload")]
 
     return {
         "version": "1.0",
@@ -181,5 +193,3 @@ def _build_blueprint_json(
         "action_items": action_items,
         "requirements_count": len(features) + len(questions) + len(conflicts) + len(action_items),
     }
-
-

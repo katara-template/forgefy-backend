@@ -1,8 +1,4 @@
-"""Import all models so SQLAlchemy metadata is fully populated.
-
-Alembic's env.py imports this module to ensure every table is registered
-before autogenerate or migration runs.
-"""
+"""Firestore document model dataclasses."""
 from app.db.models.blueprint import Blueprint
 from app.db.models.meeting_event import MeetingEvent
 from app.db.models.meeting_session import MeetingSession

@@ -16,7 +16,7 @@ from app.config import get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
 from app.core.rate_limit import limiter
-from app.db.session import build_engine, build_session_factory
+from app.db.firebase import init_firebase
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -26,11 +26,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan — startup and shutdown hooks."""
     settings = get_settings()
-    engine = build_engine(
-        settings.DATABASE_URL, echo=(settings.APP_ENV == "development")
-    )
-    app.state.db_engine = engine
-    app.state.db_session_factory = build_session_factory(engine)
+
+    firestore_client = init_firebase()
+    app.state.firestore = firestore_client
 
     redis_client: aioredis.Redis = aioredis.from_url(
         settings.REDIS_URL, decode_responses=True
@@ -41,7 +39,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
     logger.info("Forgefy backend shutting down")
     await redis_client.aclose()
-    await engine.dispose()
+    firestore_client.close()
 
 
 def create_app() -> FastAPI:

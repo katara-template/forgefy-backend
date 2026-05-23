@@ -1,10 +1,4 @@
-"""Blueprint worker — aggregates extraction events into a final blueprint.
-
-Receives session_id on the ``meeting.extract`` queue after all transcript
-segments have been processed.  Runs BlueprintAggregator to build the JSON
-document, saves a Blueprint row, transitions the session to BLUEPRINT_READY,
-and publishes a ``blueprintReady`` event to Redis.
-"""
+"""Blueprint worker — aggregates extraction events into a final blueprint."""
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +7,6 @@ import logging
 import uuid
 
 import redis as sync_redis
-from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 from app.workers.celery_app import celery_app
@@ -23,30 +16,23 @@ logger = logging.getLogger(__name__)
 _CHANNEL_PREFIX = "voxa:session:"
 
 
-async def _run_aggregation(session_id: str, database_url: str) -> str:
+async def _run_aggregation(session_id: str) -> str:
     """Run BlueprintAggregator in an async context; return blueprint_id string."""
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
+    from app.db.firebase import get_firestore_client
     from app.build.blueprint_generator import BlueprintAggregator
 
-    engine = create_async_engine(database_url, poolclass=NullPool)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    try:
-        async with factory() as db:
-            aggregator = BlueprintAggregator(db)
-            blueprint = await aggregator.generate(uuid.UUID(session_id))
-            await db.commit()
-            return str(blueprint.id)
-    finally:
-        await engine.dispose()
+    db = get_firestore_client()
+    aggregator = BlueprintAggregator(db)
+    blueprint = await aggregator.generate(uuid.UUID(session_id))
+    return str(blueprint.id)
 
 
 @celery_app.task(name="app.workers.blueprint_worker.generate_blueprint")
 def generate_blueprint(session_id: str) -> None:
-    """Aggregate requirements, create Blueprint row, notify via Redis."""
+    """Aggregate requirements, create Blueprint document, notify via Redis."""
     settings = get_settings()
 
-    blueprint_id = asyncio.run(_run_aggregation(session_id, settings.DATABASE_URL))
+    blueprint_id = asyncio.run(_run_aggregation(session_id))
 
     r = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
     try:

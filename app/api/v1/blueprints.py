@@ -1,14 +1,19 @@
-"""Blueprint endpoints: get and approve."""
+"""Blueprint endpoints: get and approve.
+
+Firestore collections used:
+  blueprints/{blueprint_id}  — session_id, json_output, approved, created_at
+  sessions/{session_id}      — user_id, status, ...
+"""
 import logging
 import uuid
+from datetime import datetime
 
 from fastapi import APIRouter
-from sqlalchemy import select
+from google.cloud.firestore import AsyncClient
 
 from app.core.exceptions import ForbiddenError, NotFoundError
 from app.db.models.blueprint import Blueprint
 from app.db.models.enums import SessionStatus
-from app.db.models.meeting_session import MeetingSession
 from app.deps import CurrentUser, DBSession
 from app.modules.voxa.state_machine import MeetingStateMachine
 from app.schemas.blueprint import BlueprintOut
@@ -17,25 +22,33 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _doc_to_blueprint(doc) -> Blueprint:
+    data = doc.to_dict()
+    return Blueprint(
+        id=uuid.UUID(doc.id),
+        session_id=uuid.UUID(data["session_id"]),
+        json_output=data.get("json_output"),
+        approved=data.get("approved", False),
+        created_at=data["created_at"],
+    )
+
+
 async def _get_owned_blueprint(
     blueprint_id: uuid.UUID,
     user_id: uuid.UUID,
-    db: DBSession,
+    db: AsyncClient,
 ) -> Blueprint:
-    """Load blueprint + session; raise 404/403 if missing or unowned."""
-    result = await db.execute(
-        select(Blueprint).where(Blueprint.id == blueprint_id)
-    )
-    blueprint = result.scalar_one_or_none()
-    if blueprint is None:
+    """Load blueprint; raise 404/403 if missing or session is unowned."""
+    doc = await db.collection("blueprints").document(str(blueprint_id)).get()
+    if not doc.exists:
         raise NotFoundError(f"Blueprint {blueprint_id} not found")
 
-    sess_result = await db.execute(
-        select(MeetingSession).where(MeetingSession.id == blueprint.session_id)
-    )
-    session = sess_result.scalar_one_or_none()
-    if session is None or session.user_id != user_id:
+    blueprint = _doc_to_blueprint(doc)
+
+    sess_doc = await db.collection("sessions").document(str(blueprint.session_id)).get()
+    if not sess_doc.exists or uuid.UUID(sess_doc.to_dict()["user_id"]) != user_id:
         raise ForbiddenError("Access denied")
+
     return blueprint
 
 
@@ -45,28 +58,22 @@ async def get_blueprint_by_session(
     db: DBSession,
     user: CurrentUser,
 ) -> BlueprintOut:
-    """Return the blueprint for a session (ownership-checked)."""
-    sess_result = await db.execute(
-        select(MeetingSession).where(
-            MeetingSession.id == session_id,
-            MeetingSession.user_id == user.id,
-        )
-    )
-    session = sess_result.scalar_one_or_none()
-    if session is None:
+    """Return the latest blueprint for a session (ownership-checked)."""
+    sess_doc = await db.collection("sessions").document(str(session_id)).get()
+    if not sess_doc.exists or uuid.UUID(sess_doc.to_dict()["user_id"]) != user.id:
         raise NotFoundError(f"Session {session_id} not found")
 
-    result = await db.execute(
-        select(Blueprint)
-        .where(Blueprint.session_id == session_id)
-        .order_by(Blueprint.created_at.desc())
+    docs = (
+        await db.collection("blueprints")
+        .where("session_id", "==", str(session_id))
+        .order_by("created_at", direction="DESCENDING")
         .limit(1)
+        .get()
     )
-    blueprint = result.scalar_one_or_none()
-    if blueprint is None:
+    if not docs:
         raise NotFoundError(f"No blueprint found for session {session_id}")
 
-    return BlueprintOut.model_validate(blueprint)
+    return BlueprintOut.model_validate(_doc_to_blueprint(docs[0]))
 
 
 @router.get("/{blueprint_id}", response_model=BlueprintOut)
@@ -86,10 +93,7 @@ async def approve_blueprint(
     db: DBSession,
     user: CurrentUser,
 ) -> BlueprintOut:
-    """Approve a blueprint: transition session BLUEPRINT_READY → APPROVED.
-
-    The Forgefy build engine integration is stubbed — see the TODO below.
-    """
+    """Approve a blueprint: transition session BLUEPRINT_READY → APPROVED."""
     blueprint = await _get_owned_blueprint(blueprint_id, user.id, db)
 
     sm = MeetingStateMachine(db)
@@ -99,12 +103,9 @@ async def approve_blueprint(
         extra_payload={"blueprint_id": str(blueprint_id), "approved_by": str(user.id)},
     )
 
+    await db.collection("blueprints").document(str(blueprint_id)).update({"approved": True})
     blueprint.approved = True
-    db.add(blueprint)
 
-    # TODO: dispatch to Forgefy build engine when multi-platform app
-    # generation is implemented.  For now we log the intent and leave the
-    # session in APPROVED state until the build engine calls back.
     logger.info(
         "TODO: dispatch build for session=%s blueprint=%s",
         blueprint.session_id,

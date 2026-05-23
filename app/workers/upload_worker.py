@@ -13,10 +13,10 @@ import asyncio
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import redis as sync_redis
-from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 from app.workers.celery_app import celery_app
@@ -57,10 +57,7 @@ def transcribe_upload(session_id: str, file_path: str) -> None:
         "is_final": True,
     }, settings)
 
-    # 3. Run extraction pipeline (Gemini or Claude based on BP_MODEL)
-    logger.info(
-        "Transcript preview session=%s: %.200s…", session_id, transcript.replace("\n", " ")
-    )
+    # 3. Run extraction pipeline
     from app.workers.extraction_worker import _run_extraction
     try:
         events = _run_extraction(transcript, settings)
@@ -69,7 +66,7 @@ def transcribe_upload(session_id: str, file_path: str) -> None:
         events = []
     logger.info("Extraction done session=%s events=%d backend=%s", session_id, len(events), settings.BP_MODEL)
 
-    # 4. Publish feature events for real-time UI, persist to DB, generate blueprint
+    # 4. Publish feature events for real-time UI
     for ev in events:
         _publish(session_id, {
             "type": "featureDetected",
@@ -78,7 +75,9 @@ def transcribe_upload(session_id: str, file_path: str) -> None:
             "payload": ev["payload"],
         }, settings)
 
-    blueprint_id = asyncio.run(_persist_and_generate(session_id, events, transcript, settings))
+    blueprint_id = asyncio.run(
+        _persist_and_generate(session_id, events, transcript, settings)
+    )
 
     # 5. Notify frontend blueprint is ready
     _publish(session_id, {
@@ -96,10 +95,8 @@ def transcribe_upload(session_id: str, file_path: str) -> None:
 
 def _transcribe(file_path: str, settings) -> str:
     """Call Deepgram pre-recorded API and return the full transcript string."""
-    import asyncio
-    from deepgram import AsyncDeepgramClient
-
     async def _run() -> str:
+        from deepgram import AsyncDeepgramClient
         dg = AsyncDeepgramClient(api_key=settings.DEEPGRAM_API_KEY)
         with open(file_path, "rb") as f:
             buffer = f.read()
@@ -125,34 +122,33 @@ def _publish(session_id: str, payload: dict, settings) -> None:
         r.close()
 
 
-async def _persist_and_generate(session_id: str, events: list[dict], transcript: str, settings) -> str:
-    """Persist extraction events and generate blueprint; return blueprint_id."""
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
+async def _persist_and_generate(
+    session_id: str, events: list[dict], transcript: str, settings
+) -> str:
+    """Persist extraction events to Firestore and generate blueprint; return blueprint_id."""
+    from app.db.firebase import get_firestore_client
     from app.build.blueprint_generator import BlueprintAggregator
-    from app.db.models.meeting_event import MeetingEvent
 
-    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    try:
-        async with factory() as db:
-            if transcript:
-                db.add(MeetingEvent(
-                    session_id=uuid.UUID(session_id),
-                    event_type="transcript.segment",
-                    payload={"text": transcript},
-                ))
-            for ev in events:
-                db.add(MeetingEvent(
-                    session_id=uuid.UUID(session_id),
-                    event_type=ev["sub_state"],
-                    payload=ev["payload"],
-                ))
-            await db.flush()
+    db = get_firestore_client()
+    events_ref = db.collection("sessions").document(session_id).collection("events")
+    now = datetime.now(timezone.utc)
 
-            aggregator = BlueprintAggregator(db)
-            blueprint = await aggregator.generate(uuid.UUID(session_id))
-            await db.commit()
-            return str(blueprint.id)
-    finally:
-        await engine.dispose()
+    if transcript:
+        await events_ref.document(str(uuid.uuid4())).set({
+            "session_id": session_id,
+            "event_type": "transcript.segment",
+            "payload": {"text": transcript},
+            "timestamp": now,
+        })
+
+    for ev in events:
+        await events_ref.document(str(uuid.uuid4())).set({
+            "session_id": session_id,
+            "event_type": ev["sub_state"],
+            "payload": ev["payload"],
+            "timestamp": now,
+        })
+
+    aggregator = BlueprintAggregator(db)
+    blueprint = await aggregator.generate(uuid.UUID(session_id))
+    return str(blueprint.id)
