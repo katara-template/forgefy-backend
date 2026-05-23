@@ -75,7 +75,12 @@ def create_app() -> FastAPI:
     # ── Routers ───────────────────────────────────────────────────────────────
     app.include_router(api_v1_router, prefix="/api/v1")
     app.include_router(ws_router)
-
+    # default route for sanity check    
+    @app.get("/", tags=["ops"], summary="Sanity check")
+    async def root() -> dict[str, str]:
+        """Basic endpoint to verify the service is running."""
+        return {"message": "Forgefy backend is up and running!"}
+    
     # ── Ops endpoints ─────────────────────────────────────────────────────────
     @app.get("/health", tags=["ops"], summary="Liveness probe")
     async def health(request: Request) -> dict[str, str]:
