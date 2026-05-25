@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     RECALL_WORKSPACE_VERIFICATION_SECRET: str = ""
     PUBLIC_API_BASE_URL: str = ""
 
+    # Sentry
+    SENTRY_DSN: str = ""
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def parse_cors_origins(cls, v: Any) -> list[str]:

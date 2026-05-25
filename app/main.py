@@ -4,8 +4,11 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 import redis.asyncio as aioredis
+import sentry_sdk
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.starlette import StarletteIntegration
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -20,6 +23,19 @@ from app.db.firebase import init_firebase
 
 configure_logging()
 logger = logging.getLogger(__name__)
+
+_settings = get_settings()
+if _settings.SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=_settings.SENTRY_DSN,
+        environment=_settings.APP_ENV,
+        integrations=[
+            StarletteIntegration(transaction_style="endpoint"),
+            FastApiIntegration(transaction_style="endpoint"),
+        ],
+        traces_sample_rate=1.0 if _settings.APP_ENV != "production" else 0.2,
+        send_default_pii=False,
+    )
 
 
 @asynccontextmanager
