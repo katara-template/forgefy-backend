@@ -1,4 +1,5 @@
 """Application settings loaded from environment / .env file."""
+import ast
 import json
 from functools import lru_cache
 from typing import Any
@@ -59,11 +60,19 @@ class Settings(BaseSettings):
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def parse_cors_origins(cls, v: Any) -> list[str]:
-        """Accept a JSON array string or a comma-separated string."""
+        """Accept a JSON array, a Python-style list, or a comma-separated string."""
+        if isinstance(v, list):
+            return v
         if isinstance(v, str):
             stripped = v.strip()
             if stripped.startswith("["):
-                return json.loads(stripped)
+                try:
+                    return json.loads(stripped)
+                except json.JSONDecodeError:
+                    # Fallback: handles single-quoted lists like ['url1', 'url2']
+                    result = ast.literal_eval(stripped)
+                    if isinstance(result, list):
+                        return [str(x) for x in result]
             return [origin.strip() for origin in stripped.split(",") if origin.strip()]
         return v
 
