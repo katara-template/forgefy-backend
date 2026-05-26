@@ -3,6 +3,7 @@ import logging
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,26 @@ class InvalidStateTransition(ForgefyError):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
+def _cors_headers(request: Request) -> dict[str, str]:
+    """Return CORS headers for the request origin by walking the middleware stack."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return {}
+    app = request.app
+    while hasattr(app, "app"):
+        if isinstance(app, CORSMiddleware):
+            if app.allow_all_origins or origin in app.allow_origins:
+                allow = origin if not app.allow_all_origins else "*"
+                return {
+                    "Access-Control-Allow-Origin": allow,
+                    "Access-Control-Allow-Credentials": "true",
+                    "Vary": "Origin",
+                }
+            return {}
+        app = app.app  # type: ignore[attr-defined]
+    return {}
+
+
 def _problem(exc: ForgefyError, request: Request) -> JSONResponse:
     """Build an RFC 7807 problem+json response."""
     slug = exc.__class__.__name__.lower()
@@ -70,7 +91,7 @@ def _problem(exc: ForgefyError, request: Request) -> JSONResponse:
             "detail": exc.detail,
             "instance": str(request.url),
         },
-        headers={"Content-Type": "application/problem+json"},
+        headers={"Content-Type": "application/problem+json", **_cors_headers(request)},
     )
 
 
@@ -100,5 +121,5 @@ def register_exception_handlers(app: FastAPI) -> None:
                 "detail": "An unexpected error occurred.",
                 "instance": str(request.url),
             },
-            headers={"Content-Type": "application/problem+json"},
+            headers={"Content-Type": "application/problem+json", **_cors_headers(request)},
         )

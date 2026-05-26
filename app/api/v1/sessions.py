@@ -124,10 +124,12 @@ async def get_session_transcript(
         .document(str(session_id))
         .collection("events")
         .where("event_type", "==", "transcript.segment")
-        .order_by("timestamp", direction="ASCENDING")
         .get()
     )
-    segments = [d.to_dict() for d in segment_docs]
+    segments = sorted(
+        [d.to_dict() for d in segment_docs],
+        key=lambda s: s.get("timestamp", ""),
+    )
     text = " ".join(
         s.get("payload", {}).get("text", "") for s in segments
     ).strip()
