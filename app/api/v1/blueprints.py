@@ -66,14 +66,13 @@ async def get_blueprint_by_session(
     docs = (
         await db.collection("blueprints")
         .where("session_id", "==", str(session_id))
-        .order_by("created_at", direction="DESCENDING")
-        .limit(1)
         .get()
     )
     if not docs:
         raise NotFoundError(f"No blueprint found for session {session_id}")
 
-    return BlueprintOut.model_validate(_doc_to_blueprint(docs[0]))
+    latest = max(docs, key=lambda d: d.to_dict().get("created_at", ""))
+    return BlueprintOut.model_validate(_doc_to_blueprint(latest))
 
 
 @router.get("/{blueprint_id}", response_model=BlueprintOut)

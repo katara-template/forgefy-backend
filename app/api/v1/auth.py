@@ -43,24 +43,63 @@ async def register(
     settings: SettingsDep,
 ) -> TokenResponse:
     """Create a new user account; return access + refresh tokens."""
-    existing = await db.collection("users").where("email", "==", body.email).limit(1).get()
-    if existing:
-        raise ConflictError(f"'{body.email}' is already registered")
+    try:
+        logger.debug("Register request for email: %s", body.email)
+        
+        # Check if email already exists
+        try:
+            existing = await db.collection("users").where("email", "==", body.email).limit(1).get()
+            if existing:
+                logger.warning("Registration attempt with existing email: %s", body.email)
+                raise ConflictError(f"'{body.email}' is already registered")
+        except ConflictError:
+            raise
+        except Exception as e:
+            logger.error("Database query error during email check: %s", e, exc_info=True)
+            raise
 
-    user_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc)
-    await db.collection("users").document(user_id).set({
-        "email": body.email,
-        "hashed_password": hash_password(body.password),
-        "created_at": now,
-        "updated_at": now,
-    })
+        # Generate user ID and timestamp
+        user_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        
+        # Hash password
+        try:
+            hashed_pwd = hash_password(body.password)
+        except Exception as e:
+            logger.error("Password hashing failed: %s", e, exc_info=True)
+            raise
 
-    logger.info("User registered: id=%s", user_id)
-    return TokenResponse(
-        access_token=create_access_token(user_id, settings),
-        refresh_token=create_refresh_token(user_id, settings),
-    )
+        # Write user to Firestore
+        try:
+            await db.collection("users").document(user_id).set({
+                "email": body.email,
+                "hashed_password": hashed_pwd,
+                "created_at": now,
+                "updated_at": now,
+            })
+        except Exception as e:
+            logger.error("Firestore write error: %s", e, exc_info=True)
+            raise
+
+        # Generate tokens
+        try:
+            access_token = create_access_token(user_id, settings)
+            refresh_token = create_refresh_token(user_id, settings)
+        except Exception as e:
+            logger.error("Token generation failed: %s", e, exc_info=True)
+            raise
+
+        logger.info("User registered successfully: id=%s, email=%s", user_id, body.email)
+        return TokenResponse(
+            access_token=access_token,
+            refresh_token=refresh_token,
+        )
+    
+    except ConflictError:
+        raise
+    except Exception as e:
+        logger.error("Unexpected error during registration for %s: %s", body.email, e, exc_info=True)
+        raise
 
 
 @router.post("/login", response_model=TokenResponse)
