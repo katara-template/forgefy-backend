@@ -14,6 +14,8 @@ celery_app = Celery(
         "app.workers.transcription_worker",
         "app.workers.extraction_worker",
         "app.workers.blueprint_worker",
+        "app.workers.build_worker",
+        "app.workers.update_worker",
     ],
 )
 
@@ -29,5 +31,7 @@ celery_app.conf.update(
         "app.workers.transcription_worker.*": {"queue": "meeting.audio"},
         "app.workers.extraction_worker.*": {"queue": "meeting.transcribe"},
         "app.workers.blueprint_worker.*": {"queue": "meeting.extract"},
+        "app.workers.build_worker.*": {"queue": "build"},
+        "app.workers.update_worker.*": {"queue": "build"},
     },
 )

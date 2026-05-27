@@ -54,6 +54,31 @@ class Settings(BaseSettings):
     RECALL_WORKSPACE_VERIFICATION_SECRET: str = ""
     PUBLIC_API_BASE_URL: str = ""
 
+    # Cloudinary (APK / bundle storage)
+    CLOUDINARY_CLOUD_NAME: str = ""
+    CLOUDINARY_API_KEY: str = ""
+    CLOUDINARY_API_SECRET: str = ""
+
+    # Cloudflare Pages (web preview deployments)
+    CLOUDFLARE_ACCOUNT_ID: str = ""
+    CLOUDFLARE_API_TOKEN: str = ""
+
+    # Appetize.io (Flutter APK browser preview)
+    APPETIZE_API_TOKEN: str = ""
+
+    # GitHub OAuth App (for linking user personal GitHub)
+    GITHUB_CLIENT_ID: str = ""
+    GITHUB_CLIENT_SECRET: str = ""
+    FRONTEND_URL: str = "http://localhost:3000"
+
+    # GitHub
+    GITHUB_TOKEN: str = ""
+
+    # Build templates (cloneable git repo URLs)
+    TEMPLATE_FLUTTER: str = "https://github.com/seenickcode/flutter_starter"
+    TEMPLATE_REACT_NATIVE: str = "https://github.com/obytes/react-native-template-obytes"
+    TEMPLATE_NEXT: str = "https://github.com/ixartz/Next-js-Boilerplate"
+
     # Sentry
     SENTRY_DSN: str = ""
 

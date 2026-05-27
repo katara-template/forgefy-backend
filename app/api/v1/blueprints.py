@@ -30,6 +30,12 @@ def _doc_to_blueprint(doc) -> Blueprint:
         json_output=data.get("json_output"),
         approved=data.get("approved", False),
         created_at=data["created_at"],
+        repo_url=data.get("repo_url"),
+        repo_name=data.get("repo_name"),
+        build_summary=data.get("build_summary"),
+        build_status=data.get("build_status"),
+        artifact_url=data.get("artifact_url"),
+        preview_url=data.get("preview_url"),
     )
 
 
@@ -105,10 +111,8 @@ async def approve_blueprint(
     await db.collection("blueprints").document(str(blueprint_id)).update({"approved": True})
     blueprint.approved = True
 
-    logger.info(
-        "TODO: dispatch build for session=%s blueprint=%s",
-        blueprint.session_id,
-        blueprint_id,
-    )
+    from app.workers.build_worker import run_build
+    run_build.apply_async(args=[str(blueprint.session_id)], queue="build")
+    logger.info("Build dispatched session=%s blueprint=%s", blueprint.session_id, blueprint_id)
 
     return BlueprintOut.model_validate(blueprint)

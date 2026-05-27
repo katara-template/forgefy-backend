@@ -14,3 +14,9 @@ class Blueprint:
     json_output: dict[str, Any] | None
     approved: bool
     created_at: datetime
+    repo_url: str | None = None
+    repo_name: str | None = None
+    build_summary: str | None = None
+    build_status: str | None = None
+    artifact_url: str | None = None
+    preview_url: str | None = None

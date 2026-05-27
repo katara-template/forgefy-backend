@@ -1,16 +1,24 @@
-"""Auth endpoints: register, login, refresh, Google OAuth.
+"""Auth endpoints: register, login, refresh, Google OAuth, GitHub OAuth.
 
 All routes are rate-limited to 60 req/min per IP.
 
 Firestore collections used:
   users/{user_id}  — email, hashed_password, created_at, updated_at
 """
+import base64
+import hashlib
+import hmac
+import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 import firebase_admin.auth
-from fastapi import APIRouter, Request
+import httpx
+from fastapi import APIRouter, Query, Request
+from fastapi.responses import RedirectResponse
 
 from app.core.exceptions import ConflictError, UnauthorizedError
 from app.core.rate_limit import limiter
@@ -180,3 +188,112 @@ async def google_auth(
         access_token=create_access_token(user_id, settings),
         refresh_token=create_refresh_token(user_id, settings),
     )
+
+
+# ---------------------------------------------------------------------------
+# GitHub OAuth — link a personal GitHub account to the Forgefy user
+# ---------------------------------------------------------------------------
+
+def _make_state(user_id: str, secret: str) -> str:
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"uid": user_id, "ts": int(time.time())}).encode()
+    ).decode()
+    sig = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()[:16]
+    return f"{payload}.{sig}"
+
+
+def _verify_state(state: str, secret: str) -> str | None:
+    """Return user_id if state is valid and fresh, else None."""
+    parts = state.rsplit(".", 1)
+    if len(parts) != 2:
+        return None
+    payload_b64, sig = parts
+    expected = hmac.new(secret.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()[:16]
+    if sig != expected:
+        return None
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload_b64).decode())
+    except Exception:
+        return None
+    if time.time() - data.get("ts", 0) > 600:
+        return None
+    return data.get("uid")
+
+
+from app.deps import CurrentUser  # noqa: E402 — circular-safe here
+
+
+@router.get("/github/authorize")
+async def github_authorize(
+    settings: SettingsDep,
+    user: CurrentUser,
+) -> dict:
+    """Return the GitHub OAuth redirect URL for the current user."""
+    if not settings.GITHUB_CLIENT_ID:
+        return {"error": "GitHub OAuth not configured"}
+    state = _make_state(str(user.id), settings.SECRET_KEY)
+    params = urlencode({
+        "client_id": settings.GITHUB_CLIENT_ID,
+        "redirect_uri": f"{settings.PUBLIC_API_BASE_URL}/api/v1/auth/github/callback",
+        "scope": "repo",
+        "state": state,
+    })
+    return {"url": f"https://github.com/login/oauth/authorize?{params}"}
+
+
+@router.get("/github/callback")
+async def github_callback(
+    code: str = Query(...),
+    state: str = Query(...),
+    db: DBSession = None,
+    settings: SettingsDep = None,
+) -> RedirectResponse:
+    """Exchange code for GitHub token, store on user, redirect to frontend."""
+    user_id = _verify_state(state, settings.SECRET_KEY)
+    if not user_id:
+        return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?github_error=invalid_state")
+
+    try:
+        resp = httpx.post(
+            "https://github.com/login/oauth/access_token",
+            headers={"Accept": "application/json"},
+            data={
+                "client_id": settings.GITHUB_CLIENT_ID,
+                "client_secret": settings.GITHUB_CLIENT_SECRET,
+                "code": code,
+            },
+            timeout=30,
+        )
+        token_data = resp.json()
+        github_token = token_data.get("access_token")
+        if not github_token:
+            return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?github_error=exchange_failed")
+
+        user_resp = httpx.get(
+            "https://api.github.com/user",
+            headers={"Authorization": f"Bearer {github_token}", "Accept": "application/json"},
+            timeout=15,
+        )
+        github_username: str = user_resp.json().get("login", "")
+
+        await db.collection("users").document(user_id).update({
+            "github_access_token": github_token,
+            "github_username": github_username,
+        })
+        logger.info("GitHub linked user=%s username=%s", user_id, github_username)
+    except Exception as exc:
+        logger.error("GitHub OAuth callback error: %s", exc)
+        return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?github_error=server_error")
+
+    return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?github=connected")
+
+
+@router.get("/github/status")
+async def github_status(db: DBSession, user: CurrentUser) -> dict:
+    """Return whether the current user has a linked GitHub account."""
+    doc = await db.collection("users").document(str(user.id)).get()
+    data = doc.to_dict() if doc.exists else {}
+    return {
+        "linked": bool(data.get("github_access_token")),
+        "username": data.get("github_username"),
+    }
