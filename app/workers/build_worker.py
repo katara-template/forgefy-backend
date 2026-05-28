@@ -189,14 +189,6 @@ async def _patch_blueprint(blueprint_id: str, updates: dict) -> None:
     await db.collection("blueprints").document(blueprint_id).update(updates)
 
 
-async def _get_user_github_token(user_id: str) -> str | None:
-    from app.db.firebase import get_firestore_client
-
-    db = get_firestore_client()
-    doc = await db.collection("users").document(user_id).get()
-    if doc.exists:
-        return doc.to_dict().get("github_access_token")
-    return None
 
 
 async def _run(session_id: str) -> dict:
@@ -236,10 +228,11 @@ async def _run(session_id: str) -> dict:
     )
     app_name = _slugify(raw)
 
-    # 4. Resolve GitHub token
+    # 4. Resolve GitHub token (validates personal token; falls back to system if invalid)
+    from app.build.github_token import get_valid_github_token
     sess_doc = await db.collection("sessions").document(session_id).get()
     owner_id: str = sess_doc.to_dict()["user_id"] if sess_doc.exists else ""
-    github_token = (await _get_user_github_token(owner_id)) or settings.GITHUB_TOKEN
+    github_token = await get_valid_github_token(owner_id, settings.GITHUB_TOKEN)
 
     # 5. Transition to BUILDING
     sm = MeetingStateMachine(db)

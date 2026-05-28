@@ -29,14 +29,6 @@ async def _patch_project(project_id: str, updates: dict) -> None:
     await db.collection("projects").document(project_id).update(updates)
 
 
-async def _get_user_github_token(user_id: str) -> str | None:
-    from app.db.firebase import get_firestore_client
-
-    db = get_firestore_client()
-    doc = await db.collection("users").document(user_id).get()
-    if doc.exists:
-        return doc.to_dict().get("github_access_token")
-    return None
 
 
 async def _run(project_id: str, prompt: str, user_id: str) -> dict:
@@ -51,8 +43,9 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
     repo_full_name: str = project["repo_full_name"]
     blueprint_context: dict = project.get("blueprint_context") or {}
 
-    # Get the right GitHub token (user's personal one if linked)
-    github_token = await _get_user_github_token(user_id) or settings.GITHUB_TOKEN
+    # Get the right GitHub token (validates personal token; falls back to system if invalid)
+    from app.build.github_token import get_valid_github_token
+    github_token = await get_valid_github_token(user_id, settings.GITHUB_TOKEN)
     push_url = f"https://{github_token}@github.com/{repo_full_name}.git"
 
     await _patch_project(project_id, {"is_updating": True})
