@@ -59,8 +59,13 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
 
     workspace = EditWorkspace(uuid.UUID(project_id), repo_full_name, github_token)
 
+    from app.build.build_logger import make_log_publisher
+    log_fn = make_log_publisher(project_id, settings.REDIS_URL)
+    log_fn("started", f"Applying update to {app_name}…")
+
     try:
-        workspace.ensure()  # clone from GitHub if workspace doesn't exist
+        workspace.ensure()
+        log_fn("info", "Workspace ready, running update agent…")
 
         summary = run_update_agent(
             workspace=workspace.path,
@@ -69,8 +74,10 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
             app_name=app_name,
             api_key=settings.ANTHROPIC_API_KEY,
             model=settings.ANTHROPIC_MODEL,
+            log_fn=log_fn,
         )
 
+        log_fn("info", "Pushing changes to GitHub…")
         workspace.sync_to_github(
             commit_message=f"feat: {prompt[:60]}",
             push_url=push_url,
@@ -79,15 +86,23 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         now = datetime.now(timezone.utc)
         await _patch_project(project_id, {
             "is_updating": False,
+            "build_error": None,
             "updated_at": now,
         })
 
+        log_fn("done", "Update complete! Changes pushed to GitHub.")
         logger.info("Update done project=%s prompt=%s", project_id, prompt[:40])
         return {"summary": summary}
 
     except Exception as exc:
+        error_msg = str(exc)[:500]
         logger.error("Update FAILED project=%s: %s", project_id, exc, exc_info=True)
-        await _patch_project(project_id, {"is_updating": False})
+        await _patch_project(project_id, {
+            "is_updating": False,
+            "build_error": error_msg,
+            "updated_at": datetime.now(timezone.utc),
+        })
+        log_fn("error", f"Update failed: {error_msg}")
         raise
 
 

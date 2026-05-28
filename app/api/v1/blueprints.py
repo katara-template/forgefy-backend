@@ -11,7 +11,9 @@ from datetime import datetime
 from fastapi import APIRouter
 from google.cloud.firestore import AsyncClient
 
-from app.core.exceptions import ForbiddenError, NotFoundError
+from pydantic import BaseModel
+
+from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
 from app.db.models.blueprint import Blueprint
 from app.db.models.enums import SessionStatus
 from app.deps import CurrentUser, DBSession
@@ -89,6 +91,39 @@ async def get_blueprint(
 ) -> BlueprintOut:
     """Retrieve a blueprint by ID."""
     blueprint = await _get_owned_blueprint(blueprint_id, user.id, db)
+    return BlueprintOut.model_validate(blueprint)
+
+
+class BlueprintPatchRequest(BaseModel):
+    app_name: str | None = None
+    template_key: str | None = None
+    features: list[dict] | None = None
+
+
+@router.patch("/{blueprint_id}", response_model=BlueprintOut)
+async def patch_blueprint(
+    blueprint_id: uuid.UUID,
+    body: BlueprintPatchRequest,
+    db: DBSession,
+    user: CurrentUser,
+) -> BlueprintOut:
+    """Edit app_name, template, or features before approving a blueprint."""
+    blueprint = await _get_owned_blueprint(blueprint_id, user.id, db)
+
+    if blueprint.approved:
+        raise ValidationError("Cannot edit an already-approved blueprint")
+
+    current: dict = dict(blueprint.json_output or {})
+
+    if body.app_name is not None:
+        current["app_name"] = body.app_name
+    if body.template_key is not None:
+        current["template"] = body.template_key
+    if body.features is not None:
+        current["features"] = body.features
+
+    await db.collection("blueprints").document(str(blueprint_id)).update({"json_output": current})
+    blueprint.json_output = current
     return BlueprintOut.model_validate(blueprint)
 
 

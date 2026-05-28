@@ -87,9 +87,15 @@ class DeepgramLiveSession:
     # ── internal ──────────────────────────────────────────────────────────────
 
     async def _flush_loop(self) -> None:
+        """Periodic flush loop — keeps running even if individual flushes fail."""
         while self._running:
-            await asyncio.sleep(_FLUSH_INTERVAL)
-            await self._flush()
+            try:
+                await asyncio.sleep(_FLUSH_INTERVAL)
+                await self._flush()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("Flush loop error (continuing) session=%s: %s", self._session_id, exc)
 
     async def _flush(self) -> None:
         async with self._lock:
@@ -101,52 +107,62 @@ class DeepgramLiveSession:
         if len(chunk) >= _MIN_CHUNK_BYTES:
             await self._transcribe_chunk(chunk)
 
-    async def _transcribe_chunk(self, audio_bytes: bytes) -> None:
-        try:
-            wav_bytes = _pcm16_to_wav(audio_bytes)
-            dg = AsyncDeepgramClient(api_key=self._api_key)
-            response = await dg.listen.v1.media.transcribe_file(
-                request=wav_bytes,
-                model=self._model,
-                punctuate=True,
-            )
-
-            if not (response.results and response.results.channels):
-                return
-            alts = response.results.channels[0].alternatives
-            if not alts:
-                return
-            text = alts[0].transcript
-            if not text:
-                return
-
-            msg = {
-                "type": "transcript",
-                "session_id": self._session_id,
-                "text": text,
-                "is_final": True,
-            }
-
-            r = aioredis.from_url(self._redis_url, decode_responses=True)
+    async def _transcribe_chunk(self, audio_bytes: bytes, *, _retries: int = 2) -> None:
+        """Transcribe one audio chunk; retries up to _retries times on failure."""
+        for attempt in range(_retries + 1):
             try:
-                await r.publish(
-                    f"{_CHANNEL_PREFIX}{self._session_id}",
-                    json.dumps(msg),
+                wav_bytes = _pcm16_to_wav(audio_bytes)
+                dg = AsyncDeepgramClient(api_key=self._api_key)
+                response = await dg.listen.v1.media.transcribe_file(
+                    request=wav_bytes,
+                    model=self._model,
+                    punctuate=True,
                 )
-            finally:
-                await r.aclose()
 
-            # Enqueue LangGraph extraction
-            from app.workers.extraction_worker import extract_requirements
-            extract_requirements.apply_async(
-                args=[self._session_id, text],
-                queue="meeting.transcribe",
-            )
+                if not (response.results and response.results.channels):
+                    return
+                alts = response.results.channels[0].alternatives
+                if not alts:
+                    return
+                text = alts[0].transcript
+                if not text:
+                    return
 
-            logger.debug("Chunk transcribed session=%s chars=%d", self._session_id, len(text))
+                msg = {
+                    "type": "transcript",
+                    "session_id": self._session_id,
+                    "text": text,
+                    "is_final": True,
+                }
 
-        except Exception as exc:
-            logger.warning(
-                "Chunk transcription error session=%s: %s",
-                self._session_id, exc, exc_info=True,
-            )
+                r = aioredis.from_url(self._redis_url, decode_responses=True)
+                try:
+                    await r.publish(
+                        f"{_CHANNEL_PREFIX}{self._session_id}",
+                        json.dumps(msg),
+                    )
+                finally:
+                    await r.aclose()
+
+                from app.workers.extraction_worker import extract_requirements
+                extract_requirements.apply_async(
+                    args=[self._session_id, text],
+                    queue="meeting.transcribe",
+                )
+
+                logger.debug("Chunk transcribed session=%s chars=%d", self._session_id, len(text))
+                return
+
+            except Exception as exc:
+                if attempt < _retries:
+                    backoff = 2 ** attempt
+                    logger.warning(
+                        "Transcription attempt %d failed session=%s, retrying in %ds: %s",
+                        attempt + 1, self._session_id, backoff, exc,
+                    )
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.warning(
+                        "Chunk transcription failed after %d attempts session=%s: %s",
+                        _retries + 1, self._session_id, exc,
+                    )
