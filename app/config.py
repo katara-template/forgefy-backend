@@ -85,6 +85,20 @@ class Settings(BaseSettings):
     # Sentry
     SENTRY_DSN: str = ""
 
+    @field_validator("REDIS_URL", "CELERY_BROKER_URL", "CELERY_RESULT_BACKEND", mode="before")
+    @classmethod
+    def fix_rediss_ssl(cls, v: Any) -> Any:
+        """Append ssl_cert_reqs=CERT_NONE to rediss:// URLs that omit it.
+
+        Celery (and redis-py) require this parameter on SSL Redis URLs or they
+        raise ValueError at startup. Cloud providers (Render, Railway, Upstash)
+        give you a bare rediss:// URL without it.
+        """
+        if isinstance(v, str) and v.startswith("rediss://") and "ssl_cert_reqs" not in v:
+            sep = "&" if "?" in v else "?"
+            return f"{v}{sep}ssl_cert_reqs=CERT_NONE"
+        return v
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def parse_cors_origins(cls, v: Any) -> list[str]:
