@@ -22,6 +22,15 @@ class GitHubClient:
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
+    def is_token_valid(self) -> bool:
+        """Return True if the token can authenticate against GitHub API."""
+        try:
+            with httpx.Client(timeout=10) as client:
+                resp = client.get(f"{self._BASE}/user", headers=self._headers)
+                return resp.status_code == 200
+        except Exception:
+            return False
+
     def create_repo(self, name: str, description: str = "", private: bool = True) -> dict:
         """Create a new GitHub repo; return the full API response dict."""
         with httpx.Client(timeout=30) as client:

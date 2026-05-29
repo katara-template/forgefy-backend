@@ -24,6 +24,7 @@ class ProjectOut(BaseModel):
     preview_url: str | None = None
     artifact_url: str | None = None
     is_updating: bool = False
+    build_error: str | None = None
 
 
 class UpdateProjectRequest(BaseModel):

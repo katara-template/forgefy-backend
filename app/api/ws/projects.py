@@ -80,4 +80,5 @@ def _coerce(d: dict) -> dict:
         "preview_url": d.get("preview_url"),
         "artifact_url": d.get("artifact_url"),
         "is_updating": d.get("is_updating", False),
+        "build_error": d.get("build_error"),
     }
