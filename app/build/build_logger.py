@@ -20,13 +20,15 @@ _TOOL_LABELS: dict[str, str] = {
     "create_directory": "Creating directory",
     "delete_file": "Deleting",
     "move_file": "Moving",
+    "generate_image": "Generating image",
+    "generate_video": "Generating video",
 }
 
 
 def tool_message(tool_name: str, inputs: dict) -> str:
     """Return a human-readable label for a tool call."""
     label = _TOOL_LABELS.get(tool_name, tool_name)
-    path = inputs.get("path") or inputs.get("source") or ""
+    path = inputs.get("path") or inputs.get("source") or inputs.get("filename") or ""
     return f"{label} `{path}`" if path else label
 
 

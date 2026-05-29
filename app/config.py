@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     TEMPLATE_REACT_NATIVE: str = "https://github.com/obytes/react-native-template-obytes"
     TEMPLATE_NEXT: str = "https://github.com/ixartz/Next-js-Boilerplate"
 
+    # fal.ai (image + video generation)
+    FAL_API_KEY: str = ""
+
     # Sentry
     SENTRY_DSN: str = ""
 

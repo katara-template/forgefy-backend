@@ -24,7 +24,13 @@ Instructions:
 3. Update the app name and description everywhere it appears.
 4. Implement every feature listed in the blueprint — write real, working code; no placeholders or TODOs.
 5. Create all screens, components, and logic the features require.
-6. When the implementation is complete, write a short summary starting with the word DONE.
+6. Use `generate_image` to create real visual assets (backgrounds, hero images, illustrations, onboarding artwork, icons) — do not use placeholder URLs or leave image slots empty.
+7. Use `generate_video` for splash screens, onboarding loops, or background videos when the app calls for them.
+8. After generating an asset, immediately reference it correctly in your code:
+   - Flutter: Image.asset('assets/images/<filename>') — also declare assets/images/ and assets/videos/ under flutter > assets in pubspec.yaml
+   - Next.js: <img src="/images/<filename>"> or next/image with src="/images/<filename>"
+   - React Native: <Image source={require('./assets/images/<filename>')} />
+9. When the implementation is complete, write a short summary starting with the word DONE.
 
 Use the file tools freely. Write production-quality code."""
 
@@ -52,7 +58,12 @@ def run_build_agent(
 
 _UPDATE_SYSTEM = """You are the Forgefy Update Agent making changes to an existing application.
 Apply only what the user asked for. Do not rewrite working code unnecessarily.
-Read the relevant files first, make the changes, then write a short summary starting with DONE."""
+Read the relevant files first, make the changes, then write a short summary starting with DONE.
+
+If the update requires new images or videos (e.g. the user asks for a new screen, a banner, a background):
+- Use `generate_image` or `generate_video` to create the asset and save it to the assets folder.
+- Reference the saved path in the code you write or modify.
+- For Flutter: ensure assets/ directories are declared in pubspec.yaml."""
 
 
 def run_update_agent(
