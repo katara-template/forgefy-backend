@@ -36,7 +36,22 @@ async def ws_build_logs(
     logger.info("ws/build_logs connected project=%s", project_id)
 
     channel = f"build:{project_id}:logs"
+    history_key = f"build:{project_id}:log_history"
     redis = ws.app.state.redis
+
+    # Replay history before subscribing so the client never misses earlier entries.
+    # Subscribe first, then replay — this ordering means any events emitted between
+    # the two steps arrive via pub/sub and are de-duplicated on the client by ordering
+    # (history entries all arrive before the first live message).
+    async with redis.pubsub() as pubsub:
+        await pubsub.subscribe(channel)
+
+        history: list[str] = await redis.lrange(history_key, 0, -1)
+        for entry in history:
+            try:
+                await ws.send_text(entry)
+            except Exception:
+                return  # client already gone
 
     async def forward_logs(pubsub) -> None:
         """Poll Redis pub/sub and forward events to the WebSocket."""

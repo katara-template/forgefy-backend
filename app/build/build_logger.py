@@ -32,13 +32,23 @@ def tool_message(tool_name: str, inputs: dict) -> str:
     return f"{label} `{path}`" if path else label
 
 
+_LOG_HISTORY_MAX = 200   # entries kept in the Redis list per project
+_LOG_HISTORY_TTL = 7200  # seconds — 2 hours (covers any realistic build duration)
+
+
 def make_log_publisher(project_id: str, redis_url: str) -> Callable[[str, str], None]:
     """Return a sync callable that publishes build log events.
+
+    Each event is:
+      1. Published on pub/sub channel  build:{project_id}:logs  (live subscribers)
+      2. Appended to the Redis list    build:{project_id}:log_history  (replay buffer)
+         The list is capped at _LOG_HISTORY_MAX entries and expires after _LOG_HISTORY_TTL.
 
     Event JSON:  { "type": "<event_type>", "message": "<text>" }
     Event types: started | info | thinking | tool | warning | error | done
     """
     channel = f"build:{project_id}:logs"
+    history_key = f"build:{project_id}:log_history"
     _client: object = None
 
     def _get_client():
@@ -50,7 +60,14 @@ def make_log_publisher(project_id: str, redis_url: str) -> Callable[[str, str], 
 
     def publish(event_type: str, message: str) -> None:
         try:
-            _get_client().publish(channel, json.dumps({"type": event_type, "message": message}))
+            payload = json.dumps({"type": event_type, "message": message})
+            r = _get_client()
+            pipe = r.pipeline()
+            pipe.publish(channel, payload)
+            pipe.rpush(history_key, payload)
+            pipe.ltrim(history_key, -_LOG_HISTORY_MAX, -1)
+            pipe.expire(history_key, _LOG_HISTORY_TTL)
+            pipe.execute()
         except Exception as exc:
             logger.debug("build_logger publish error: %s", exc)
 

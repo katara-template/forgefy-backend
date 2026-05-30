@@ -13,7 +13,8 @@ from app.build.build_logger import tool_message
 
 logger = logging.getLogger(__name__)
 
-_MAX_ITERATIONS = 60
+_MAX_ITERATIONS = 80
+_WARN_AT_ITERATION = 50
 
 _BUILD_SYSTEM = """You are the Forgefy Build Agent.
 Your task: implement a complete, working application from a product blueprint by modifying the files in the workspace provided to you via tools.
@@ -97,7 +98,10 @@ def _loop(
 ) -> str:
     messages: list[dict[str, Any]] = [{"role": "user", "content": initial_user_msg}]
 
-    for _ in range(_MAX_ITERATIONS):
+    for iteration in range(_MAX_ITERATIONS):
+        if iteration == _WARN_AT_ITERATION and log_fn:
+            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
+
         if log_fn:
             log_fn("thinking", "Thinking…")
 
