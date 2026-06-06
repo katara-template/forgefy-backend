@@ -54,7 +54,7 @@ services:
     command: >
       celery -A app.workers.celery_app worker
       --loglevel=info
-      -Q meeting.audio,meeting.transcribe,meeting.extract
+      -Q meeting.audio,meeting.transcribe,meeting.extract,build
 
   beat:
     build: .

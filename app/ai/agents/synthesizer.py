@@ -19,6 +19,8 @@ def run(transcript: str, api_key: str, model: str) -> list[dict]:
     result = call_claude(_SYSTEM, transcript, api_key, model, max_tokens=2048)
 
     events: list[dict] = []
+    if app_name := result.get("app_name", ""):
+        events.append({"sub_state": "APP_NAME", "payload": {"text": app_name}})
     if app_desc := result.get("app_description", ""):
         events.append({"sub_state": "APP_DESCRIPTION", "payload": {"text": app_desc}})
     for feature in result.get("features", []):

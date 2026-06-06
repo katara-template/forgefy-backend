@@ -79,9 +79,21 @@ def transcribe_upload(session_id: str, file_path: str) -> None:
     if feature_msgs:
         _publish_many(session_id, feature_msgs, settings)
 
-    blueprint_id = asyncio.run(
-        _persist_and_generate(session_id, events, transcript, settings)
-    )
+    loop = asyncio.new_event_loop()
+    try:
+        blueprint_id = loop.run_until_complete(
+            _persist_and_generate(session_id, events, transcript, settings)
+        )
+    except Exception as exc:
+        logger.error("Blueprint generation failed session=%s: %s", session_id, exc, exc_info=True)
+        _publish_many(session_id, [{
+            "type": "blueprintError",
+            "session_id": session_id,
+            "error": str(exc),
+        }], settings)
+        return
+    finally:
+        loop.close()
 
     # 5. Notify frontend blueprint is ready
     _publish_many(session_id, [{
@@ -115,7 +127,11 @@ def _transcribe(file_path: str, settings) -> str:
         alts = response.results.channels[0].alternatives
         return alts[0].transcript if alts else ""
 
-    return asyncio.run(_run())
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_run())
+    finally:
+        loop.close()
 
 
 def _publish_many(session_id: str, payloads: list[dict], settings) -> None:
@@ -135,10 +151,10 @@ async def _persist_and_generate(
     session_id: str, events: list[dict], transcript: str, settings
 ) -> str:
     """Persist extraction events to Firestore (batched) and generate blueprint."""
-    from app.db.firebase import get_firestore_client
+    from app.db.firebase import refresh_async_firestore_client
     from app.build.blueprint_generator import BlueprintAggregator
 
-    db = get_firestore_client()
+    db = refresh_async_firestore_client()
     events_ref = db.collection("sessions").document(session_id).collection("events")
     now = datetime.now(timezone.utc)
 

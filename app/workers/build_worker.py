@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import uuid
@@ -191,17 +192,17 @@ async def _patch_blueprint(blueprint_id: str, updates: dict) -> None:
 
 
 
-async def _run(session_id: str) -> dict:
+async def _run(session_id: str, project_id: str) -> dict:
     from app.build.workspace import Workspace
     from app.build.github_client import GitHubClient
     from app.build.build_agent import run_build_agent
     from app.build.build_logger import make_log_publisher
-    from app.db.firebase import get_firestore_client
+    from app.db.firebase import refresh_async_firestore_client
     from app.db.models.enums import SessionStatus
     from app.modules.voxa.state_machine import MeetingStateMachine
 
     settings = get_settings()
-    db = get_firestore_client()
+    db = refresh_async_firestore_client()  # bind fresh gRPC channel to this event loop
 
     # 1. Load approved blueprint
     bp = await _load_approved_blueprint(session_id)
@@ -220,12 +221,14 @@ async def _run(session_id: str) -> dict:
     }
     template_url = template_urls[template_key]
 
-    # 3. Derive app name
-    raw = (
-        json_output.get("app_name")
-        or (json_output.get("app_description") or "")[:40]
-        or f"app-{session_id[:8]}"
-    )
+    # 3. Derive app name — blueprint_generator always fills app_name now;
+    #    fall back to first meaningful words of description, then a timestamp stub.
+    raw = json_output.get("app_name") or ""
+    if not raw:
+        desc = (json_output.get("app_description") or "").strip()
+        # Take the first five words of the description as a rough name
+        words = desc.split()[:5]
+        raw = " ".join(words) if words else f"app-{session_id[:8]}"
     app_name = _slugify(raw)
 
     # 4. Resolve GitHub token (validates personal token; falls back to system if invalid)
@@ -233,14 +236,52 @@ async def _run(session_id: str) -> dict:
     sess_doc = await db.collection("sessions").document(session_id).get()
     owner_id: str = sess_doc.to_dict()["user_id"] if sess_doc.exists else ""
     github_token = await get_valid_github_token(owner_id, settings.GITHUB_TOKEN)
+    # True when user hasn't connected their GitHub — repo lands on the platform account
+    using_platform_github: bool = github_token == settings.GITHUB_TOKEN
 
-    # 5. Transition to BUILDING
+    # 5. Check the user's token quota before doing any expensive work
+    from app.core.usage import get_user_tier, is_over_limit
+    user_tier = await get_user_tier(db, owner_id)
+    if await is_over_limit(db, owner_id, user_tier):
+        from app.core.tiers import get_tier
+        from app.build.build_logger import publish_user_event
+        tier = get_tier(user_tier)
+        error_msg = (
+            f"You've used all {tier.monthly_tokens:,} tokens in your {tier.name} plan this month. "
+            "Upgrade to continue building."
+        )
+        now = datetime.now(timezone.utc)
+        await db.collection("projects").document(project_id).set({
+            "owner_id": owner_id,
+            "session_id": session_id,
+            "blueprint_id": blueprint_id,
+            "app_name": app_name,
+            "template_key": template_key,
+            "repo_full_name": "",
+            "github_url": "",
+            "repo_owner": "platform" if using_platform_github else "user",
+            "preview_url": None,
+            "artifact_url": None,
+            "is_updating": False,
+            "build_error": error_msg,
+            "build_error_action": "support",
+            "blueprint_context": json_output,
+            "created_at": now,
+            "updated_at": now,
+        })
+        publish_user_event(
+            settings.REDIS_URL, owner_id, "quota_exceeded", error_msg,
+            tier=user_tier, limit=tier.monthly_tokens,
+        )
+        logger.warning("Build blocked — token limit reached user=%s tier=%s", owner_id, user_tier)
+        return {"project_id": project_id, "blocked": "token_limit"}
+
+    # 6. Transition to BUILDING
     sm = MeetingStateMachine(db)
     await sm.transition(uuid.UUID(session_id), SessionStatus.BUILDING)
     await _patch_blueprint(blueprint_id, {"build_status": "IN_PROGRESS"})
 
     # 6. Create project doc early so frontend shows build in progress
-    project_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     await db.collection("projects").document(project_id).set({
         "owner_id": owner_id,
@@ -250,6 +291,7 @@ async def _run(session_id: str) -> dict:
         "template_key": template_key,
         "repo_full_name": "",
         "github_url": "",
+        "repo_owner": "platform" if using_platform_github else "user",
         "preview_url": None,
         "artifact_url": None,
         "is_updating": True,
@@ -260,20 +302,56 @@ async def _run(session_id: str) -> dict:
     })
     logger.info("Project stub created project=%s", project_id)
 
-    # Create log publisher bound to this project
     log_fn = make_log_publisher(project_id, settings.REDIS_URL)
     log_fn("started", f"Starting build for {app_name} ({template_key})")
 
-    # 7. Clone template
-    workspace = Workspace(uuid.UUID(session_id), template_key, template_url)
-    workspace.clone()
+    # Log the feature plan so users immediately see what will be built
+    features: list[str] = json_output.get("features") or []
+    entities: list[str] = json_output.get("entities") or []
+    if features:
+        log_fn("info", f"Features to build: {', '.join(str(f) for f in features[:12])}")
+    if entities:
+        log_fn("info", f"Data models: {', '.join(str(e) for e in entities[:8])}")
+    stack_label = {"flutter": "Flutter", "react_native": "React Native", "next": "Next.js"}.get(template_key, template_key)
+    log_fn("info", f"Stack: {stack_label} · scaffolding project structure…")
 
+    # Declared before try so the error handler can persist them even if a later step fails
+    repo_url: str = ""
+    repo_full_name: str = ""
+
+    workspace = Workspace(uuid.UUID(session_id), template_key, template_url, git_token=github_token)
     try:
+        # 7. Clone template
+        workspace.clone()
         workspace.init_git()
-        log_fn("info", "Template cloned, running build agent…")
+        log_fn("info", "Template cloned — creating GitHub repository…")
 
-        # 8. Run Claude build agent
-        summary = run_build_agent(
+        # 8. Create GitHub repo and push template code immediately so it's live on GitHub
+        gh = GitHubClient(github_token)
+        repo_data = gh.create_repo(
+            name=app_name,
+            description=(json_output.get("app_description") or "")[:100],
+            private=True,
+        )
+        repo_url = repo_data["html_url"]
+        repo_full_name = repo_data["full_name"]
+        push_url = gh.get_push_url(repo_full_name)
+
+        workspace.commit_all("chore: initial template")
+        workspace.push(push_url)
+
+        # Save repo info immediately — update prompts can now work even while the agent runs
+        now = datetime.now(timezone.utc)
+        await db.collection("projects").document(project_id).update({
+            "repo_full_name": repo_full_name,
+            "github_url": repo_url,
+            "repo_owner": "platform" if using_platform_github else "user",
+            "updated_at": now,
+        })
+        log_fn("info", f"Repository live on GitHub ({repo_url}). Running build agent…")
+
+        # 9. Run Claude build agent — modifies files in the local workspace
+        summary, tokens_used = run_build_agent(
             workspace=workspace.path,
             blueprint=json_output,
             app_name=app_name,
@@ -282,22 +360,18 @@ async def _run(session_id: str) -> dict:
             model=settings.ANTHROPIC_MODEL,
             log_fn=log_fn,
         )
+        logger.info("Build agent used %d tokens session=%s", tokens_used, session_id)
 
-        # 9. Create GitHub repo and push
-        log_fn("info", "Pushing code to GitHub…")
-        gh = GitHubClient(github_token)
-        repo_data = gh.create_repo(
-            name=app_name,
-            description=(json_output.get("app_description") or "")[:100],
-            private=True,
-        )
-        repo_url: str = repo_data["html_url"]
-        push_url = gh.get_push_url(repo_data["full_name"])
+        # Record usage against the user's monthly quota
+        from app.core.usage import record_usage
+        await record_usage(db, owner_id, tokens_used, is_build=True)
 
+        # 10. Push agent changes on top of the template commit
+        log_fn("info", "Pushing agent changes to GitHub…")
         workspace.commit_all(f"feat: initial build by Forgefy\n\n{summary[:400]}")
         workspace.push(push_url)
 
-        # 10. Preview + artifact (all non-fatal)
+        # 11. Preview + artifact (all non-fatal)
         artifact_url: str | None = None
         preview_url: str | None = None
 
@@ -328,7 +402,7 @@ async def _run(session_id: str) -> dict:
             logger.warning("Build/preview failed (non-fatal) session=%s: %s", session_id, exc)
             log_fn("warning", f"Preview deployment failed (code is still on GitHub): {exc}")
 
-        # 11. Update blueprint
+        # 12. Update blueprint
         bp_updates: dict = {
             "repo_url": repo_url,
             "repo_name": app_name,
@@ -341,11 +415,12 @@ async def _run(session_id: str) -> dict:
             bp_updates["preview_url"] = preview_url
         await _patch_blueprint(blueprint_id, bp_updates)
 
-        # 12. Update project doc with real values
+        # 13. Update project doc with final values
         now = datetime.now(timezone.utc)
         await db.collection("projects").document(project_id).update({
-            "repo_full_name": repo_data["full_name"],
+            "repo_full_name": repo_full_name,
             "github_url": repo_url,
+            "repo_owner": "platform" if using_platform_github else "user",
             "preview_url": preview_url,
             "artifact_url": artifact_url,
             "is_updating": False,
@@ -365,27 +440,42 @@ async def _run(session_id: str) -> dict:
         }
 
     except Exception as exc:
-        error_msg = str(exc)[:500]
+        from app.core.build_errors import sanitize_build_error
+        build_err = sanitize_build_error(exc)
         logger.error("Build FAILED session=%s: %s", session_id, exc, exc_info=True)
 
         await _patch_blueprint(blueprint_id, {
             "build_status": "FAILED",
-            "build_error": error_msg,
+            "build_error": build_err.message,
         })
 
         now = datetime.now(timezone.utc)
-        await db.collection("projects").document(project_id).update({
+        proj_err: dict = {
             "is_updating": False,
-            "build_error": error_msg,
+            "build_error": build_err.message,
+            "build_error_action": build_err.action,
             "updated_at": now,
-        })
+        }
+        # If the GitHub repo was created before the failure, save the link so it isn't lost
+        if repo_url:
+            proj_err["github_url"] = repo_url
+            proj_err["repo_full_name"] = repo_full_name
+            proj_err["repo_owner"] = "platform" if using_platform_github else "user"
+        await db.collection("projects").document(project_id).update(proj_err)
 
-        log_fn("error", f"Build failed: {error_msg}")
+        log_fn("error", f"Build failed: {build_err.message}")
         raise
+
+    finally:
+        workspace.cleanup()
 
 
 @celery_app.task(name="app.workers.build_worker.run_build", bind=True, max_retries=0)
-def run_build(self, session_id: str) -> dict:
+def run_build(self, session_id: str, project_id: str) -> dict:
     """Celery entry point — clone → agent → push → build → upload."""
-    logger.info("Build task started session=%s", session_id)
-    return asyncio.run(_run(session_id))
+    logger.info("Build task started session=%s project=%s", session_id, project_id)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_run(session_id, project_id))
+    finally:
+        loop.close()

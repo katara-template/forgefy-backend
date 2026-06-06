@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     SECRET_KEY: str = "changeme"
     JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 480  # 8 hours — long enough to cover a full meeting-to-build flow
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     CORS_ORIGINS: Any = ["http://localhost:3000"]
 
@@ -75,12 +75,16 @@ class Settings(BaseSettings):
     GITHUB_TOKEN: str = ""
 
     # Build templates (cloneable git repo URLs)
-    TEMPLATE_FLUTTER: str = "https://github.com/seenickcode/flutter_starter"
-    TEMPLATE_REACT_NATIVE: str = "https://github.com/obytes/react-native-template-obytes"
-    TEMPLATE_NEXT: str = "https://github.com/ixartz/Next-js-Boilerplate"
+    TEMPLATE_FLUTTER: str = "https://github.com/katara-template/flutter-clean-bloc.git"
+    TEMPLATE_REACT_NATIVE: str = "https://github.com/katara-template/rn-redux.git"
+    TEMPLATE_NEXT: str = "https://github.com/katara-template/next-ts.git"
 
     # fal.ai (image + video generation)
     FAL_API_KEY: str = ""
+
+    # Notchpay (payments — card, MTN MoMo, Orange Money)
+    NOTCHPAY_PUBLIC_KEY: str = ""   # pk_... from Notchpay dashboard
+    NOTCHPAY_SECRET_HASH: str = ""  # hash secret for webhook verification
 
     # Sentry
     SENTRY_DSN: str = ""

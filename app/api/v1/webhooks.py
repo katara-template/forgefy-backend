@@ -10,10 +10,12 @@ we reject anything that doesn't match.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -199,3 +201,94 @@ async def _clear_mapping(bot_id: str, session_id: str, redis_url: str) -> None:
         await r.delete(f"recall:bot:{bot_id}", f"recall:session:{session_id}")
     finally:
         await r.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Notchpay webhook
+# ---------------------------------------------------------------------------
+
+# How subscriptions work with Notchpay (which has no native recurring billing):
+#   - User pays once → tier set for 31 days (tier_expires_at)
+#   - Frontend shows expiry date and a "Renew" button
+#   - On renewal, user pays again → tier_expires_at extended by 31 days
+#   - get_user_tier() auto-downgrades to free when tier_expires_at passes
+
+_TIER_PRICES = {19: "starter", 49: "pro", 149: "team"}
+
+
+@router.post("/notchpay", status_code=200)
+async def notchpay_webhook(request: Request) -> dict:
+    """Receive Notchpay payment events and update user tier."""
+    settings = get_settings()
+    raw_body = await request.body()
+
+    # Verify webhook signature — Notchpay sends HMAC-SHA256 in x-notch-signature
+    if settings.NOTCHPAY_SECRET_HASH:
+        signature = request.headers.get("x-notch-signature", "")
+        expected = hmac.digest(
+            settings.NOTCHPAY_SECRET_HASH.encode(),
+            raw_body,
+            "sha256",
+        ).hex()
+        if not hmac.compare_digest(expected, signature):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    try:
+        body = json.loads(raw_body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event: str = body.get("event", "")
+    data: dict = body.get("data", {})
+    status: str = data.get("status", "")
+
+    logger.info("Notchpay webhook event=%s status=%s", event, status)
+
+    if event == "payment.complete" and status == "complete":
+        await _handle_payment_complete(data, settings)
+
+    return {"received": True}
+
+
+async def _handle_payment_complete(data: dict, settings) -> None:
+    """Activate or extend a user's subscription after a successful payment."""
+    from app.db.firebase import get_firestore_client
+
+    meta: dict = data.get("meta") or data.get("metadata") or {}
+    user_id: str = meta.get("user_id", "")
+    tier_key: str = meta.get("tier", "")
+
+    # Fallback: infer tier from amount if meta wasn't stored
+    if not tier_key:
+        amount = int(data.get("amount", 0))
+        tier_key = _TIER_PRICES.get(amount, "")
+
+    if not user_id or not tier_key:
+        logger.warning("Notchpay webhook: missing user_id or tier in meta — data=%s", data)
+        return
+
+    from app.core.tiers import TIERS
+    if tier_key not in TIERS:
+        logger.warning("Notchpay webhook: unknown tier %r for user %s", tier_key, user_id)
+        return
+
+    db = get_firestore_client()
+    now = datetime.now(timezone.utc)
+
+    # Extend existing subscription if user already has one active; otherwise start fresh
+    user_doc = await db.collection("users").document(user_id).get()
+    current_expires = (user_doc.to_dict() or {}).get("tier_expires_at")
+
+    base = current_expires if (current_expires and current_expires > now) else now
+    new_expires = base + timedelta(days=31)
+
+    await db.collection("users").document(user_id).update({
+        "tier": tier_key,
+        "tier_expires_at": new_expires,
+        "updated_at": now,
+    })
+
+    logger.info(
+        "Subscription activated user=%s tier=%s expires=%s",
+        user_id, tier_key, new_expires.isoformat(),
+    )

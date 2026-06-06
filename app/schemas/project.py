@@ -17,6 +17,7 @@ class ProjectOut(BaseModel):
     template_key: str
     repo_full_name: str
     github_url: str
+    repo_owner: str | None = None  # "platform" or "user"
     created_at: datetime
     updated_at: datetime
     session_id: uuid.UUID | None = None
@@ -25,6 +26,7 @@ class ProjectOut(BaseModel):
     artifact_url: str | None = None
     is_updating: bool = False
     build_error: str | None = None
+    build_error_action: str | None = None  # "retry" | "user_fix" | "support"
 
 
 class UpdateProjectRequest(BaseModel):
