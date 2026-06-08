@@ -102,7 +102,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         redis_client: aioredis.Redis = aioredis.from_url(
-            redis_url, decode_responses=True, ssl_context=ctx
+            redis_url, 
+            decode_responses=True, 
+            ssl_cert_reqs="none",
+            ssl_context=ctx
         )
     else:
         redis_client: aioredis.Redis = aioredis.from_url(redis_url, decode_responses=True)
