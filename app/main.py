@@ -4,6 +4,8 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 import redis.asyncio as aioredis
+import ssl
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
@@ -54,8 +56,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     firestore_client = init_firebase()
     app.state.firestore = firestore_client
 
+    # Handle rediss:// URLs that may include a string `ssl_cert_reqs` query
+    # param (e.g. `ssl_cert_reqs=CERT_NONE`). redis-py expects the
+    # ssl_cert_reqs argument to be an `ssl` module constant (e.g. ssl.CERT_NONE).
+    redis_url = settings.REDIS_URL
+    ssl_cert_reqs = None
+    if isinstance(redis_url, str) and redis_url.startswith("rediss://"):
+        # If the URL includes ssl_cert_reqs=..., remove it from the query
+        # and map known string flags to the ssl module constants.
+        parsed = urlparse(redis_url)
+        qs = parse_qs(parsed.query)
+        if "ssl_cert_reqs" in qs:
+            val = qs.pop("ssl_cert_reqs")[0]
+            mapping = {"CERT_NONE": ssl.CERT_NONE, "CERT_OPTIONAL": ssl.CERT_OPTIONAL, "CERT_REQUIRED": ssl.CERT_REQUIRED}
+            ssl_cert_reqs = mapping.get(val, None)
+            # Rebuild URL without ssl_cert_reqs
+            new_query = urlencode(qs, doseq=True)
+            parsed = parsed._replace(query=new_query)
+            redis_url = urlunparse(parsed)
+
     redis_client: aioredis.Redis = aioredis.from_url(
-        settings.REDIS_URL, decode_responses=True
+        redis_url, decode_responses=True, ssl_cert_reqs=ssl_cert_reqs
     )
     app.state.redis = redis_client
 
