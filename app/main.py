@@ -61,6 +61,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ssl_cert_reqs argument to be an `ssl` module constant (e.g. ssl.CERT_NONE).
     redis_url = settings.REDIS_URL
     ssl_cert_reqs = None
+    ssl_context = None
     if isinstance(redis_url, str) and redis_url.startswith("rediss://"):
         # If the URL includes ssl_cert_reqs=..., remove it from the query
         # and map known string flags to the ssl module constants.
@@ -74,9 +75,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             new_query = urlencode(qs, doseq=True)
             parsed = parsed._replace(query=new_query)
             redis_url = urlunparse(parsed)
+        # Build an SSLContext for the connection. Enforce TLSv1.2+ when available.
+      
+            ctx = ssl.create_default_context()
+            # Map cert requirements into the context
+            if ssl_cert_reqs is not None:
+                if ssl_cert_reqs == ssl.CERT_NONE:
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                else:
+                    ctx.verify_mode = ssl_cert_reqs
+            # Prefer TLSv1.2+ where supported
+            try:
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            except Exception:
+                # older Python may not support TLSVersion
+                pass
+            ssl_context = ctx
 
+    # Pass an SSLContext for TLS connections or None for plain redis://
     redis_client: aioredis.Redis = aioredis.from_url(
-        redis_url, decode_responses=True, ssl_cert_reqs=ssl_cert_reqs
+        redis_url, decode_responses=True, ssl=ssl_context
     )
     app.state.redis = redis_client
 
