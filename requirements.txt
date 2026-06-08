@@ -82,7 +82,7 @@ python-json-logger==4.1.0
 python-multipart==0.0.29
 pytokens==0.4.1
 PyYAML==6.0.3
-redis==6.4.0
+redis>=5.0.0
 requests==2.34.2
 requests-toolbelt==1.0.0
 rsa==4.9.1
