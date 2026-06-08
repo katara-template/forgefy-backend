@@ -5,8 +5,9 @@ Firestore collections used:
   sessions/{session_id}      — user_id, status, ...
 """
 import logging
+import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter
 from google.cloud.firestore import AsyncClient
@@ -38,6 +39,7 @@ def _doc_to_blueprint(doc) -> Blueprint:
         build_status=data.get("build_status"),
         artifact_url=data.get("artifact_url"),
         preview_url=data.get("preview_url"),
+        project_id=data.get("project_id"),
     )
 
 
@@ -133,21 +135,64 @@ async def approve_blueprint(
     db: DBSession,
     user: CurrentUser,
 ) -> BlueprintOut:
-    """Approve a blueprint: transition session BLUEPRINT_READY → APPROVED."""
+    """Approve a blueprint and dispatch the build task.
+
+    Idempotent: if the session is already APPROVED (e.g. a previous build task
+    crashed before starting), the state transition is skipped and the build is
+    re-dispatched so the user can retry without manual intervention.
+    """
     blueprint = await _get_owned_blueprint(blueprint_id, user.id, db)
 
-    sm = MeetingStateMachine(db)
-    await sm.transition(
-        blueprint.session_id,
-        SessionStatus.APPROVED,
-        extra_payload={"blueprint_id": str(blueprint_id), "approved_by": str(user.id)},
-    )
+    sess_doc = await db.collection("sessions").document(str(blueprint.session_id)).get()
+    current_status = sess_doc.to_dict().get("status", "") if sess_doc.exists else ""
 
-    await db.collection("blueprints").document(str(blueprint_id)).update({"approved": True})
-    blueprint.approved = True
+    if current_status != SessionStatus.APPROVED.value:
+        sm = MeetingStateMachine(db)
+        await sm.transition(
+            blueprint.session_id,
+            SessionStatus.APPROVED,
+            extra_payload={"blueprint_id": str(blueprint_id), "approved_by": str(user.id)},
+        )
+
+    # Reuse an existing project_id if the build is being retried, otherwise mint one now
+    # so the frontend can navigate to the project page before the task starts.
+    project_id = blueprint.project_id or str(uuid.uuid4())
+
+    bp_updates: dict = {"approved": True, "project_id": project_id}
+    if not blueprint.approved:
+        await db.collection("blueprints").document(str(blueprint_id)).update(bp_updates)
+        blueprint.approved = True
+    elif not blueprint.project_id:
+        await db.collection("blueprints").document(str(blueprint_id)).update({"project_id": project_id})
+
+    blueprint.project_id = project_id
+
+    # Create the project stub now so the project page loads immediately.
+    # The build task overwrites this with full data as the build progresses.
+    json_out = blueprint.json_output or {}
+    raw_name = json_out.get("app_name") or (json_out.get("app_description") or "")[:40] or f"app-{str(blueprint.session_id)[:8]}"
+    stub_app_name = re.sub(r"[^a-zA-Z0-9._-]", "-", raw_name).strip("-").lower()[:100] or "forgefy-app"
+    stub_template = json_out.get("template", "next")
+    now = datetime.now(timezone.utc)
+    await db.collection("projects").document(project_id).set({
+        "owner_id": str(user.id),
+        "session_id": str(blueprint.session_id),
+        "blueprint_id": str(blueprint_id),
+        "app_name": stub_app_name,
+        "template_key": stub_template,
+        "repo_full_name": "",
+        "github_url": "",
+        "preview_url": None,
+        "artifact_url": None,
+        "is_updating": True,
+        "build_error": None,
+        "blueprint_context": json_out,
+        "created_at": now,
+        "updated_at": now,
+    })
 
     from app.workers.build_worker import run_build
-    run_build.apply_async(args=[str(blueprint.session_id)], queue="build")
-    logger.info("Build dispatched session=%s blueprint=%s", blueprint.session_id, blueprint_id)
+    run_build.apply_async(args=[str(blueprint.session_id), project_id], queue="build")
+    logger.info("Build dispatched session=%s blueprint=%s project=%s", blueprint.session_id, blueprint_id, project_id)
 
     return BlueprintOut.model_validate(blueprint)

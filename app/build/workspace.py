@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import uuid
@@ -14,8 +15,11 @@ WORKSPACE_ROOT = Path("/tmp/forgefy_workspaces")
 
 def _run(args: list[str], cwd: Path | None = None, timeout: int = 600) -> str:
     """Run a subprocess; return stdout; raise RuntimeError on failure."""
+    env = os.environ.copy()
+    # Never prompt for git credentials — fail fast instead of hanging on missing /dev/tty
+    env["GIT_TERMINAL_PROMPT"] = "0"
     result = subprocess.run(
-        args, cwd=cwd, capture_output=True, text=True, timeout=timeout
+        args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env
     )
     if result.returncode != 0:
         raise RuntimeError(f"{' '.join(args)} failed:\n{result.stderr.strip()}")
@@ -25,10 +29,17 @@ def _run(args: list[str], cwd: Path | None = None, timeout: int = 600) -> str:
 class Workspace:
     """Manages a cloned template directory for one session."""
 
-    def __init__(self, session_id: uuid.UUID, template_key: str, template_url: str) -> None:
+    def __init__(
+        self,
+        session_id: uuid.UUID,
+        template_key: str,
+        template_url: str,
+        git_token: str = "",
+    ) -> None:
         self.session_id = session_id
         self.template_key = template_key
         self.template_url = template_url
+        self.git_token = git_token
         self.path = WORKSPACE_ROOT / str(session_id)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -39,8 +50,13 @@ class Workspace:
         if self.path.exists():
             shutil.rmtree(self.path)
 
+        url = self.template_url
+        if self.git_token and url.startswith("https://github.com/"):
+            # Embed the token so git can authenticate without a credential helper or TTY
+            url = url.replace("https://", f"https://{self.git_token}@", 1)
+
         logger.info("Cloning template=%s → %s", self.template_key, self.path)
-        _run(["git", "clone", "--depth", "1", self.template_url, str(self.path)])
+        _run(["git", "clone", "--depth", "1", url, str(self.path)])
         shutil.rmtree(self.path / ".git", ignore_errors=True)
         logger.info("Workspace ready: %s", self.path)
 
@@ -51,14 +67,26 @@ class Workspace:
         _run(["git", "config", "user.email", "build@forgefy.app"], cwd=self.path)
         _run(["git", "config", "user.name", "Forgefy Build"], cwd=self.path)
 
-    def commit_all(self, message: str) -> None:
-        """Stage all changes and commit."""
+    def commit_all(self, message: str) -> bool:
+        """Stage all changes and commit. Returns False (no-op) if nothing staged."""
         _run(["git", "add", "-A"], cwd=self.path)
+        nothing_staged = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=self.path, capture_output=True,
+        ).returncode == 0
+        if nothing_staged:
+            logger.info("commit_all: nothing to commit — skipping")
+            return False
         _run(["git", "commit", "-m", message], cwd=self.path)
+        return True
 
     def push(self, remote_url: str) -> None:
-        """Add origin and push main."""
-        _run(["git", "remote", "add", "origin", remote_url], cwd=self.path)
+        """Set origin and push main. Safe to call multiple times."""
+        try:
+            _run(["git", "remote", "add", "origin", remote_url], cwd=self.path)
+        except RuntimeError:
+            # origin already exists — update URL instead
+            _run(["git", "remote", "set-url", "origin", remote_url], cwd=self.path)
         _run(["git", "push", "-u", "origin", "main"], cwd=self.path)
 
     def cleanup(self) -> None:
@@ -211,17 +239,53 @@ class EditWorkspace:
             logger.info("Edit workspace cloned: %s", self.path)
 
     def sync_to_github(self, commit_message: str, push_url: str) -> None:
-        """Stage all changes, commit (if anything changed), and push."""
+        """Stage all changes, commit, rebase onto remote, then push.
+
+        Handles the case where the remote is ahead of local (e.g. user pushed
+        directly to GitHub between when we cloned and when the agent finished).
+        Agent changes always win on conflict — the agent's code is the canonical
+        output for this update.
+        """
         _run(["git", "add", "-A"], cwd=self.path)
-        # Check if there's anything staged
-        diff = subprocess.run(
+        nothing_staged = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
             cwd=self.path, capture_output=True,
-        )
-        if diff.returncode == 0:
+        ).returncode == 0
+        if nothing_staged:
             logger.info("No changes to commit in edit workspace")
             return
+
         _run(["git", "commit", "-m", commit_message], cwd=self.path)
         _run(["git", "remote", "set-url", "origin", push_url], cwd=self.path)
+
+        # Bring in any commits that landed on the remote while the agent was running.
+        # --rebase keeps history linear; --autostash preserves any un-staged working tree.
+        try:
+            _run(
+                ["git", "pull", "--rebase", "--autostash", "origin", "main"],
+                cwd=self.path,
+                timeout=60,
+            )
+        except RuntimeError:
+            # Automatic rebase failed (conflicting edits to the same lines).
+            # Abort the in-progress rebase so the repo is in a clean state,
+            # then force-push the agent's version — agent output takes precedence.
+            subprocess.run(
+                ["git", "rebase", "--abort"],
+                cwd=self.path, capture_output=True,
+            )
+            logger.warning(
+                "Rebase conflict for %s — using force-with-lease to push agent changes",
+                self.repo_full_name,
+            )
+            _run(["git", "push", "--force-with-lease", "origin", "main"], cwd=self.path)
+            return
+
         _run(["git", "push", "origin", "main"], cwd=self.path)
         logger.info("Synced edit workspace to GitHub: %s", self.repo_full_name)
+
+    def cleanup(self) -> None:
+        """Delete the workspace directory to free disk space."""
+        if self.path.exists():
+            shutil.rmtree(self.path)
+            logger.info("Edit workspace removed: %s", self.path)

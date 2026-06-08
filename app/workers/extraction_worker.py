@@ -23,9 +23,9 @@ async def _persist_events(
     transcript_segment: str = "",
 ) -> None:
     """Write extraction events (and transcript segment) to Firestore."""
-    from app.db.firebase import get_firestore_client
+    from app.db.firebase import refresh_async_firestore_client
 
-    db = get_firestore_client()
+    db = refresh_async_firestore_client()
     events_ref = db.collection("sessions").document(session_id).collection("events")
     now = datetime.now(timezone.utc)
 
@@ -96,8 +96,10 @@ def extract_requirements(session_id: str, transcript_segment: str) -> None:
         r.close()
 
     try:
-        asyncio.run(
-            _persist_events(session_id, events, transcript_segment)
-        )
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_persist_events(session_id, events, transcript_segment))
+        finally:
+            loop.close()
     except Exception as exc:
         logger.warning("Failed to persist extraction events session=%s: %s", session_id, exc)

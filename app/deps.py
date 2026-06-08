@@ -55,6 +55,7 @@ async def get_current_user(
         hashed_password=data["hashed_password"],
         created_at=data["created_at"],
         updated_at=data["updated_at"],
+        tier=data.get("tier", "free"),
     )
 
 

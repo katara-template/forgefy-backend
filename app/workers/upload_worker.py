@@ -50,12 +50,12 @@ def transcribe_upload(session_id: str, file_path: str) -> None:
     logger.info("Transcript ready session=%s chars=%d", session_id, len(transcript))
 
     # 2. Publish full transcript to Redis (WebSocket picks it up)
-    _publish(session_id, {
+    _publish_many(session_id, [{
         "type": "transcript",
         "session_id": session_id,
         "text": transcript,
         "is_final": True,
-    }, settings)
+    }], settings)
 
     # 3. Run extraction pipeline
     from app.workers.extraction_worker import _run_extraction
@@ -66,25 +66,41 @@ def transcribe_upload(session_id: str, file_path: str) -> None:
         events = []
     logger.info("Extraction done session=%s events=%d backend=%s", session_id, len(events), settings.BP_MODEL)
 
-    # 4. Publish feature events for real-time UI
-    for ev in events:
-        _publish(session_id, {
+    # 4. Publish all feature events in one Redis round-trip
+    feature_msgs = [
+        {
             "type": "featureDetected",
             "session_id": session_id,
             "sub_state": ev["sub_state"],
             "payload": ev["payload"],
-        }, settings)
+        }
+        for ev in events
+    ]
+    if feature_msgs:
+        _publish_many(session_id, feature_msgs, settings)
 
-    blueprint_id = asyncio.run(
-        _persist_and_generate(session_id, events, transcript, settings)
-    )
+    loop = asyncio.new_event_loop()
+    try:
+        blueprint_id = loop.run_until_complete(
+            _persist_and_generate(session_id, events, transcript, settings)
+        )
+    except Exception as exc:
+        logger.error("Blueprint generation failed session=%s: %s", session_id, exc, exc_info=True)
+        _publish_many(session_id, [{
+            "type": "blueprintError",
+            "session_id": session_id,
+            "error": str(exc),
+        }], settings)
+        return
+    finally:
+        loop.close()
 
     # 5. Notify frontend blueprint is ready
-    _publish(session_id, {
+    _publish_many(session_id, [{
         "type": "blueprintReady",
         "session_id": session_id,
         "blueprint_id": blueprint_id,
-    }, settings)
+    }], settings)
 
     logger.info("Physical pipeline complete session=%s blueprint=%s", session_id, blueprint_id)
 
@@ -111,13 +127,22 @@ def _transcribe(file_path: str, settings) -> str:
         alts = response.results.channels[0].alternatives
         return alts[0].transcript if alts else ""
 
-    return asyncio.run(_run())
-
-
-def _publish(session_id: str, payload: dict, settings) -> None:
-    r = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
+    loop = asyncio.new_event_loop()
     try:
-        r.publish(f"{_CHANNEL_PREFIX}{session_id}", json.dumps(payload))
+        return loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def _publish_many(session_id: str, payloads: list[dict], settings) -> None:
+    """Publish multiple events over a single Redis connection."""
+    r = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
+    channel = f"{_CHANNEL_PREFIX}{session_id}"
+    try:
+        pipe = r.pipeline(transaction=False)
+        for payload in payloads:
+            pipe.publish(channel, json.dumps(payload))
+        pipe.execute()
     finally:
         r.close()
 
@@ -125,16 +150,19 @@ def _publish(session_id: str, payload: dict, settings) -> None:
 async def _persist_and_generate(
     session_id: str, events: list[dict], transcript: str, settings
 ) -> str:
-    """Persist extraction events to Firestore and generate blueprint; return blueprint_id."""
-    from app.db.firebase import get_firestore_client
+    """Persist extraction events to Firestore (batched) and generate blueprint."""
+    from app.db.firebase import refresh_async_firestore_client
     from app.build.blueprint_generator import BlueprintAggregator
 
-    db = get_firestore_client()
+    db = refresh_async_firestore_client()
     events_ref = db.collection("sessions").document(session_id).collection("events")
     now = datetime.now(timezone.utc)
 
+    # Batch all Firestore writes into a single round-trip.
+    batch = db.batch()
+
     if transcript:
-        await events_ref.document(str(uuid.uuid4())).set({
+        batch.set(events_ref.document(str(uuid.uuid4())), {
             "session_id": session_id,
             "event_type": "transcript.segment",
             "payload": {"text": transcript},
@@ -142,12 +170,14 @@ async def _persist_and_generate(
         })
 
     for ev in events:
-        await events_ref.document(str(uuid.uuid4())).set({
+        batch.set(events_ref.document(str(uuid.uuid4())), {
             "session_id": session_id,
             "event_type": ev["sub_state"],
             "payload": ev["payload"],
             "timestamp": now,
         })
+
+    await batch.commit()
 
     aggregator = BlueprintAggregator(db)
     blueprint = await aggregator.generate(uuid.UUID(session_id))

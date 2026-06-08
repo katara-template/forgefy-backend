@@ -51,5 +51,5 @@ def configure_logging() -> None:
     root.setLevel(level)
 
     # Quiet noisy third-party loggers
-    for noisy in ("uvicorn.access", "httpx", "httpcore"):
+    for noisy in ("uvicorn.access", "httpx", "httpcore", "grpc", "grpc._cython", "grpc._cython.cygrpc"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

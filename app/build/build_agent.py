@@ -13,27 +13,399 @@ from app.build.build_logger import tool_message
 
 logger = logging.getLogger(__name__)
 
-_MAX_ITERATIONS = 60
+_MAX_ITERATIONS = 80
+_WARN_AT_ITERATION = 50
 
-_BUILD_SYSTEM = """You are the Forgefy Build Agent.
-Your task: implement a complete, working application from a product blueprint by modifying the files in the workspace provided to you via tools.
+# ---------------------------------------------------------------------------
+# Template-specific directory / component scaffolding guidance
+# ---------------------------------------------------------------------------
 
-Instructions:
-1. Start with `list_files` on '.' to see the template structure.
-2. Read key config files (pubspec.yaml, package.json, app.json, etc.) to understand the template.
-3. Update the app name and description everywhere it appears.
-4. Implement every feature listed in the blueprint — write real, working code; no placeholders or TODOs.
-5. Create all screens, components, and logic the features require.
-6. Use `generate_image` to create real visual assets (backgrounds, hero images, illustrations, onboarding artwork, icons) — do not use placeholder URLs or leave image slots empty.
-7. Use `generate_video` for splash screens, onboarding loops, or background videos when the app calls for them.
-8. After generating an asset, immediately reference it correctly in your code:
-   - Flutter: Image.asset('assets/images/<filename>') — also declare assets/images/ and assets/videos/ under flutter > assets in pubspec.yaml
-   - Next.js: <img src="/images/<filename>"> or next/image with src="/images/<filename>"
-   - React Native: <Image source={require('./assets/images/<filename>')} />
-9. When the implementation is complete, write a short summary starting with the word DONE.
+_FLUTTER_STRUCTURE = """
+ARCHITECTURE: Clean Architecture with Feature-first organisation.
 
-Use the file tools freely. Write production-quality code."""
+EXACT FOLDER STRUCTURE — call create_directory for every path below before writing any files:
 
+  lib/core/error/
+  lib/core/network/
+  lib/core/usecases/
+  lib/core/utils/
+  lib/core/theme/
+
+  For EACH feature extracted from the blueprint, create:
+  lib/features/{feature}/data/datasources/
+  lib/features/{feature}/data/models/
+  lib/features/{feature}/data/repositories/
+  lib/features/{feature}/domain/entities/
+  lib/features/{feature}/domain/repositories/
+  lib/features/{feature}/domain/usecases/
+  lib/features/{feature}/presentation/bloc/
+  lib/features/{feature}/presentation/pages/
+  lib/features/{feature}/presentation/widgets/
+
+  NOTE: if the feature is "auth" (login / register / session), create it ONLY if
+  auth decision is YES. If auth decision is NO, do not create the auth feature folder
+  or any login/register pages — skip it entirely.
+
+  assets/images/
+  assets/videos/   (if video assets are needed)
+
+LAYER RESPONSIBILITIES:
+
+  core/error/
+    exceptions.dart  — AppException subclasses (NetworkException, CacheException, etc.)
+    failures.dart    — Failure sealed class / subclasses for Either<Failure, T>
+
+  core/network/
+    api_client.dart  — Dio / http base client with interceptors (auth header, logging)
+    network_info.dart — connectivity check (dart:io InternetAddress.lookup)
+
+  core/usecases/
+    usecase.dart     — abstract UseCase<Type, Params> interface
+
+  core/utils/
+    constants.dart   — API base URL, timeout durations, shared string keys
+
+  core/theme/
+    app_theme.dart   — ThemeData (light + dark), color palette, typography, spacing
+
+  features/{feature}/data/datasources/
+    {feature}_remote_datasource.dart  — HTTP/Firebase calls, returns Models
+    {feature}_local_datasource.dart   — SharedPreferences / Hive / SQLite caching
+
+  features/{feature}/data/models/
+    {entity}_model.dart  — extends the domain Entity, adds fromJson / toJson
+
+  features/{feature}/data/repositories/
+    {feature}_repository_impl.dart  — implements domain repository, wires remote+local
+
+  features/{feature}/domain/entities/
+    {entity}.dart  — plain Dart class, no framework dependencies
+
+  features/{feature}/domain/repositories/
+    {feature}_repository.dart  — abstract repository interface
+
+  features/{feature}/domain/usecases/
+    {action}_usecase.dart  — single public call() that returns Either<Failure, T>
+
+  features/{feature}/presentation/bloc/
+    {feature}_bloc.dart   — BLoC class
+    {feature}_event.dart  — sealed event classes
+    {feature}_state.dart  — sealed state classes
+
+  features/{feature}/presentation/pages/
+    {feature}_page.dart   — full screen, uses BlocBuilder/BlocConsumer
+
+  features/{feature}/presentation/widgets/
+    {feature}_form.dart, {feature}_card.dart, etc. — stateless/stateful sub-widgets
+
+ROOT FILES:
+  lib/injection_container.dart — GetIt service locator registering all blocs, repos, usecases, datasources
+  lib/app.dart                 — MaterialApp with theme, BlocProviders, named routes
+  lib/main.dart                — runApp, WidgetsFlutterBinding, init injection_container
+
+pubspec.yaml — add: flutter_bloc, equatable, get_it, dartz, dio, shared_preferences,
+               connectivity_plus, and any feature-specific packages (firebase_*, etc.)
+
+BUILD ORDER (strictly follow):
+  1. core/ files first (error, network, utils, theme)
+  2. domain/ layer for every feature (entities → repositories → usecases)
+  3. data/ layer for every feature (models → datasources → repository_impl)
+  4. presentation/widgets/ for every feature (reusable sub-widgets)
+  5. presentation/bloc/ for every feature
+  6. presentation/pages/ for every feature
+  7. injection_container.dart (wire everything together)
+  8. app.dart, main.dart
+  9. Generate all image/video assets, declare in pubspec.yaml
+  10. pubspec.yaml — finalize all dependencies
+"""
+
+_NEXT_STRUCTURE = """
+ARCHITECTURE: Next.js 14 App Router — Server-side API Routes + Client Components.
+
+RULE: Any operation that touches a database, reads secrets, or must be protected
+goes in app/api/**  (Route Handlers running on the server).
+Client pages/components call these API routes via fetch — they never import server
+modules directly.
+
+EXACT FOLDER STRUCTURE — call create_directory for EVERY path before writing files:
+
+  ── Server-side API routes (run on the server, never sent to the browser) ──
+  app/api/auth/login/           [AUTH ONLY]
+  app/api/auth/register/        [AUTH ONLY]
+  app/api/auth/logout/          [AUTH ONLY]
+  app/api/auth/me/              [AUTH ONLY]
+  For each feature from the blueprint:
+    app/api/{feature}/          — collection: GET (list) + POST (create)
+    app/api/{feature}/[id]/     — item:       GET (single) + PUT (update) + DELETE
+
+  ── Client-facing pages (App Router groups) ──
+  app/(auth)/login/             [AUTH ONLY]
+  app/(auth)/register/          [AUTH ONLY]
+  app/(app)/layout.tsx          — authenticated shell, checks session  [AUTH ONLY if auth required; otherwise use a plain layout]
+  For each feature:
+    app/(app)/{feature}/        — feature list/dashboard page
+    app/(app)/{feature}/[id]/   — feature detail page (if needed)
+
+  ── Shared UI ──
+  components/ui/                — Button, Input, Card, Modal, Spinner, Badge, Avatar,
+                                   Select, Checkbox, Textarea, Toast, Dialog, Tooltip
+  components/layout/            — Header, Footer, Sidebar, PageWrapper, MobileNav, Breadcrumb
+  For each feature:
+    components/{feature}/       — feature-specific reusable components
+
+  ── Server utilities (imported only by app/api/**) ──
+  lib/db.ts                     — database client singleton (Prisma / Supabase / mongoose)
+  lib/auth.ts                   — session helpers, JWT sign/verify, cookie utilities  [AUTH ONLY]
+  lib/validations.ts            — Zod schemas for validating request bodies
+
+  ── Client utilities (safe to import in client components) ──
+  lib/api.ts                    — typed fetch wrapper that calls /api/* routes
+  lib/utils.ts                  — shared pure helpers (formatDate, cn, etc.)
+
+  hooks/                        — useAuth.ts [AUTH ONLY], use{Feature}.ts — SWR / React Query hooks
+  types/                        — index.ts with all shared TypeScript interfaces
+  middleware.ts                 — Next.js edge middleware (protects /app/* routes)  [AUTH ONLY]
+  public/images/                — AI-generated assets
+
+API ROUTE PATTERN — use this shape for every route.ts:
+  import {{ NextRequest, NextResponse }} from 'next/server'
+  import {{ z }} from 'zod'
+  import {{ db }} from '@/lib/db'
+  import {{ getSession }} from '@/lib/auth'
+
+  const Schema = z.object({{ ... }})
+
+  export async function GET(req: NextRequest) {{
+    const session = await getSession(req)
+    if (!session) return NextResponse.json({{ error: 'Unauthorized' }}, {{ status: 401 }})
+    const data = await db...
+    return NextResponse.json(data)
+  }}
+
+  export async function POST(req: NextRequest) {{
+    const session = await getSession(req)
+    if (!session) return NextResponse.json({{ error: 'Unauthorized' }}, {{ status: 401 }})
+    const body = Schema.parse(await req.json())
+    const result = await db...
+    return NextResponse.json(result, {{ status: 201 }})
+  }}
+
+BUILD ORDER (strictly follow; skip [AUTH ONLY] steps if auth decision is NO):
+  1.  types/index.ts                        — all shared TypeScript interfaces
+  2.  lib/db.ts                             — database client
+  3.  lib/auth.ts                           — session / JWT helpers              [AUTH ONLY]
+  4.  lib/validations.ts                    — Zod schemas (one per resource)
+  5.  lib/api.ts                            — client-side fetch wrapper
+  6.  lib/utils.ts                          — shared helpers
+  7.  app/api/auth/login/route.ts           — POST: validate → hash → session    [AUTH ONLY]
+  8.  app/api/auth/register/route.ts        — POST: validate → hash → user       [AUTH ONLY]
+  9.  app/api/auth/logout/route.ts          — POST: clear session cookie          [AUTH ONLY]
+  10. app/api/auth/me/route.ts              — GET: return session user             [AUTH ONLY]
+  11. For each feature: app/api/{f}/route.ts and app/api/{f}/[id]/route.ts
+  12. middleware.ts                         — protect (app)/* group               [AUTH ONLY]
+  13. components/ui/*.tsx                  — ALL base components before any page
+  14. components/layout/*.tsx              — layout components
+  15. hooks/useAuth.ts                     — auth hook                            [AUTH ONLY]
+      hooks/use{Feature}.ts               — SWR/RQ hooks calling lib/api.ts
+  16. app/layout.tsx                       — root layout with providers
+  17. app/(auth)/login/page.tsx            — login form, calls /api/auth/login    [AUTH ONLY]
+  18. app/(auth)/register/page.tsx         — register form, calls /api/auth/register [AUTH ONLY]
+  19. app/(app)/layout.tsx                 — authenticated shell                  [AUTH ONLY → otherwise use plain app/layout.tsx]
+  20. For each feature: app/(app)/{f}/page.tsx using the components and hooks
+  21. Generate all image/video assets, reference in pages
+  22. tailwind.config.ts / globals.css     — theme tokens
+  23. package.json                         — finalize dependencies (zod, swr, etc.)
+"""
+
+_RN_STRUCTURE = """
+ARCHITECTURE: Feature-Sliced Design with Redux Toolkit.
+
+EXACT FOLDER STRUCTURE — call create_directory for every path before writing files:
+
+  src/app/                      — Redux store root
+  For each feature from the blueprint:
+    src/features/{feature}/api/
+    src/features/{feature}/components/
+    src/features/{feature}/screens/
+    src/features/{feature}/slice/
+    src/features/{feature}/types/
+    src/features/{feature}/hooks/
+
+  NOTE: if a feature is "auth" (login / register / session), create it ONLY if
+  auth decision is YES. If auth decision is NO, do not create the auth feature,
+  no login/register screens, no auth slice or auth API calls — skip entirely.
+
+  src/navigation/               — navigator files
+  src/services/                 — shared HTTP client
+  src/hooks/                    — shared app-level hooks
+  src/styles/                   — shared style constants
+  src/utils/                    — constants, helpers
+  assets/images/                — AI-generated assets
+
+LAYER RESPONSIBILITIES:
+
+  src/app/store.ts              — configureStore with all slice reducers
+  src/app/rootReducer.ts        — combineReducers
+
+  src/features/{feature}/api/{feature}Api.ts
+    — RTK Query createApi endpoints or plain axios calls
+
+  src/features/{feature}/components/{FeatureName}Form.tsx
+    — reusable feature-specific UI components (no navigation logic)
+
+  src/features/{feature}/screens/{FeatureName}Screen.tsx
+    — full screen component, connects store, uses feature components
+
+  src/features/{feature}/slice/{feature}Slice.ts
+    — createSlice with actions, reducers, selectors
+
+  src/features/{feature}/types/{feature}.types.ts
+    — TypeScript interfaces for this feature's data
+
+  src/features/{feature}/hooks/use{FeatureName}.ts
+    — custom hook encapsulating slice dispatch + selectors
+
+  src/navigation/AppNavigator.tsx   — root Stack/Tab navigator
+  src/services/httpClient.ts        — axios instance with interceptors
+  src/hooks/useAppDispatch.ts       — typed dispatch hook
+  src/styles/tailwind.config.js     — NativeWind / StyleSheet tokens
+  src/utils/constants.ts            — API_URL, storage keys, etc.
+  src/App.tsx                       — Provider + NavigationContainer root
+
+BUILD ORDER (strictly follow; skip auth feature steps if auth decision is NO):
+  1. src/utils/constants.ts and src/services/httpClient.ts
+  2. types files for every feature  (skip auth feature if auth decision is NO)
+  3. slice files for every feature  (skip auth slice if auth decision is NO)
+  4. src/app/store.ts + rootReducer.ts (import all slices)
+  5. api files for every feature    (skip auth API if auth decision is NO)
+  6. hooks for every feature + src/hooks/useAppDispatch.ts
+  7. feature components/ (reusable, no screens yet)
+  8. feature screens/               (skip login/register screens if auth decision is NO)
+  9. src/navigation/AppNavigator.tsx — if auth YES: include auth stack; if NO: go straight to main stack
+  10. src/App.tsx
+  11. Generate all image assets, reference in screens
+  12. package.json / app.json — finalize dependencies
+"""
+
+_STRUCTURE_MAP = {
+    "flutter": _FLUTTER_STRUCTURE,
+    "next": _NEXT_STRUCTURE,
+    "react_native": _RN_STRUCTURE,
+}
+
+_BUILD_PREAMBLE = """You are the Forgefy Build Agent.
+Your task: implement a complete, working application from the blueprint by writing files in the workspace.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BUILD PHASES — follow in order
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 0 · Auth Decision  ← do this BEFORE anything else
+
+  Read the blueprint's "features", "entities", and "description" fields.
+
+  AUTH IS REQUIRED if ANY of the following are true:
+    • A feature name contains: auth, login, register, sign in, sign up,
+      user account, user profile, password, session, onboarding (with accounts)
+    • An entity name is: User, Account, Profile, Session, Token, Credential
+    • The description mentions: authentication, user accounts, login, sign in,
+      protected data, personalisation tied to a user identity
+
+  AUTH IS NOT REQUIRED for: public tools, utilities, dashboards with no user
+  model, calculator-type apps, content viewers with no personalisation, public
+  APIs, games with no user save state, etc.
+
+  ► Write ONE sentence declaring your decision BEFORE creating any folders:
+      "AUTH: YES — [brief reason from blueprint]"
+      OR
+      "AUTH: NO — [brief reason: public app / no user model / etc.]"
+
+  If AUTH is NO, skip ALL items marked [AUTH ONLY] in the structure below:
+    — do NOT create auth API routes, auth feature folder, login/register screens,
+      session/JWT code, or auth middleware.
+    — treat every build-order step marked [AUTH ONLY] as N/A.
+    — build the app as a fully public application with no login wall.
+
+PHASE 1 · Explore
+  • list_files on '.' to see the existing template
+  • Read key config files to understand conventions
+
+PHASE 2 · Scaffold directories
+  • Call create_directory for every folder listed in the structure below
+  • Before creating each file, write one short sentence narrating what you are doing
+    (e.g. "Creating LoginScreen…", "Building AuthService…")
+    This sentence appears in the user's live build log.
+
+PHASE 3 · Reusable components / widgets  ← DO THIS BEFORE SCREENS
+  • Build all shared UI components first so screens can import them
+  • Keep each component focused on one responsibility
+
+PHASE 4 · Models & services
+  • Data models with serialisation (fromJson/toJson, TypeScript interfaces)
+  • Service classes: one per domain (auth, API, local storage, etc.)
+  • State management wired up
+
+PHASE 5 · Screens / pages
+  • One file per screen/route listed in the blueprint
+  • Every screen must use the reusable components from Phase 3
+
+PHASE 6 · Assets
+  • Use generate_image for every visual element: backgrounds, hero images,
+    onboarding artwork, icons, illustrations — do NOT leave image slots empty
+  • Use generate_video for splash/onboarding animations where appropriate
+  • After generating an asset, immediately reference it in code:
+      Flutter    → Image.asset('assets/images/<file>') + declare in pubspec.yaml
+      Next.js    → <img src="/images/<file>"> or next/image
+      React Native → require('./assets/images/<file>')
+
+PHASE 7 · Configuration
+  • Update the app name everywhere (pubspec.yaml, package.json, app.json, Info.plist, etc.)
+  • Add all required third-party dependencies
+  • Update bundle ID / application ID
+
+RULES
+  • Write real, working code — zero placeholders, zero TODOs
+  • Narrate each step (one short sentence) so the user sees live progress
+  • After ALL features are implemented, write a summary starting with DONE
+
+"""
+
+_BUILD_SUFFIX = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADDITIONAL REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Implement EVERY feature listed in the blueprint — nothing optional
+• Handle loading states, empty states, and basic error states in every screen
+• Add input validation where the app collects user data
+• Style the app consistently using the color/theme constants you define
+• Do not leave any generated image/video slot with a placeholder URL
+"""
+
+
+def _build_system(template_key: str) -> str:
+    structure = _STRUCTURE_MAP.get(template_key, _NEXT_STRUCTURE)
+    return _BUILD_PREAMBLE + structure + _BUILD_SUFFIX
+
+
+# ---------------------------------------------------------------------------
+# Update agent system prompt
+# ---------------------------------------------------------------------------
+_UPDATE_SYSTEM = """You are the Forgefy Update Agent making targeted changes to an existing application.
+
+Rules:
+• Read the relevant files first — understand what already exists before touching anything
+• Apply only what the user asked for; do not rewrite working code unnecessarily
+• Narrate what you are doing: "Updating HomeScreen to add search bar…"
+• If the change requires a new screen, add it to the navigator/router as well
+• If the change requires new images or videos, use generate_image / generate_video,
+  save to the assets folder, and reference the saved path in code
+  (Flutter: also declare new asset paths in pubspec.yaml)
+• After completing the change, write a short summary starting with DONE
+"""
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def run_build_agent(
     workspace: Path,
@@ -43,27 +415,18 @@ def run_build_agent(
     api_key: str,
     model: str,
     log_fn: Callable[[str, str], None] | None = None,
-) -> str:
-    """Run the build agent tool loop; return a summary string."""
+) -> tuple[str, int]:
+    """Run the build agent tool loop; return (summary, total_tokens_used)."""
     client = anthropic.Anthropic(api_key=api_key)
+    system = _build_system(template_key)
     user_msg = (
         f"App name: {app_name}\n"
         f"Template: {template_key}\n\n"
         f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
-        "Implement this application now. Start by exploring the workspace, then implement all features. "
-        "Finish by writing a summary starting with DONE."
+        "Build this application now following the phases in your instructions. "
+        "Narrate each step as you go. Finish by writing a summary starting with DONE."
     )
-    return _loop(client, model, _BUILD_SYSTEM, workspace, user_msg, log_fn)
-
-
-_UPDATE_SYSTEM = """You are the Forgefy Update Agent making changes to an existing application.
-Apply only what the user asked for. Do not rewrite working code unnecessarily.
-Read the relevant files first, make the changes, then write a short summary starting with DONE.
-
-If the update requires new images or videos (e.g. the user asks for a new screen, a banner, a background):
-- Use `generate_image` or `generate_video` to create the asset and save it to the assets folder.
-- Reference the saved path in the code you write or modify.
-- For Flutter: ensure assets/ directories are declared in pubspec.yaml."""
+    return _loop(client, model, system, workspace, user_msg, log_fn)
 
 
 def run_update_agent(
@@ -74,8 +437,8 @@ def run_update_agent(
     api_key: str,
     model: str,
     log_fn: Callable[[str, str], None] | None = None,
-) -> str:
-    """Run the update agent; return a summary string."""
+) -> tuple[str, int]:
+    """Run the update agent; return (summary, total_tokens_used)."""
     client = anthropic.Anthropic(api_key=api_key)
     user_msg = (
         f"App name: {app_name}\n"
@@ -87,6 +450,10 @@ def run_update_agent(
     return _loop(client, model, _UPDATE_SYSTEM, workspace, user_msg, log_fn)
 
 
+# ---------------------------------------------------------------------------
+# Core loop
+# ---------------------------------------------------------------------------
+
 def _loop(
     client: anthropic.Anthropic,
     model: str,
@@ -94,10 +461,15 @@ def _loop(
     workspace: Path,
     initial_user_msg: str,
     log_fn: Callable[[str, str], None] | None = None,
-) -> str:
+) -> tuple[str, int]:
+    """Agent tool loop. Returns (summary, total_tokens_used)."""
     messages: list[dict[str, Any]] = [{"role": "user", "content": initial_user_msg}]
+    total_tokens = 0
 
-    for _ in range(_MAX_ITERATIONS):
+    for iteration in range(_MAX_ITERATIONS):
+        if iteration == _WARN_AT_ITERATION and log_fn:
+            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
+
         if log_fn:
             log_fn("thinking", "Thinking…")
 
@@ -109,6 +481,7 @@ def _loop(
             messages=messages,
         )
 
+        total_tokens += response.usage.input_tokens + response.usage.output_tokens
         messages.append({"role": "assistant", "content": response.content})
 
         tool_results: list[dict[str, Any]] = []
@@ -119,15 +492,15 @@ def _loop(
                 last_text = block.text
                 logger.debug("Agent text: %s", block.text[:120])
                 if log_fn and block.text.strip():
-                    # Show first 120 chars of the agent's thinking
-                    preview = block.text.strip()[:120]
-                    if len(block.text.strip()) > 120:
+                    preview = block.text.strip()[:160]
+                    if len(block.text.strip()) > 160:
                         preview += "…"
                     log_fn("text", preview)
                 if "DONE" in block.text.upper():
                     if log_fn:
                         log_fn("done", "Agent finished.")
-                    return block.text
+                    return block.text, total_tokens
+
             elif block.type == "tool_use":
                 msg = tool_message(block.name, block.input)
                 logger.debug("Tool %s → %s", block.name, msg)
@@ -141,11 +514,11 @@ def _loop(
         if response.stop_reason == "end_turn":
             if log_fn:
                 log_fn("done", "Agent finished.")
-            return last_text or "Done."
+            return last_text or "Done.", total_tokens
 
         if tool_results:
             messages.append({"role": "user", "content": tool_results})
 
     if log_fn:
         log_fn("error", "Agent reached iteration limit.")
-    return "Agent reached iteration limit."
+    return "Agent reached iteration limit.", total_tokens

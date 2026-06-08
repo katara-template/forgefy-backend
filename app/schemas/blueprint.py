@@ -22,3 +22,4 @@ class BlueprintOut(BaseModel):
     build_status: str | None = None
     artifact_url: str | None = None
     preview_url: str | None = None
+    project_id: str | None = None

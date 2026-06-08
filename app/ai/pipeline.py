@@ -1,11 +1,14 @@
 """LangGraph extraction pipeline.
 
-State flows through four sequential nodes (one per agent type).  Each node
-calls Claude independently; events accumulate via the list-append reducer.
+All four agent nodes run in parallel (fan-out from START → all nodes → END).
+They share no state dependencies so there is no reason to run them sequentially.
+LangGraph executes independent nodes in separate threads automatically.
 
-Graph topology:
-    START → feature_extractor → question_detector → conflict_detector
-          → action_item_extractor → END
+Graph topology (parallel fan-out):
+    START ──→ feature_extractor     ──→ END
+          ──→ question_detector     ──→ END
+          ──→ conflict_detector     ──→ END
+          ──→ action_item_extractor ──→ END
 """
 from __future__ import annotations
 
@@ -13,7 +16,7 @@ import logging
 import operator
 from typing import Annotated, Any, TypedDict
 
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, START, StateGraph
 
 from app.ai.agents import (
     action_item_extractor,
@@ -32,7 +35,7 @@ class PipelineState(TypedDict):
     transcript: str
     api_key: str
     model: str
-    # Annotated with operator.add so LangGraph merges lists from each node.
+    # operator.add merges lists from parallel nodes without conflict.
     events: Annotated[list[dict], operator.add]
     errors: Annotated[list[str], operator.add]
 
@@ -96,7 +99,7 @@ def _node_action_item_extractor(state: PipelineState) -> dict:
 
 
 def build_pipeline() -> Any:
-    """Compile and return the LangGraph extraction pipeline."""
+    """Compile and return the LangGraph extraction pipeline (parallel fan-out)."""
     graph: StateGraph = StateGraph(PipelineState)
 
     graph.add_node("feature_extractor", _node_feature_extractor)
@@ -104,11 +107,11 @@ def build_pipeline() -> Any:
     graph.add_node("conflict_detector", _node_conflict_detector)
     graph.add_node("action_item_extractor", _node_action_item_extractor)
 
-    graph.set_entry_point("feature_extractor")
-    graph.add_edge("feature_extractor", "question_detector")
-    graph.add_edge("question_detector", "conflict_detector")
-    graph.add_edge("conflict_detector", "action_item_extractor")
-    graph.add_edge("action_item_extractor", END)
+    # Fan-out: all four nodes start from START and finish at END independently.
+    # LangGraph runs nodes that share the same predecessor in parallel threads.
+    for node in ("feature_extractor", "question_detector", "conflict_detector", "action_item_extractor"):
+        graph.add_edge(START, node)
+        graph.add_edge(node, END)
 
     return graph.compile()
 

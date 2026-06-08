@@ -6,7 +6,7 @@ import uuid
 
 from fastapi import APIRouter
 
-from app.core.exceptions import ForbiddenError, NotFoundError
+from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
 from app.deps import CurrentUser, DBSession
 from app.schemas.project import ProjectOut, UpdateProjectRequest
 
@@ -23,6 +23,7 @@ def _doc_to_out(doc) -> ProjectOut:
         template_key=d["template_key"],
         repo_full_name=d["repo_full_name"],
         github_url=d["github_url"],
+        repo_owner=d.get("repo_owner"),
         created_at=d["created_at"],
         updated_at=d["updated_at"],
         session_id=uuid.UUID(d["session_id"]) if d.get("session_id") else None,
@@ -31,6 +32,7 @@ def _doc_to_out(doc) -> ProjectOut:
         artifact_url=d.get("artifact_url"),
         is_updating=d.get("is_updating", False),
         build_error=d.get("build_error"),
+        build_error_action=d.get("build_error_action"),
     )
 
 
@@ -78,7 +80,10 @@ async def update_project(
     user: CurrentUser,
 ) -> dict:
     """Dispatch a prompt-driven update for the project. Returns immediately."""
-    await _get_owned(project_id, user.id, db)  # ownership check
+    project = await _get_owned(project_id, user.id, db)
+
+    if project.is_updating:
+        raise ValidationError("A build or update is already in progress.")
 
     from app.workers.update_worker import apply_update
     apply_update.apply_async(

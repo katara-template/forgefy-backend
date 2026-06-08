@@ -13,3 +13,4 @@ class User:
     hashed_password: str
     created_at: datetime
     updated_at: datetime
+    tier: str = "free"  # "free" | "starter" | "pro" | "team"

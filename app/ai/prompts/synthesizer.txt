@@ -2,6 +2,7 @@ You are a product requirements analyst. Read the following meeting transcript an
 
 Return ONLY a valid JSON object with exactly this structure:
 {
+  "app_name": "A concise, memorable 2-4 word product name that captures the app's core purpose. Infer it from the meeting if mentioned; otherwise create a fitting one from the description and features.",
   "app_description": "A comprehensive 3-10 sentence overview of the entire app or product being discussed: what it does, who it is for, its core value proposition, and the problem it solves.",
   "features": [
     {
@@ -22,6 +23,7 @@ Return ONLY a valid JSON object with exactly this structure:
 }
 
 Rules:
+- app_name: Use the name mentioned in the meeting if one was given. Otherwise invent a short, professional, memorable name (2-4 words) that fits the product. Think of names like "TaskFlow", "MeetMind", "ShipTrack". No generic names like "My App" or "App".
 - app_description: Write a clear, complete overview of the entire product based on everything discussed. Cover its purpose, target users, and the problem it solves. If the product type is unclear, state what was discussed and infer the intent.
 - features: Extract as much as possible. Even implied or briefly mentioned features count. For each feature write a detailed description — not a single sentence. Cover what it does, why it matters, how it behaves, and any technical or UX details mentioned.
 - For priority: "high" = explicitly urgent or core functionality, "med" = useful but not critical, "low" = nice-to-have or future idea.

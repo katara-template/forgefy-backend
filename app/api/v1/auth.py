@@ -82,6 +82,7 @@ async def register(
             await db.collection("users").document(user_id).set({
                 "email": body.email,
                 "hashed_password": hashed_pwd,
+                "tier": "free",
                 "created_at": now,
                 "updated_at": now,
             })
@@ -178,6 +179,7 @@ async def google_auth(
         await db.collection("users").document(user_id).set({
             "email": email,
             "hashed_password": "",
+            "tier": "free",
             "created_at": now,
             "updated_at": now,
         })
