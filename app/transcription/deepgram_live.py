@@ -34,6 +34,21 @@ def _pcm16_to_wav(pcm_bytes: bytes, sample_rate: int = 16000, channels: int = 1)
     return buf.getvalue()
 
 
+def _make_redis_client(redis_url: str) -> aioredis.Redis:
+    """Create an aioredis client, stripping URL SSL params that redis-py ignores."""
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+    extra: dict = {}
+    url = redis_url
+    if redis_url.startswith("rediss://"):
+        parsed = urlparse(redis_url)
+        qs = parse_qs(parsed.query)
+        qs.pop("ssl_cert_reqs", None)
+        url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+        extra["ssl_cert_reqs"] = "none"
+    return aioredis.from_url(url, decode_responses=True, **extra)
+
+
 class DeepgramLiveSession:
     """Buffers PCM-16 audio and transcribes in periodic chunks via pre-recorded API."""
 
@@ -52,9 +67,11 @@ class DeepgramLiveSession:
         self._lock = asyncio.Lock()
         self._flush_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._running = False
+        self._redis: aioredis.Redis | None = None
 
     async def start(self) -> None:
         self._running = True
+        self._redis = _make_redis_client(self._redis_url)
         self._flush_task = asyncio.create_task(self._flush_loop())
         logger.info("Deepgram chunked session started session=%s model=%s", self._session_id, self._model)
 
@@ -81,6 +98,10 @@ class DeepgramLiveSession:
 
         if len(remaining) >= _MIN_CHUNK_BYTES:
             await self._transcribe_chunk(remaining)
+
+        if self._redis:
+            await self._redis.aclose()
+            self._redis = None
 
         logger.info("Deepgram chunked session finished session=%s", self._session_id)
 
@@ -135,14 +156,11 @@ class DeepgramLiveSession:
                     "is_final": True,
                 }
 
-                r = aioredis.from_url(self._redis_url, decode_responses=True)
-                try:
-                    await r.publish(
+                if self._redis:
+                    await self._redis.publish(
                         f"{_CHANNEL_PREFIX}{self._session_id}",
                         json.dumps(msg),
                     )
-                finally:
-                    await r.aclose()
 
                 from app.workers.extraction_worker import extract_requirements
                 extract_requirements.apply_async(

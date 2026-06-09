@@ -68,7 +68,14 @@ def _run_extraction(transcript: str, settings) -> list[dict]:
     return events
 
 
-@celery_app.task(name="app.workers.extraction_worker.extract_requirements")
+@celery_app.task(
+    name="app.workers.extraction_worker.extract_requirements",
+    autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,        # 1s, 2s, 4s between Celery retries
+    retry_backoff_max=30,
+    retry_jitter=True,
+)
 def extract_requirements(session_id: str, transcript_segment: str) -> None:
     """Run the LangGraph pipeline on a finalized transcript segment."""
     settings = get_settings()

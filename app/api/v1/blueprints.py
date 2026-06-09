@@ -62,6 +62,26 @@ async def _get_owned_blueprint(
     return blueprint
 
 
+@router.get("/session/{session_id}/all", response_model=list[BlueprintOut])
+async def list_blueprints_by_session(
+    session_id: uuid.UUID,
+    db: DBSession,
+    user: CurrentUser,
+) -> list[BlueprintOut]:
+    """Return all blueprints for a session sorted newest-first (ownership-checked)."""
+    sess_doc = await db.collection("sessions").document(str(session_id)).get()
+    if not sess_doc.exists or uuid.UUID(sess_doc.to_dict()["user_id"]) != user.id:
+        raise NotFoundError(f"Session {session_id} not found")
+
+    docs = (
+        await db.collection("blueprints")
+        .where("session_id", "==", str(session_id))
+        .get()
+    )
+    sorted_docs = sorted(docs, key=lambda d: d.to_dict().get("created_at", ""), reverse=True)
+    return [BlueprintOut.model_validate(_doc_to_blueprint(d)) for d in sorted_docs]
+
+
 @router.get("/session/{session_id}", response_model=BlueprintOut)
 async def get_blueprint_by_session(
     session_id: uuid.UUID,

@@ -49,6 +49,40 @@ _EXTRACTION_TYPES = frozenset(
     {"APP_DESCRIPTION", "FEATURE_FOUND", "QUESTION_FOUND", "CONFLICT_FOUND", "ACTION_ITEM_FOUND"}
 )
 
+# Keyword sets for platform inference.  Multi-word phrases rank higher
+# because they carry stronger intent signal than lone words like "app".
+_WEB_PHRASES = frozenset({
+    "website", "web app", "web application", "web platform", "web portal",
+    "web interface", "web-based", "web based", "dashboard", "admin panel",
+    "admin dashboard", "landing page", "saas", "browser-based", "next.js",
+    "nextjs", "react app",
+})
+
+_MOBILE_PHRASES = frozenset({
+    "mobile app", "mobile application", "ios app", "android app",
+    "mobile platform", "phone app", "flutter app", "react native",
+    "app store", "play store", "push notification", "native app", "flutter",
+    "ios", "android",
+})
+
+
+def _detect_platform(json_output: dict) -> str:
+    """Infer 'web', 'mobile', or 'both' from blueprint content keywords."""
+    text = " ".join([
+        json_output.get("app_description", "") or "",
+        *[f.get("title", "") or "" for f in json_output.get("features", [])],
+        *[f.get("description", "") or "" for f in json_output.get("features", [])],
+    ]).lower()
+
+    web_hits = sum(1 for phrase in _WEB_PHRASES if phrase in text)
+    mobile_hits = sum(1 for phrase in _MOBILE_PHRASES if phrase in text)
+
+    if web_hits > 0 and mobile_hits > 0:
+        return "both"
+    if web_hits > 0:
+        return "web"
+    return "mobile"  # default — Flutter when ambiguous
+
 
 class BlueprintAggregator:
     """Queries extraction events and produces a structured blueprint."""
@@ -112,8 +146,51 @@ class BlueprintAggregator:
                 or await self._infer_app_name(json_output)
             )
 
-        blueprint_id = str(uuid.uuid4())
+        platform = _detect_platform(json_output)
         now = datetime.now(timezone.utc)
+        feature_count = len(json_output.get("features", []))
+
+        if platform == "both":
+            # Save one Flutter blueprint and one Next.js blueprint; let the user
+            # decide which to build first.
+            bp_mobile_id = str(uuid.uuid4())
+            bp_web_id = str(uuid.uuid4())
+            mobile_output = {**json_output, "template": "flutter", "platform_variant": "mobile"}
+            web_output = {**json_output, "template": "next", "platform_variant": "web"}
+
+            await self._db.collection("blueprints").document(bp_mobile_id).set({
+                "session_id": str(session_id),
+                "json_output": mobile_output,
+                "approved": False,
+                "created_at": now,
+            })
+            await self._db.collection("blueprints").document(bp_web_id).set({
+                "session_id": str(session_id),
+                "json_output": web_output,
+                "approved": False,
+                "created_at": now,
+            })
+
+            await self._sm.transition(
+                session_id,
+                SessionStatus.BLUEPRINT_READY,
+                extra_payload={"blueprint_id": bp_mobile_id, "blueprint_id_web": bp_web_id},
+            )
+            logger.info(
+                "Dual blueprint generated session=%s mobile=%s web=%s features=%d",
+                session_id, bp_mobile_id, bp_web_id, feature_count,
+            )
+            return Blueprint(
+                id=uuid.UUID(bp_mobile_id),
+                session_id=session_id,
+                json_output=mobile_output,
+                approved=False,
+                created_at=now,
+            )
+
+        # Single-platform path
+        json_output["template"] = "next" if platform == "web" else "flutter"
+        blueprint_id = str(uuid.uuid4())
         await self._db.collection("blueprints").document(blueprint_id).set({
             "session_id": str(session_id),
             "json_output": json_output,
@@ -126,12 +203,9 @@ class BlueprintAggregator:
             SessionStatus.BLUEPRINT_READY,
             extra_payload={"blueprint_id": blueprint_id},
         )
-
         logger.info(
-            "Blueprint generated session=%s blueprint=%s features=%d",
-            session_id,
-            blueprint_id,
-            len(json_output.get("features", [])),
+            "Blueprint generated session=%s blueprint=%s template=%s features=%d",
+            session_id, blueprint_id, json_output["template"], feature_count,
         )
         return Blueprint(
             id=uuid.UUID(blueprint_id),

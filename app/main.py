@@ -69,7 +69,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         qs = parse_qs(parsed.query)
         if "ssl_cert_reqs" in qs:
             val = qs.pop("ssl_cert_reqs")[0]
-            mapping = {"CERT_NONE": ssl.CERT_NONE, "CERT_OPTIONAL": ssl.CERT_OPTIONAL, "CERT_REQUIRED": ssl.CERT_REQUIRED}
+            mapping = {
+                "CERT_NONE": ssl.CERT_NONE, "none": ssl.CERT_NONE,
+                "CERT_OPTIONAL": ssl.CERT_OPTIONAL, "optional": ssl.CERT_OPTIONAL,
+                "CERT_REQUIRED": ssl.CERT_REQUIRED, "required": ssl.CERT_REQUIRED,
+            }
             ssl_cert_reqs = mapping.get(val, None)
             # Rebuild URL without ssl_cert_reqs
             new_query = urlencode(qs, doseq=True)

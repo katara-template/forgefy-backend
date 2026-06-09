@@ -59,9 +59,24 @@ def _channel(session_id: uuid.UUID) -> str:
 # ── Redis subscriber task ─────────────────────────────────────────────────────
 
 
+def _make_redis_client(redis_url: str) -> aioredis.Redis:
+    """Create an aioredis client, stripping URL SSL params that redis-py ignores."""
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+    extra: dict = {}
+    url = redis_url
+    if redis_url.startswith("rediss://"):
+        parsed = urlparse(redis_url)
+        qs = parse_qs(parsed.query)
+        qs.pop("ssl_cert_reqs", None)
+        url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+        extra["ssl_cert_reqs"] = "none"
+    return aioredis.from_url(url, decode_responses=True, **extra)
+
+
 async def _redis_subscriber(session_id: uuid.UUID, settings_redis_url: str) -> None:
     """Subscribe to the Redis channel for session_id and forward messages."""
-    redis: aioredis.Redis = aioredis.from_url(settings_redis_url, decode_responses=True)
+    redis: aioredis.Redis = _make_redis_client(settings_redis_url)
     pubsub = redis.pubsub()
     await pubsub.subscribe(_channel(session_id))
     try:
