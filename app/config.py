@@ -92,15 +92,22 @@ class Settings(BaseSettings):
     @field_validator("REDIS_URL", "CELERY_BROKER_URL", "CELERY_RESULT_BACKEND", mode="before")
     @classmethod
     def fix_rediss_ssl(cls, v: Any) -> Any:
-        """Append ssl_cert_reqs=CERT_NONE to rediss:// URLs that omit it.
+        """Ensure rediss:// URLs carry ssl_cert_reqs=none (redis-py canonical form).
 
-        Celery (and redis-py) require this parameter on SSL Redis URLs or they
-        raise ValueError at startup. Cloud providers (Render, Railway, Upstash)
-        give you a bare rediss:// URL without it.
+        redis-py only accepts lowercase none/optional/required as the value for
+        ssl_cert_reqs in URL query strings.  The old value 'CERT_NONE' raises
+        RedisError: Invalid SSL Certificate Requirements Flag: CERT_NONE.
+        Cloud providers (Render, Railway, Upstash) give bare rediss:// URLs
+        without any cert flag, so we append the correct value here.
         """
-        if isinstance(v, str) and v.startswith("rediss://") and "ssl_cert_reqs" not in v:
+        if not isinstance(v, str) or not v.startswith("rediss://"):
+            return v
+        # Normalise an existing CERT_NONE (uppercase) left from the old code
+        if "ssl_cert_reqs=CERT_NONE" in v:
+            return v.replace("ssl_cert_reqs=CERT_NONE", "ssl_cert_reqs=none")
+        if "ssl_cert_reqs" not in v:
             sep = "&" if "?" in v else "?"
-            return f"{v}{sep}ssl_cert_reqs=CERT_NONE"
+            return f"{v}{sep}ssl_cert_reqs=none"
         return v
 
     @field_validator("CORS_ORIGINS", mode="before")

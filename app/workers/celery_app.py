@@ -1,4 +1,6 @@
 """Celery application instance and queue configuration."""
+import ssl
+
 from celery import Celery
 
 from app.config import get_settings
@@ -12,6 +14,7 @@ celery_app = Celery(
     include=[
         "app.workers.connector_worker",
         "app.workers.transcription_worker",
+        "app.workers.upload_worker",
         "app.workers.extraction_worker",
         "app.workers.blueprint_worker",
         "app.workers.build_worker",
@@ -30,6 +33,7 @@ celery_app.conf.update(
     task_routes={
         "app.workers.connector_worker.*": {"queue": "meeting.audio"},
         "app.workers.transcription_worker.*": {"queue": "meeting.audio"},
+        "app.workers.upload_worker.*": {"queue": "meeting.audio"},
         "app.workers.extraction_worker.*": {"queue": "meeting.transcribe"},
         "app.workers.blueprint_worker.*": {"queue": "meeting.extract"},
         "app.workers.build_worker.*": {"queue": "build"},
@@ -43,3 +47,10 @@ celery_app.conf.update(
         },
     },
 )
+
+# Celery's Redis transport doesn't honour ssl_cert_reqs from the URL query
+# string on its own — it needs explicit SSL dicts.
+if _s.CELERY_BROKER_URL.startswith("rediss://"):
+    _ssl_opts = {"ssl_cert_reqs": ssl.CERT_NONE}
+    celery_app.conf.broker_use_ssl = _ssl_opts
+    celery_app.conf.redis_backend_use_ssl = _ssl_opts
