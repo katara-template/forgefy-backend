@@ -75,25 +75,38 @@ def _make_redis_client(redis_url: str) -> aioredis.Redis:
 
 
 async def _redis_subscriber(session_id: uuid.UUID, settings_redis_url: str) -> None:
-    """Subscribe to the Redis channel for session_id and forward messages."""
-    redis: aioredis.Redis = _make_redis_client(settings_redis_url)
-    pubsub = redis.pubsub()
-    await pubsub.subscribe(_channel(session_id))
-    try:
-        async for raw in pubsub.listen():
-            if raw["type"] != "message":
-                continue
-            try:
-                payload: dict[str, Any] = json.loads(raw["data"])
-            except (json.JSONDecodeError, TypeError):
-                continue
-            await manager.broadcast(session_id, payload)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await pubsub.unsubscribe(_channel(session_id))
-        await pubsub.aclose()
-        await redis.aclose()
+    """Subscribe to the Redis channel for session_id and forward messages.
+
+    Uses get_message() polling instead of listen() so that idle-connection
+    timeouts from managed Redis providers (Upstash etc.) cause a reconnect
+    rather than a silent task crash.
+    """
+    channel = _channel(session_id)
+    while True:
+        redis: aioredis.Redis = _make_redis_client(settings_redis_url)
+        try:
+            async with redis.pubsub() as pubsub:
+                await pubsub.subscribe(channel)
+                while True:
+                    raw = await pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=0
+                    )
+                    if raw is not None:
+                        try:
+                            payload: dict[str, Any] = json.loads(raw["data"])
+                            await manager.broadcast(session_id, payload)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.debug(
+                "_redis_subscriber reconnecting session=%s: %s", session_id, exc
+            )
+            await asyncio.sleep(1.0)
+        finally:
+            await redis.aclose()
 
 
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
