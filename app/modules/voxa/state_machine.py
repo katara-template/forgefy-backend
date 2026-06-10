@@ -22,10 +22,11 @@ _TRANSITIONS: dict[SessionStatus, frozenset[SessionStatus]] = {
     SessionStatus.WAITING: frozenset({SessionStatus.JOINING, SessionStatus.LISTENING, SessionStatus.PROCESSING}),
     SessionStatus.JOINING: frozenset({SessionStatus.LISTENING, SessionStatus.PROCESSING}),
     SessionStatus.LISTENING: frozenset({SessionStatus.PROCESSING}),
-    SessionStatus.PROCESSING: frozenset({SessionStatus.BLUEPRINT_READY}),
+    SessionStatus.PROCESSING: frozenset({SessionStatus.BLUEPRINT_READY, SessionStatus.FAILED}),
     SessionStatus.BLUEPRINT_READY: frozenset({SessionStatus.APPROVED}),
     SessionStatus.APPROVED: frozenset({SessionStatus.BUILDING}),
     SessionStatus.BUILDING: frozenset(),
+    SessionStatus.FAILED: frozenset(),
 }
 
 LISTENING_SUB_STATES: frozenset[str] = frozenset(

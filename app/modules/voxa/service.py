@@ -190,6 +190,7 @@ class VoxaService:
         generate_blueprint.apply_async(
             args=[str(session_id)],
             queue="meeting.extract",
+            countdown=20,
         )
         return session
 

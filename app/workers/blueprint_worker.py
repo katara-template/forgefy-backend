@@ -27,8 +27,22 @@ async def _run_aggregation(session_id: str) -> str:
     return str(blueprint.id)
 
 
-@celery_app.task(name="app.workers.blueprint_worker.generate_blueprint")
-def generate_blueprint(session_id: str) -> None:
+async def _mark_session_failed(session_id: str) -> None:
+    from app.db.firebase import get_firestore_client
+    from app.db.models.enums import SessionStatus
+
+    db = get_firestore_client()
+    await db.collection("sessions").document(session_id).update(
+        {"status": SessionStatus.FAILED.value}
+    )
+
+
+@celery_app.task(
+    bind=True,
+    name="app.workers.blueprint_worker.generate_blueprint",
+    max_retries=2,
+)
+def generate_blueprint(self, session_id: str) -> None:
     """Aggregate requirements, create Blueprint document, notify via Redis."""
     settings = get_settings()
 
@@ -36,9 +50,20 @@ def generate_blueprint(session_id: str) -> None:
     try:
         blueprint_id = loop.run_until_complete(_run_aggregation(session_id))
     except Exception as exc:
+        if self.request.retries < self.max_retries:
+            # "No transcript data" means extraction tasks haven't landed yet — give
+            # them time.  Other transient failures (API errors) get a shorter wait.
+            countdown = 30 if "No transcript data" in str(exc) else 10
+            raise self.retry(exc=exc, countdown=countdown)
+
+        # All retries exhausted — surface the failure.
         from app.core.build_errors import sanitize_build_error
         build_err = sanitize_build_error(exc)
         logger.error("Blueprint generation FAILED session=%s: %s", session_id, exc, exc_info=True)
+        try:
+            loop.run_until_complete(_mark_session_failed(session_id))
+        except Exception as mark_exc:
+            logger.warning("Could not mark session FAILED session=%s: %s", session_id, mark_exc)
         r = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
         try:
             r.publish(

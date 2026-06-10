@@ -10,6 +10,7 @@ class SessionStatus(str, Enum):
     BLUEPRINT_READY = "BLUEPRINT_READY"
     APPROVED = "APPROVED"
     BUILDING = "BUILDING"
+    FAILED = "FAILED"
 
 
 class Platform(str, Enum):
