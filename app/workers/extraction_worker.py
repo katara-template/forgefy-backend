@@ -17,25 +17,30 @@ logger = logging.getLogger(__name__)
 _CHANNEL_PREFIX = "voxa:session:"
 
 
+async def _persist_transcript(session_id: str, transcript_segment: str) -> None:
+    """Write a transcript segment to Firestore unconditionally."""
+    from app.db.firebase import refresh_async_firestore_client
+
+    db = refresh_async_firestore_client()
+    events_ref = db.collection("sessions").document(session_id).collection("events")
+    await events_ref.document(str(uuid.uuid4())).set({
+        "session_id": session_id,
+        "event_type": "transcript.segment",
+        "payload": {"text": transcript_segment},
+        "timestamp": datetime.now(timezone.utc),
+    })
+
+
 async def _persist_events(
     session_id: str,
     events: list[dict],
-    transcript_segment: str = "",
 ) -> None:
-    """Write extraction events (and transcript segment) to Firestore."""
+    """Write extraction events to Firestore."""
     from app.db.firebase import refresh_async_firestore_client
 
     db = refresh_async_firestore_client()
     events_ref = db.collection("sessions").document(session_id).collection("events")
     now = datetime.now(timezone.utc)
-
-    if transcript_segment:
-        await events_ref.document(str(uuid.uuid4())).set({
-            "session_id": session_id,
-            "event_type": "transcript.segment",
-            "payload": {"text": transcript_segment},
-            "timestamp": now,
-        })
 
     for event in events:
         await events_ref.document(str(uuid.uuid4())).set({
@@ -79,6 +84,18 @@ def _run_extraction(transcript: str, settings) -> list[dict]:
 def extract_requirements(session_id: str, transcript_segment: str) -> None:
     """Run the LangGraph pipeline on a finalized transcript segment."""
     settings = get_settings()
+
+    # Always persist the transcript segment first so blueprint generation can
+    # fall back to raw segments even if AI extraction fails or returns nothing.
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_persist_transcript(session_id, transcript_segment))
+        finally:
+            loop.close()
+    except Exception as exc:
+        logger.warning("Failed to persist transcript segment session=%s: %s", session_id, exc)
+
     events = _run_extraction(transcript_segment, settings)
 
     if not events:
@@ -105,7 +122,7 @@ def extract_requirements(session_id: str, transcript_segment: str) -> None:
     try:
         loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(_persist_events(session_id, events, transcript_segment))
+            loop.run_until_complete(_persist_events(session_id, events))
         finally:
             loop.close()
     except Exception as exc:

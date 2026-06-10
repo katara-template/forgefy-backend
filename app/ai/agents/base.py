@@ -23,12 +23,13 @@ def call_claude(
     model: str,
     *,
     max_tokens: int = 1024,
+    timeout: float = 120.0,
 ) -> dict:
     """Call Claude and return the parsed JSON response.
 
     Raises ValueError if the response cannot be parsed as JSON.
     """
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key, timeout=timeout)
     message = client.messages.create(
         model=model,
         max_tokens=max_tokens,
