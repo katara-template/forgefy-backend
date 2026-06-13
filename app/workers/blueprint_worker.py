@@ -41,14 +41,22 @@ async def _mark_session_failed(session_id: str) -> None:
     bind=True,
     name="app.workers.blueprint_worker.generate_blueprint",
     max_retries=2,
+    time_limit=360,       # hard kill after 6 min
+    soft_time_limit=300,  # SoftTimeLimitExceeded raised at 5 min
 )
 def generate_blueprint(self, session_id: str) -> None:
     """Aggregate requirements, create Blueprint document, notify via Redis."""
     settings = get_settings()
 
+    from celery.exceptions import SoftTimeLimitExceeded  # type: ignore[import-untyped]
+
     loop = asyncio.new_event_loop()
     try:
         blueprint_id = loop.run_until_complete(_run_aggregation(session_id))
+    except SoftTimeLimitExceeded as exc:
+        loop.close()
+        logger.warning("Blueprint task soft time limit hit session=%s, retrying", session_id)
+        raise self.retry(exc=exc, countdown=15)
     except Exception as exc:
         if self.request.retries < self.max_retries:
             # "No transcript data" means extraction tasks haven't landed yet — give

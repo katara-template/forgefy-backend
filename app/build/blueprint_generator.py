@@ -222,7 +222,7 @@ class BlueprintAggregator:
 
         settings = get_settings()
         try:
-            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=120.0)
             msg = client.messages.create(
                 model=settings.ANTHROPIC_MODEL,
                 max_tokens=1024,
@@ -259,7 +259,7 @@ class BlueprintAggregator:
 
         settings = get_settings()
         try:
-            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=120.0)
             msg = client.messages.create(
                 model=settings.ANTHROPIC_MODEL,
                 max_tokens=20,
