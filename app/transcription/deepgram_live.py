@@ -11,7 +11,9 @@ import asyncio
 import io
 import json
 import logging
+import uuid
 import wave
+from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
 from deepgram import AsyncDeepgramClient
@@ -107,6 +109,26 @@ class DeepgramLiveSession:
 
     # ── internal ──────────────────────────────────────────────────────────────
 
+    async def _persist_transcript(self, text: str) -> None:
+        """Write transcript segment to Firestore immediately in the web-service process."""
+        try:
+            from app.db.firebase import get_firestore_client
+            db = get_firestore_client()
+            await (
+                db.collection("sessions")
+                .document(self._session_id)
+                .collection("events")
+                .document(str(uuid.uuid4()))
+                .set({
+                    "session_id": self._session_id,
+                    "event_type": "transcript.segment",
+                    "payload": {"text": text},
+                    "timestamp": datetime.now(timezone.utc),
+                })
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist transcript session=%s: %s", self._session_id, exc)
+
     async def _flush_loop(self) -> None:
         """Periodic flush loop — keeps running even if individual flushes fail."""
         while self._running:
@@ -161,6 +183,11 @@ class DeepgramLiveSession:
                         f"{_CHANNEL_PREFIX}{self._session_id}",
                         json.dumps(msg),
                     )
+
+                # Persist transcript segment immediately in the web-service process
+                # so blueprint generation always has data regardless of how backed-up
+                # the Celery extraction queue is.
+                await self._persist_transcript(text)
 
                 from app.workers.extraction_worker import extract_requirements
                 extract_requirements.apply_async(
