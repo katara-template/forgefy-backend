@@ -365,7 +365,7 @@ PHASE 7 · Configuration
 RULES
   • Write real, working code — zero placeholders, zero TODOs
   • Narrate each step (one short sentence) so the user sees live progress
-  • After ALL features are implemented, write a summary starting with DONE
+  • After ALL features are implemented, write a clear user-facing summary starting with DONE: that describes what was built — e.g. "DONE: Built a task manager with home screen, add-task form, and local storage. Screens: Home, AddTask, Settings."
 
 """
 
@@ -391,16 +391,15 @@ def _build_system(template_key: str) -> str:
 # ---------------------------------------------------------------------------
 _UPDATE_SYSTEM = """You are the Forgefy Update Agent making targeted changes to an existing application.
 
-Rules:
-• Read the relevant files first — understand what already exists before touching anything
-• Apply only what the user asked for; do not rewrite working code unnecessarily
-• Narrate what you are doing: "Updating HomeScreen to add search bar…"
-• If the change requires a new screen, add it to the navigator/router as well
-• If the change requires new images or videos, use generate_image / generate_video,
-  save to the assets folder, and reference the saved path in code
-  (Flutter: also declare new asset paths in pubspec.yaml)
-• After completing the change, write a short summary starting with DONE
-"""
+CRITICAL RULES — you MUST follow these or the task fails:
+1. ALWAYS use the write_file tool to make changes. Describing changes in text is not enough — you must call write_file.
+2. Read the relevant files first so you understand the existing structure.
+3. Apply what the user asked for. If the request describes a feature (e.g. "monitor tasks and predict criticality"), break it down into concrete UI screens and logic, then implement each piece with write_file.
+4. If the change requires a new screen, add it to the navigator/router file as well.
+5. Narrate each step briefly: "Reading HomeScreen… Writing updated HomeScreen with risk badge…"
+6. After ALL write_file calls are done, write a summary starting with DONE: describing exactly what changed.
+
+IMPORTANT: Never say DONE without having called write_file at least once. If you are unsure what to write, make a reasonable implementation and write it."""
 
 
 # ---------------------------------------------------------------------------
@@ -424,9 +423,229 @@ def run_build_agent(
         f"Template: {template_key}\n\n"
         f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
         "Build this application now following the phases in your instructions. "
-        "Narrate each step as you go. Finish by writing a summary starting with DONE."
+        "Narrate each step as you go. When finished, write a user-friendly summary starting with DONE: that describes what was built — screens, features, and anything notable."
     )
     return _loop(client, model, system, workspace, user_msg, log_fn)
+
+
+def _tools_to_ollama_format(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {}),
+            },
+        }
+        for t in tools
+    ]
+
+
+def _ollama_loop(
+    base_url: str,
+    model: str,
+    system: str,
+    workspace: Path,
+    initial_user_msg: str,
+    timeout: int = 300,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    """Ollama tool-use agent loop. Returns (summary, 0) — Ollama doesn't expose token counts."""
+    import requests as _req
+
+    # Keep tool results short so the context doesn't balloon across iterations.
+    _TOOL_RESULT_LIMIT = 1500
+    # Sliding window: system + first user msg are always kept; only the last N
+    # assistant/tool pairs are retained so the context stays within num_ctx.
+    _HISTORY_PAIRS = 6  # = 12 messages max in the rolling window
+
+    url = f"{base_url.rstrip('/')}/api/chat"
+    ollama_tools = _tools_to_ollama_format(TOOLS)
+    # Slot 0 = system, slot 1 = initial user task — never dropped.
+    anchor: list[dict[str, Any]] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": initial_user_msg},
+    ]
+    history: list[dict[str, Any]] = []  # assistant + tool messages, pruned each turn
+    last_text = ""
+    write_calls = 0  # track whether the agent actually wrote any files
+
+    def _trimmed_messages() -> list[dict[str, Any]]:
+        """Return anchor + the last _HISTORY_PAIRS*2 history messages."""
+        return anchor + history[-(_HISTORY_PAIRS * 2):]
+
+    for iteration in range(_MAX_ITERATIONS):
+        if iteration == _WARN_AT_ITERATION and log_fn:
+            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
+
+        try:
+            # stream=True: timeout applies per-chunk, not for the full response,
+            # so long generations don't hit the read timeout.
+            with _req.post(
+                url,
+                json={
+                    "model": model,
+                    "messages": _trimmed_messages(),
+                    "tools": ollama_tools,
+                    "stream": True,
+                    "options": {
+                        "num_ctx": 8192,
+                        "num_predict": 4096,
+                    },
+                },
+                timeout=(30, None),
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                content_parts: list[str] = []
+                tool_calls: list[dict] = []
+                stream_buf = ""       # accumulate content tokens until a flush boundary
+                think_buf = ""        # accumulate thinking tokens separately
+                in_think_tag = False  # track inline <think> blocks in content
+                for raw_line in resp.iter_lines():
+                    if not raw_line:
+                        continue
+                    chunk = json.loads(raw_line)
+                    msg = chunk.get("message", {})
+
+                    # ── Thinking tokens (Ollama thinking-model field) ──────────
+                    think_token = msg.get("thinking") or ""
+                    if think_token:
+                        think_buf += think_token
+                        if log_fn and len(think_buf) >= 120:
+                            log_fn("thinking", think_buf.strip())
+                            think_buf = ""
+
+                    # ── Content tokens ─────────────────────────────────────────
+                    token = msg.get("content") or ""
+                    if token:
+                        # Route inline <think>…</think> to the thinking buffer
+                        # so they don't pollute the content sent back to the model.
+                        if "<think>" in token:
+                            in_think_tag = True
+                        if in_think_tag:
+                            think_buf += token
+                            if log_fn and len(think_buf) >= 120:
+                                log_fn("thinking", think_buf.strip())
+                                think_buf = ""
+                            if "</think>" in token:
+                                in_think_tag = False
+                                think_buf = ""  # done with this think block
+                        else:
+                            content_parts.append(token)
+                            stream_buf += token
+                            # Flush to log at natural sentence boundaries or 120 chars
+                            if log_fn and (
+                                "\n" in stream_buf
+                                or stream_buf.endswith((".", "!", "?", "…"))
+                                or len(stream_buf) >= 120
+                            ):
+                                log_fn("text", stream_buf.strip())
+                                stream_buf = ""
+
+                    if chunk.get("done"):
+                        tool_calls = msg.get("tool_calls") or []
+                        if log_fn:
+                            if think_buf.strip():
+                                log_fn("thinking", think_buf.strip())
+                                think_buf = ""
+                            if stream_buf.strip():
+                                log_fn("text", stream_buf.strip())
+                                stream_buf = ""
+
+                content_text: str = "".join(content_parts)
+        except Exception as exc:
+            raise RuntimeError(f"Ollama build agent request failed: {exc}") from exc
+
+        history.append({
+            "role": "assistant",
+            "content": content_text,
+            **({"tool_calls": tool_calls} if tool_calls else {}),
+        })
+
+        if content_text:
+            last_text = content_text
+            if "DONE" in content_text.upper():
+                if write_calls == 0:
+                    # Agent claimed done without writing anything — push back once
+                    if log_fn:
+                        log_fn("info", "Agent said DONE without writing files — asking it to implement…")
+                    history.append({"role": "assistant", "content": content_text})
+                    history.append({
+                        "role": "user",
+                        "content": (
+                            "You said you were done but you haven't called write_file yet. "
+                            "Please implement the changes now using write_file. "
+                            "Do not just describe what to do — actually write the code."
+                        ),
+                    })
+                    continue
+                # Don't emit done here — update_worker will use the returned summary
+                return content_text, 0
+
+        if not tool_calls:
+            if write_calls == 0 and last_text:
+                # No tool calls and no writes — push back once to get actual file output
+                if log_fn:
+                    log_fn("info", "No files written yet — asking agent to write the code…")
+                history.append({"role": "assistant", "content": last_text})
+                history.append({
+                    "role": "user",
+                    "content": (
+                        "You haven't written any files yet. "
+                        "Use the write_file tool to implement the changes now."
+                    ),
+                })
+                continue
+            # Don't emit done here — update_worker will use the returned summary
+            return last_text or "Done.", 0
+
+        for call in tool_calls:
+            func = call.get("function", {})
+            tool_name = func.get("name", "")
+            tool_input = func.get("arguments", {})
+            if isinstance(tool_input, str):
+                try:
+                    tool_input = json.loads(tool_input)
+                except json.JSONDecodeError:
+                    tool_input = {}
+            if tool_name == "write_file":
+                write_calls += 1
+            if log_fn:
+                log_fn("tool", tool_message(tool_name, tool_input))
+            result = execute_tool(tool_name, tool_input, workspace)
+            # Truncate large results (e.g. read_file on a big file) so they
+            # don't blow up the context window on the next iteration.
+            if len(result) > _TOOL_RESULT_LIMIT:
+                result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
+            history.append({"role": "tool", "content": result})
+
+    if log_fn:
+        log_fn("error", "Agent reached iteration limit.")
+    return "Agent reached iteration limit.", 0
+
+
+def run_build_agent_ollama(
+    workspace: Path,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    base_url: str,
+    model: str,
+    timeout: int = 300,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    """Run the build agent using local Ollama with tool calls; return (summary, 0)."""
+    system = _build_system(template_key)
+    user_msg = (
+        f"App name: {app_name}\n"
+        f"Template: {template_key}\n\n"
+        f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
+        "Build this application now following the phases in your instructions. "
+        "Narrate each step as you go. When finished, write a user-friendly summary starting with DONE: that describes what was built — screens, features, and anything notable."
+    )
+    return _ollama_loop(base_url, model, system, workspace, user_msg, timeout, log_fn)
 
 
 def run_update_agent(
@@ -445,9 +664,30 @@ def run_update_agent(
         f"Existing blueprint context:\n{json.dumps(blueprint, indent=2)}\n\n"
         f"User's update request: {prompt}\n\n"
         "Apply this change now. Read the relevant files first, make the changes, "
-        "then write a summary starting with DONE."
+        "then write a user-friendly summary starting with DONE: that describes exactly what was changed."
     )
     return _loop(client, model, _UPDATE_SYSTEM, workspace, user_msg, log_fn)
+
+
+def run_update_agent_ollama(
+    workspace: Path,
+    prompt: str,
+    blueprint: dict[str, Any],
+    app_name: str,
+    base_url: str,
+    model: str,
+    timeout: int = 300,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    """Run the update agent using local Ollama; return (summary, 0)."""
+    user_msg = (
+        f"App name: {app_name}\n"
+        f"Existing blueprint context:\n{json.dumps(blueprint, indent=2)}\n\n"
+        f"User's update request: {prompt}\n\n"
+        "Apply this change now. Read the relevant files first, make the changes, "
+        "then write a user-friendly summary starting with DONE: that describes exactly what was changed."
+    )
+    return _ollama_loop(base_url, model, _UPDATE_SYSTEM, workspace, user_msg, timeout, log_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -469,9 +709,6 @@ def _loop(
     for iteration in range(_MAX_ITERATIONS):
         if iteration == _WARN_AT_ITERATION and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
-
-        if log_fn:
-            log_fn("thinking", "Thinking…")
 
         response = client.messages.create(
             model=model,
@@ -497,8 +734,7 @@ def _loop(
                         preview += "…"
                     log_fn("text", preview)
                 if "DONE" in block.text.upper():
-                    if log_fn:
-                        log_fn("done", "Agent finished.")
+                    # Don't emit done here — update_worker will use the returned summary
                     return block.text, total_tokens
 
             elif block.type == "tool_use":
@@ -512,8 +748,7 @@ def _loop(
                 )
 
         if response.stop_reason == "end_turn":
-            if log_fn:
-                log_fn("done", "Agent finished.")
+            # Don't emit done here — update_worker will use the returned summary
             return last_text or "Done.", total_tokens
 
         if tool_results:

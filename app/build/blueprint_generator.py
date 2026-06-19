@@ -218,23 +218,45 @@ class BlueprintAggregator:
     async def _derive_features(self, description: str) -> list[dict]:
         """Ask the AI to infer likely features from the app description when none were extracted."""
         from app.config import get_settings
-        import anthropic, json as _json
+        import json as _json
 
         settings = get_settings()
         try:
-            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=120.0)
-            msg = client.messages.create(
-                model=settings.ANTHROPIC_MODEL,
-                max_tokens=1024,
-                system=(
-                    "You are a product analyst. Given an app description, infer the most likely "
-                    "features the app needs. Return ONLY a valid JSON array — no markdown, no explanation.\n"
-                    'Each item: {"title": "2-6 word name", "description": "1-2 sentence detail", "priority": "high|med|low"}'
-                ),
-                messages=[{"role": "user", "content": f"App description:\n{description}"}],
+            _SYSTEM = (
+                "You are a product analyst. Given an app description, infer the most likely "
+                "features the app needs. Return a JSON object with a 'features' array.\n"
+                'Each item: {"title": "2-6 word name", "description": "1-2 sentence detail", "priority": "high|med|low"}'
             )
-            raw = msg.content[0].text.strip()
-            features = _json.loads(raw)
+            if settings.BP_MODEL == "Qwen3":
+                from app.ai.agents.ollama_synthesizer import call_ollama
+                result = call_ollama(
+                    system_prompt=_SYSTEM,
+                    user_content=f"App description:\n{description}",
+                    base_url=settings.OLLAMA_URL,
+                    model=settings.OLLAMA_MODEL,
+                    timeout=settings.OLLAMA_TIMEOUT,
+                )
+                features = result.get("features", [])
+            elif settings.BP_MODEL == "gemini":
+                from app.ai.agents.gemini_synthesizer import call_gemini
+                result = call_gemini(
+                    system_prompt=_SYSTEM,
+                    user_content=f"App description:\n{description}",
+                    api_key=settings.GEMINI_API_KEY,
+                    model=settings.GEMINI_MODEL,
+                    max_tokens=1024,
+                )
+                features = result.get("features", [])
+            else:
+                import anthropic
+                client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=120.0)
+                msg = client.messages.create(
+                    model=settings.ANTHROPIC_MODEL,
+                    max_tokens=1024,
+                    system=_SYSTEM,
+                    messages=[{"role": "user", "content": f"App description:\n{description}"}],
+                )
+                features = _json.loads(msg.content[0].text.strip())
             if isinstance(features, list):
                 logger.info("Derived %d features from description", len(features))
                 return features
@@ -245,7 +267,6 @@ class BlueprintAggregator:
     async def _infer_app_name(self, blueprint: dict[str, Any]) -> str:
         """Ask the AI for a concise, memorable app name based on the blueprint content."""
         from app.config import get_settings
-        import anthropic
 
         description = (blueprint.get("app_description") or "").strip()
         features = blueprint.get("features") or []
@@ -259,19 +280,47 @@ class BlueprintAggregator:
 
         settings = get_settings()
         try:
-            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=120.0)
-            msg = client.messages.create(
-                model=settings.ANTHROPIC_MODEL,
-                max_tokens=20,
-                system=(
-                    "Generate a concise, memorable product name (2–4 words) for the app described. "
-                    "Use the name mentioned in the context if one appears; otherwise invent a fitting name. "
-                    "Examples: TaskFlow, MeetMind, ShipTrack, PocketCoach. "
-                    "Return ONLY the name — no quotes, no punctuation, no explanation."
-                ),
-                messages=[{"role": "user", "content": content}],
+            _NAME_SYSTEM = (
+                "Generate a concise, memorable product name (2–4 words) for the app described. "
+                "Use the name mentioned in the context if one appears; otherwise invent a fitting name. "
+                "Examples: TaskFlow, MeetMind, ShipTrack, PocketCoach. "
+                'Return ONLY a JSON object: {"app_name": "<name>"}'
             )
-            name = msg.content[0].text.strip().strip('"').strip("'")
+            if settings.BP_MODEL == "Qwen3":
+                from app.ai.agents.ollama_synthesizer import call_ollama
+                result = call_ollama(
+                    system_prompt=_NAME_SYSTEM,
+                    user_content=content,
+                    base_url=settings.OLLAMA_URL,
+                    model=settings.OLLAMA_MODEL,
+                    timeout=settings.OLLAMA_TIMEOUT,
+                )
+                name = result.get("app_name", "").strip().strip('"').strip("'")
+            elif settings.BP_MODEL == "gemini":
+                from app.ai.agents.gemini_synthesizer import call_gemini
+                result = call_gemini(
+                    system_prompt=_NAME_SYSTEM,
+                    user_content=content,
+                    api_key=settings.GEMINI_API_KEY,
+                    model=settings.GEMINI_MODEL,
+                    max_tokens=64,
+                )
+                name = result.get("app_name", "").strip().strip('"').strip("'")
+            else:
+                import anthropic
+                client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=120.0)
+                msg = client.messages.create(
+                    model=settings.ANTHROPIC_MODEL,
+                    max_tokens=20,
+                    system=(
+                        "Generate a concise, memorable product name (2–4 words) for the app described. "
+                        "Use the name mentioned in the context if one appears; otherwise invent a fitting name. "
+                        "Examples: TaskFlow, MeetMind, ShipTrack, PocketCoach. "
+                        "Return ONLY the name — no quotes, no punctuation, no explanation."
+                    ),
+                    messages=[{"role": "user", "content": content}],
+                )
+                name = msg.content[0].text.strip().strip('"').strip("'")
             logger.info("Inferred app name: %r", name)
             return name
         except Exception as exc:

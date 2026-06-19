@@ -91,3 +91,26 @@ async def update_project(
         queue="build",
     )
     return {"status": "queued"}
+
+
+@router.post("/{project_id}/build-preview", response_model=dict)
+async def trigger_preview_build(
+    project_id: uuid.UUID,
+    db: DBSession,
+    user: CurrentUser,
+) -> dict:
+    """Manually trigger a preview build and deployment for the project."""
+    project = await _get_owned(project_id, user.id, db)
+
+    if project.is_updating:
+        raise ValidationError("A build or update is already in progress.")
+
+    if not project.github_url:
+        raise ValidationError("Project has no GitHub repository yet — wait for the initial build to finish.")
+
+    from app.workers.build_worker import build_preview
+    build_preview.apply_async(
+        args=[str(project_id), str(user.id)],
+        queue="build",
+    )
+    return {"status": "queued"}

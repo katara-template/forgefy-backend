@@ -39,12 +39,41 @@ def call_ollama(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        "stream": False,
+        "stream": True,
         "format": "json",
+        "options": {
+            "num_ctx": 8192,   # cap context window to prevent OOM on small hardware
+            "num_predict": 2048,
+        },
     }
 
+    # stream=True: timeout applies per-chunk, not for the full response,
+    # so long generations on slow hardware don't hit the read timeout.
     try:
-        resp = requests.post(url, json=payload, timeout=timeout)
+        with requests.post(url, json=payload, timeout=(30, None), stream=True) as resp:
+            if resp.status_code == 404:
+                raise OllamaError(
+                    f"Model '{model}' not found in Ollama. "
+                    f"Run 'docker compose exec ollama ollama pull {model}' to load it."
+                )
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                raise OllamaError(
+                    f"Ollama returned HTTP {resp.status_code}: {resp.text[:300]}"
+                ) from exc
+
+            content_parts: list[str] = []
+            for raw_line in resp.iter_lines():
+                if not raw_line:
+                    continue
+                chunk = json.loads(raw_line)
+                msg = chunk.get("message", {})
+                if msg.get("content"):
+                    content_parts.append(msg["content"])
+            raw = "".join(content_parts).strip()
+    except OllamaError:
+        raise
     except requests.exceptions.ConnectionError as exc:
         raise OllamaError(
             f"Ollama service unavailable at {base_url}. "
@@ -52,25 +81,10 @@ def call_ollama(
         ) from exc
     except requests.exceptions.Timeout as exc:
         raise OllamaError(
-            f"Ollama request timed out after {timeout}s. "
-            "The model may still be loading or the transcript is too large."
+            "Ollama connection timed out. "
+            "The model may have crashed or the host is under heavy load."
         ) from exc
 
-    if resp.status_code == 404:
-        raise OllamaError(
-            f"Model '{model}' not found in Ollama. "
-            f"Run 'docker compose exec ollama ollama pull {model}' to load it."
-        )
-
-    try:
-        resp.raise_for_status()
-    except requests.exceptions.HTTPError as exc:
-        raise OllamaError(
-            f"Ollama returned HTTP {resp.status_code}: {resp.text[:300]}"
-        ) from exc
-
-    data = resp.json()
-    raw = data.get("message", {}).get("content", "").strip()
     if not raw:
         raise OllamaError("Ollama returned an empty response body.")
 

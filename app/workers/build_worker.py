@@ -350,16 +350,29 @@ async def _run(session_id: str, project_id: str) -> dict:
         })
         log_fn("info", f"Repository live on GitHub ({repo_url}). Running build agent…")
 
-        # 9. Run Claude build agent — modifies files in the local workspace
-        summary, tokens_used = run_build_agent(
-            workspace=workspace.path,
-            blueprint=json_output,
-            app_name=app_name,
-            template_key=template_key,
-            api_key=settings.ANTHROPIC_API_KEY,
-            model=settings.ANTHROPIC_MODEL,
-            log_fn=log_fn,
-        )
+        # 9. Run build agent — model selected by BUILD_MODEL (independent of BP_MODEL)
+        if settings.BUILD_MODEL == "Qwen3":
+            from app.build.build_agent import run_build_agent_ollama
+            summary, tokens_used = run_build_agent_ollama(
+                workspace=workspace.path,
+                blueprint=json_output,
+                app_name=app_name,
+                template_key=template_key,
+                base_url=settings.OLLAMA_URL,
+                model=settings.OLLAMA_MODEL,
+                timeout=settings.OLLAMA_TIMEOUT,
+                log_fn=log_fn,
+            )
+        else:
+            summary, tokens_used = run_build_agent(
+                workspace=workspace.path,
+                blueprint=json_output,
+                app_name=app_name,
+                template_key=template_key,
+                api_key=settings.ANTHROPIC_API_KEY,
+                model=settings.ANTHROPIC_MODEL,
+                log_fn=log_fn,
+            )
         logger.info("Build agent used %d tokens session=%s", tokens_used, session_id)
 
         # Record usage against the user's monthly quota
@@ -380,9 +393,11 @@ async def _run(session_id: str, project_id: str) -> dict:
             if template_key == "react_native":
                 preview_url = _deploy_expo_snack(workspace.path, app_name)
 
+            log_fn("info", f"Compiling {stack_label} project (this may take a few minutes)…")
             artifact_path = workspace.build_artifacts()
 
             if artifact_path:
+                log_fn("info", "Compilation successful — deploying preview…")
                 if template_key == "flutter" and artifact_path.is_file():
                     if settings.APPETIZE_API_TOKEN:
                         preview_url = _deploy_appetize(artifact_path, settings.APPETIZE_API_TOKEN)
@@ -397,10 +412,15 @@ async def _run(session_id: str, project_id: str) -> dict:
 
                 if settings.CLOUDINARY_CLOUD_NAME:
                     artifact_url = _upload_artifact(artifact_path, session_id)
+            else:
+                log_fn("warning", "Compilation produced no output — preview unavailable. Check the GitHub repo for errors.")
 
         except Exception as exc:
+            error_detail = str(exc)
+            # Show the last 800 chars of the error — compilation errors are at the end
+            snippet = error_detail[-800:].strip() if len(error_detail) > 800 else error_detail.strip()
             logger.warning("Build/preview failed (non-fatal) session=%s: %s", session_id, exc)
-            log_fn("warning", f"Preview deployment failed (code is still on GitHub): {exc}")
+            log_fn("warning", f"Preview build failed (code is still on GitHub):\n{snippet}")
 
         # 12. Update blueprint
         bp_updates: dict = {
@@ -428,7 +448,10 @@ async def _run(session_id: str, project_id: str) -> dict:
             "updated_at": now,
         })
 
-        log_fn("done", "Build complete! Code is live on GitHub.")
+        clean_summary = (summary or "").strip()
+        if clean_summary.upper().startswith("DONE"):
+            clean_summary = clean_summary[4:].lstrip(":").strip()
+        log_fn("done", clean_summary or "Your app has been built successfully!")
         logger.info("Build SUCCESS session=%s repo=%s preview=%s", session_id, repo_url, preview_url)
 
         return {
@@ -477,5 +500,103 @@ def run_build(self, session_id: str, project_id: str) -> dict:
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(_run(session_id, project_id))
+    finally:
+        loop.close()
+
+
+async def _run_preview(project_id: str, user_id: str) -> dict:
+    """Clone the project repo, compile, deploy preview, update Firestore."""
+    from app.build.workspace import EditWorkspace
+    from app.build.build_logger import make_log_publisher
+    from app.build.github_token import get_valid_github_token
+    from app.db.firebase import refresh_async_firestore_client
+
+    settings = get_settings()
+    db = refresh_async_firestore_client()
+
+    doc = await db.collection("projects").document(project_id).get()
+    if not doc.exists:
+        raise ValueError(f"Project {project_id} not found")
+    project_data = doc.to_dict()
+
+    repo_full_name: str = project_data["repo_full_name"]
+    template_key: str = project_data.get("template_key", "next")
+    app_name: str = project_data["app_name"]
+    session_id: str = project_data.get("session_id", project_id)
+
+    github_token = await get_valid_github_token(user_id, settings.GITHUB_TOKEN)
+    log_fn = make_log_publisher(project_id, settings.REDIS_URL)
+    stack_label = {"flutter": "Flutter", "react_native": "React Native", "next": "Next.js"}.get(template_key, template_key)
+
+    # Mark project as busy so the frontend log panel activates and the WebSocket
+    # delivers updates. Cleared in both the success and failure paths below.
+    await db.collection("projects").document(project_id).update({
+        "is_updating": True,
+        "build_error": None,
+        "updated_at": datetime.now(timezone.utc),
+    })
+    log_fn("started", f"Building preview for {app_name}…")
+
+    workspace = EditWorkspace(uuid.UUID(project_id), repo_full_name, github_token)
+    try:
+        workspace.ensure()
+        log_fn("info", f"Compiling {stack_label} project (this may take a few minutes)…")
+
+        artifact_path = workspace.build_artifacts(template_key)
+
+        preview_url: str | None = None
+        artifact_url: str | None = None
+
+        if artifact_path:
+            log_fn("info", "Compilation successful — deploying preview…")
+
+            if template_key == "flutter" and artifact_path.is_file() and settings.APPETIZE_API_TOKEN:
+                preview_url = _deploy_appetize(artifact_path, settings.APPETIZE_API_TOKEN)
+            elif template_key == "next" and artifact_path.is_dir():
+                preview_url = _deploy_cloudflare_pages(artifact_path, app_name)
+            elif template_key == "react_native" and artifact_path.is_dir():
+                preview_url = _deploy_cloudflare_pages(artifact_path, app_name)
+
+            if settings.CLOUDINARY_CLOUD_NAME:
+                artifact_url = _upload_artifact(artifact_path, session_id)
+        else:
+            log_fn("warning", "Compilation produced no output — check the GitHub repo for errors.")
+
+        now = datetime.now(timezone.utc)
+        updates: dict = {"is_updating": False, "updated_at": now}
+        if preview_url:
+            updates["preview_url"] = preview_url
+            log_fn("done", f"Preview deployed → {preview_url}")
+        else:
+            log_fn("warning", "Preview deployment skipped — no artifact or missing deploy credentials.")
+        if artifact_url:
+            updates["artifact_url"] = artifact_url
+
+        await db.collection("projects").document(project_id).update(updates)
+        return {"preview_url": preview_url, "artifact_url": artifact_url}
+
+    except Exception as exc:
+        error_detail = str(exc)
+        snippet = error_detail[-800:].strip() if len(error_detail) > 800 else error_detail.strip()
+        log_fn("error", f"Preview build failed:\n{snippet}")
+        logger.error("Preview build FAILED project=%s: %s", project_id, exc, exc_info=True)
+        await db.collection("projects").document(project_id).update({
+            "is_updating": False,
+            "build_error": snippet[:500],
+            "build_error_action": "retry",
+            "updated_at": datetime.now(timezone.utc),
+        })
+        raise
+    finally:
+        workspace.cleanup()
+
+
+@celery_app.task(name="app.workers.build_worker.build_preview", bind=True, max_retries=0)
+def build_preview(self, project_id: str, user_id: str) -> dict:
+    """Celery entry point — manually triggered preview build."""
+    logger.info("Preview build task started project=%s", project_id)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_run_preview(project_id, user_id))
     finally:
         loop.close()

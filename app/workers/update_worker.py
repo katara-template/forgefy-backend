@@ -84,34 +84,61 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         workspace.ensure()
         log_fn("info", "Workspace ready, running update agent…")
 
-        summary, tokens_used = run_update_agent(
-            workspace=workspace.path,
-            prompt=prompt,
-            blueprint=blueprint_context,
-            app_name=app_name,
-            api_key=settings.ANTHROPIC_API_KEY,
-            model=settings.ANTHROPIC_MODEL,
-            log_fn=log_fn,
-        )
+        if settings.BUILD_MODEL == "Qwen3":
+            from app.build.build_agent import run_update_agent_ollama
+            summary, tokens_used = run_update_agent_ollama(
+                workspace=workspace.path,
+                prompt=prompt,
+                blueprint=blueprint_context,
+                app_name=app_name,
+                base_url=settings.OLLAMA_URL,
+                model=settings.OLLAMA_MODEL,
+                timeout=settings.OLLAMA_TIMEOUT,
+                log_fn=log_fn,
+            )
+        else:
+            summary, tokens_used = run_update_agent(
+                workspace=workspace.path,
+                prompt=prompt,
+                blueprint=blueprint_context,
+                app_name=app_name,
+                api_key=settings.ANTHROPIC_API_KEY,
+                model=settings.ANTHROPIC_MODEL,
+                log_fn=log_fn,
+            )
         logger.info("Update agent used %d tokens project=%s", tokens_used, project_id)
         await record_usage(db, user_id, tokens_used, is_update=True)
 
         log_fn("info", "Pushing changes to GitHub…")
-        workspace.sync_to_github(
+        pushed = workspace.sync_to_github(
             commit_message=f"feat: {prompt[:60]}",
             push_url=push_url,
         )
+
+        clean_summary = (summary or "").strip()
+        if clean_summary.upper().startswith("DONE"):
+            clean_summary = clean_summary[4:].lstrip(":").strip()
 
         now = datetime.now(timezone.utc)
         await _patch_project(project_id, {
             "is_updating": False,
             "build_error": None,
+            "last_summary": clean_summary or None,
             "updated_at": now,
         })
 
-        log_fn("done", "Update complete! Changes pushed to GitHub.")
-        logger.info("Update done project=%s prompt=%s", project_id, prompt[:40])
-        return {"summary": summary}
+        if pushed:
+            log_fn("done", clean_summary or "Your app has been updated successfully!")
+        else:
+            agent_said = f'\n\nAgent response: "{clean_summary}"' if clean_summary else ""
+            log_fn(
+                "warning",
+                f"The agent finished but made no file changes.{agent_said}\n\n"
+                "Try breaking your request into a smaller, more specific step — "
+                "e.g. 'Add a RiskScore badge to the task list item that shows High/Medium/Low.'"
+            )
+        logger.info("Update done project=%s pushed=%s prompt=%s", project_id, pushed, prompt[:40])
+        return {"summary": summary, "pushed": pushed}
 
     except Exception as exc:
         from app.core.build_errors import sanitize_build_error
