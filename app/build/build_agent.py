@@ -391,15 +391,23 @@ def _build_system(template_key: str) -> str:
 # ---------------------------------------------------------------------------
 _UPDATE_SYSTEM = """You are the Forgefy Update Agent making targeted changes to an existing application.
 
+MANDATORY FIRST STEP: Call list_files('.') to understand the project structure before doing anything else.
+
 CRITICAL RULES — you MUST follow these or the task fails:
-1. ALWAYS use the write_file tool to make changes. Describing changes in text is not enough — you must call write_file.
-2. Read the relevant files first so you understand the existing structure.
-3. Apply what the user asked for. If the request describes a feature (e.g. "monitor tasks and predict criticality"), break it down into concrete UI screens and logic, then implement each piece with write_file.
-4. If the change requires a new screen, add it to the navigator/router file as well.
-5. Narrate each step briefly: "Reading HomeScreen… Writing updated HomeScreen with risk badge…"
+1. ALWAYS use the write_file tool to make changes. You MUST call write_file at least once — describing changes in text is NOT acceptable.
+2. Always start by calling list_files('.') then read the relevant source files before writing anything.
+3. For broad requests, break them into specific sub-tasks and implement each one:
+   - "add onboarding screen" → list files, find navigator/router, create the onboarding screen file, update the navigator to include it
+   - "add animations" → list files, identify which screens to animate, rewrite each with animation code
+   - "add dark mode" → find theme file, update colors, add toggle logic
+4. If the change requires a new screen/route, also update the navigator/router file.
+5. Narrate each step briefly before each tool call: "Reading navigator…", "Writing OnboardingScreen…"
 6. After ALL write_file calls are done, write a summary starting with DONE: describing exactly what changed.
 
-IMPORTANT: Never say DONE without having called write_file at least once. If you are unsure what to write, make a reasonable implementation and write it."""
+IMPORTANT:
+- A response of "." or any single character is WRONG — always implement the full change with write_file.
+- Never say DONE without having called write_file at least once.
+- If the request is vague, make a reasonable implementation — do not refuse or return empty."""
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +713,8 @@ def _loop(
     """Agent tool loop. Returns (summary, total_tokens_used)."""
     messages: list[dict[str, Any]] = [{"role": "user", "content": initial_user_msg}]
     total_tokens = 0
+    write_calls = 0
+    pushback_sent = False
 
     for iteration in range(_MAX_ITERATIONS):
         if iteration == _WARN_AT_ITERATION and log_fn:
@@ -723,6 +733,7 @@ def _loop(
 
         tool_results: list[dict[str, Any]] = []
         last_text = ""
+        done_text: str | None = None
 
         for block in response.content:
             if block.type == "text":
@@ -734,10 +745,11 @@ def _loop(
                         preview += "…"
                     log_fn("text", preview)
                 if "DONE" in block.text.upper():
-                    # Don't emit done here — update_worker will use the returned summary
-                    return block.text, total_tokens
+                    done_text = block.text
 
             elif block.type == "tool_use":
+                if block.name == "write_file":
+                    write_calls += 1
                 msg = tool_message(block.name, block.input)
                 logger.debug("Tool %s → %s", block.name, msg)
                 if log_fn:
@@ -747,8 +759,39 @@ def _loop(
                     {"type": "tool_result", "tool_use_id": block.id, "content": result}
                 )
 
+        # If agent said DONE but hasn't written any files, push back once
+        if done_text is not None and not tool_results:
+            if write_calls == 0 and not pushback_sent:
+                pushback_sent = True
+                if log_fn:
+                    log_fn("info", "Agent said DONE without writing files — asking it to implement…")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You said you were done but you haven't called write_file yet. "
+                        "Please implement the changes now using write_file. "
+                        "Start with list_files('.') to explore the project, then write the code."
+                    ),
+                })
+                continue
+            return done_text, total_tokens
+
         if response.stop_reason == "end_turn":
-            # Don't emit done here — update_worker will use the returned summary
+            if write_calls == 0 and not pushback_sent:
+                # Agent stopped without writing any files — push back once
+                pushback_sent = True
+                if log_fn:
+                    log_fn("info", "No files written yet — asking agent to write the code…")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You haven't written any files yet. "
+                        "Use the write_file tool to implement the changes now. "
+                        "Start by calling list_files('.') to see the project structure, "
+                        "then read the relevant files and write the implementation."
+                    ),
+                })
+                continue
             return last_text or "Done.", total_tokens
 
         if tool_results:
