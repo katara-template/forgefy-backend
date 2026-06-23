@@ -389,25 +389,83 @@ def _build_system(template_key: str) -> str:
 # ---------------------------------------------------------------------------
 # Update agent system prompt
 # ---------------------------------------------------------------------------
-_UPDATE_SYSTEM = """You are the Forgefy Update Agent making targeted changes to an existing application.
+_UPDATE_SYSTEM = """You are the Forgefy Update Agent. You make precise, targeted changes to existing applications.
 
-MANDATORY FIRST STEP: Call list_files('.') to understand the project structure before doing anything else.
+══════════════════════════════════════════
+MANDATORY WORKFLOW — follow every time
+══════════════════════════════════════════
+1. Call list_files('.') to see the full project tree.
+2. Read the navigator / router file so you know existing screens and routes.
+3. Read any file you will modify before writing it.
+4. Implement every part of the request with write_file — one call per file.
+5. After all writes, output a summary starting with DONE:.
 
-CRITICAL RULES — you MUST follow these or the task fails:
-1. ALWAYS use the write_file tool to make changes. You MUST call write_file at least once — describing changes in text is NOT acceptable.
-2. Always start by calling list_files('.') then read the relevant source files before writing anything.
-3. For broad requests, break them into specific sub-tasks and implement each one:
-   - "add onboarding screen" → list files, find navigator/router, create the onboarding screen file, update the navigator to include it
-   - "add animations" → list files, identify which screens to animate, rewrite each with animation code
-   - "add dark mode" → find theme file, update colors, add toggle logic
-4. If the change requires a new screen/route, also update the navigator/router file.
-5. Narrate each step briefly before each tool call: "Reading navigator…", "Writing OnboardingScreen…"
-6. After ALL write_file calls are done, write a summary starting with DONE: describing exactly what changed.
+══════════════════════════════════════════
+CRITICAL RULES
+══════════════════════════════════════════
+- You MUST call write_file at least once. Text descriptions alone fail the task.
+- Never output "." or a single word as your response — always write code.
+- Never say DONE without having written at least one file.
+- If a new screen is added, also update the navigator/router to include it.
+- Narrate briefly before each tool call: "Reading AppNavigator…", "Writing OnboardingPage…"
 
-IMPORTANT:
-- A response of "." or any single character is WRONG — always implement the full change with write_file.
-- Never say DONE without having called write_file at least once.
-- If the request is vague, make a reasonable implementation — do not refuse or return empty."""
+══════════════════════════════════════════
+FLUTTER PATTERNS
+══════════════════════════════════════════
+Onboarding screen:
+  File: lib/features/onboarding/presentation/pages/onboarding_page.dart
+  Use PageView with individual step widgets (icon, title, body, skip/next).
+  Store completion in SharedPreferences; check in main.dart to decide initial route.
+  Register route in lib/app.dart.
+
+Animations:
+  Entrance: AnimatedOpacity + SlideTransition triggered in initState via AnimationController.
+  List stagger: wrap each item in AnimationBuilder with staggered begin values.
+  Page transitions: use PageRouteBuilder with custom transitionsBuilder.
+  Hero: wrap shared elements in Hero widget with matching tag.
+
+Dark mode:
+  Add ThemeMode state to MaterialApp. Toggle via a provider/bloc. Persist in SharedPreferences.
+
+New screen:
+  Create in lib/features/{feature}/presentation/pages/.
+  Add named route to lib/app.dart routes map or GoRouter.
+
+══════════════════════════════════════════
+NEXT.JS PATTERNS
+══════════════════════════════════════════
+Onboarding screen:
+  File: app/(app)/onboarding/page.tsx
+  Multi-step with useState for step index. Store completion in localStorage or cookie.
+  Redirect to dashboard if already completed (check in useEffect or middleware).
+
+Animations:
+  CSS: add keyframes to globals.css, apply with className.
+  Framer Motion: wrap elements in <motion.div> with initial/animate/exit props.
+  Tailwind: use transition-*, animate-*, or custom @keyframes in config.
+
+Dark mode:
+  next-themes provider in layout.tsx. Toggle with useTheme hook.
+
+New page:
+  Create app/(app)/{feature}/page.tsx. Add link to layout sidebar/nav.
+
+══════════════════════════════════════════
+REACT NATIVE PATTERNS
+══════════════════════════════════════════
+Onboarding screen:
+  File: src/features/onboarding/screens/OnboardingScreen.tsx
+  Use FlatList or ScrollView with pagingEnabled. Store completion in AsyncStorage.
+  Add to AppNavigator.tsx as the initial screen when not completed.
+
+Animations:
+  Entrance: Animated.timing with useRef(new Animated.Value(0)).
+  List stagger: run Animated.stagger on mount.
+  Layout: LayoutAnimation.configureNext before state changes.
+
+New screen:
+  Create in src/features/{feature}/screens/.
+  Add to Stack.Navigator in src/navigation/AppNavigator.tsx."""
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +560,7 @@ def _ollama_loop(
                         "num_predict": 4096,
                     },
                 },
-                timeout=(30, None),
+                timeout=(30, timeout),
                 stream=True,
             ) as resp:
                 resp.raise_for_status()
@@ -579,7 +637,7 @@ def _ollama_loop(
                     # Agent claimed done without writing anything — push back once
                     if log_fn:
                         log_fn("info", "Agent said DONE without writing files — asking it to implement…")
-                    history.append({"role": "assistant", "content": content_text})
+                    # assistant message already appended above — only add the user pushback
                     history.append({
                         "role": "user",
                         "content": (
@@ -661,17 +719,21 @@ def run_update_agent(
     prompt: str,
     blueprint: dict[str, Any],
     app_name: str,
+    template_key: str,
     api_key: str,
     model: str,
     log_fn: Callable[[str, str], None] | None = None,
 ) -> tuple[str, int]:
     """Run the update agent; return (summary, total_tokens_used)."""
     client = anthropic.Anthropic(api_key=api_key)
+    framework = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(template_key, template_key)
     user_msg = (
         f"App name: {app_name}\n"
+        f"Framework: {framework}\n"
         f"Existing blueprint context:\n{json.dumps(blueprint, indent=2)}\n\n"
         f"User's update request: {prompt}\n\n"
-        "Apply this change now. Read the relevant files first, make the changes, "
+        "Apply this change now. Use list_files('.') to explore the workspace, read the relevant files, "
+        "implement every part of the request with write_file, "
         "then write a user-friendly summary starting with DONE: that describes exactly what was changed."
     )
     return _loop(client, model, _UPDATE_SYSTEM, workspace, user_msg, log_fn)
@@ -682,17 +744,21 @@ def run_update_agent_ollama(
     prompt: str,
     blueprint: dict[str, Any],
     app_name: str,
+    template_key: str,
     base_url: str,
     model: str,
     timeout: int = 300,
     log_fn: Callable[[str, str], None] | None = None,
 ) -> tuple[str, int]:
     """Run the update agent using local Ollama; return (summary, 0)."""
+    framework = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(template_key, template_key)
     user_msg = (
         f"App name: {app_name}\n"
+        f"Framework: {framework}\n"
         f"Existing blueprint context:\n{json.dumps(blueprint, indent=2)}\n\n"
         f"User's update request: {prompt}\n\n"
-        "Apply this change now. Read the relevant files first, make the changes, "
+        "Apply this change now. Use list_files('.') to explore the workspace, read the relevant files, "
+        "implement every part of the request with write_file, "
         "then write a user-friendly summary starting with DONE: that describes exactly what was changed."
     )
     return _ollama_loop(base_url, model, _UPDATE_SYSTEM, workspace, user_msg, timeout, log_fn)

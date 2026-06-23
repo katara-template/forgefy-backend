@@ -43,6 +43,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
     project = await _load_project(project_id)
     app_name: str = project["app_name"]
     repo_full_name: str = project["repo_full_name"]
+    template_key: str = project.get("template_key", "")
     blueprint_context: dict = project.get("blueprint_context") or {}
 
     # Get the right GitHub token (validates personal token; falls back to system if invalid)
@@ -91,6 +92,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
                 prompt=prompt,
                 blueprint=blueprint_context,
                 app_name=app_name,
+                template_key=template_key,
                 base_url=settings.OLLAMA_URL,
                 model=settings.OLLAMA_MODEL,
                 timeout=settings.OLLAMA_TIMEOUT,
@@ -102,6 +104,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
                 prompt=prompt,
                 blueprint=blueprint_context,
                 app_name=app_name,
+                template_key=template_key,
                 api_key=settings.ANTHROPIC_API_KEY,
                 model=settings.ANTHROPIC_MODEL,
                 log_fn=log_fn,
