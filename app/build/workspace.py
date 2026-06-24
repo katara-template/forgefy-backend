@@ -133,6 +133,22 @@ def _patch_next_config(path: Path) -> None:
     logger.info("Created next.config.js with output: 'export'")
 
 
+def _find_package_root(path: Path) -> Path:
+    """Return the directory containing package.json.
+
+    The build agent sometimes creates files in a subdirectory rather than the
+    workspace root. Search one level deep so npm/expo are run in the right place.
+    """
+    if (path / "package.json").exists():
+        return path
+    for child in sorted(path.iterdir()):
+        if child.is_dir() and not child.name.startswith(".") and (child / "package.json").exists():
+            logger.info("package.json found in subdirectory %s — using as project root", child.name)
+            return child
+    logger.warning("No package.json found in %s or its subdirectories — using root", path)
+    return path
+
+
 def build_artifacts_at(path: Path, template_key: str) -> Path | None:
     """Compile and return the artifact path for the given workspace directory."""
     if template_key == "flutter":
@@ -147,31 +163,33 @@ def build_artifacts_at(path: Path, template_key: str) -> Path | None:
         return None
 
     if template_key == "react_native":
-        logger.info("React Native: npm install + expo export path=%s", path)
-        _run(["npm", "install", "--legacy-peer-deps"], cwd=path, timeout=300)
+        root = _find_package_root(path)
+        logger.info("React Native: npm install + expo export path=%s", root)
+        _run(["npm", "install", "--legacy-peer-deps"], cwd=root, timeout=300)
         try:
-            _run(["npx", "expo", "export", "--platform", "web"], cwd=path, timeout=300)
-            dist = path / "dist"
+            _run(["npx", "expo", "export", "--platform", "web"], cwd=root, timeout=300)
+            dist = root / "dist"
             if dist.exists():
                 return dist
         except RuntimeError:
             pass
-        gradlew = path / "android" / "gradlew"
+        gradlew = root / "android" / "gradlew"
         if gradlew.exists():
             _run(["chmod", "+x", str(gradlew)])
-            _run(["./gradlew", "assembleRelease", "--no-daemon"], cwd=path / "android", timeout=600)
-            apk = path / "android/app/build/outputs/apk/release/app-release.apk"
+            _run(["./gradlew", "assembleRelease", "--no-daemon"], cwd=root / "android", timeout=600)
+            apk = root / "android/app/build/outputs/apk/release/app-release.apk"
             if apk.exists():
                 return apk
         logger.warning("No artifact produced for react_native build")
         return None
 
     if template_key == "next":
-        logger.info("Next.js: npm install + static export path=%s", path)
-        _run(["npm", "install", "--legacy-peer-deps"], cwd=path, timeout=300)
-        _patch_next_config(path)
-        _run(["npm", "run", "build"], cwd=path, timeout=300)
-        out = path / "out"
+        root = _find_package_root(path)
+        logger.info("Next.js: npm install + static export path=%s", root)
+        _run(["npm", "install", "--legacy-peer-deps"], cwd=root, timeout=300)
+        _patch_next_config(root)
+        _run(["npm", "run", "build"], cwd=root, timeout=300)
+        out = root / "out"
         if out.exists():
             return out
         logger.warning("No out/ dir after next build")
@@ -209,6 +227,37 @@ class EditWorkspace:
             _run(["git", "config", "user.name", "Forgefy Build"], cwd=self.path)
             logger.info("Edit workspace cloned: %s", self.path)
 
+    # Patterns that must never be committed regardless of what the repo's
+    # .gitignore says (or doesn't say).
+    _REQUIRED_IGNORES = [
+        "node_modules/",
+        ".next/",
+        ".expo/",
+        "dist/",
+        "build/",
+        ".dart_tool/",
+        "*.g.dart",
+        ".flutter-plugins",
+        ".flutter-plugins-dependencies",
+        "__pycache__/",
+        "*.pyc",
+        ".env",
+        ".env.local",
+        ".env*.local",
+        "*.tsbuildinfo",
+    ]
+
+    def _patch_gitignore(self) -> None:
+        """Ensure critical build-output patterns are always gitignored."""
+        gitignore_path = self.path / ".gitignore"
+        existing = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
+        missing = [p for p in self._REQUIRED_IGNORES if p not in existing]
+        if missing:
+            with gitignore_path.open("a", encoding="utf-8") as f:
+                f.write("\n# --- build outputs (auto-patched by Forgefy) ---\n")
+                f.write("\n".join(missing) + "\n")
+            logger.info("Patched .gitignore with %d missing entries", len(missing))
+
     def sync_to_github(self, commit_message: str, push_url: str) -> bool:
         """Stage all changes, commit, rebase onto remote, then push.
 
@@ -217,6 +266,8 @@ class EditWorkspace:
         Agent changes always win on conflict — the agent's code is the canonical
         output for this update.
         """
+        # Always ensure node_modules and build outputs are ignored before staging.
+        self._patch_gitignore()
         _run(["git", "add", "-A"], cwd=self.path)
         nothing_staged = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],

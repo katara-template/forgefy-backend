@@ -41,3 +41,7 @@ class ChatResponse(BaseModel):
     type: str          # "chat" | "update"
     response: str      # message to show the user
     update_queued: bool = False
+
+
+class ChatHistoryRequest(BaseModel):
+    messages: list[dict]

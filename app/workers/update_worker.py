@@ -85,11 +85,45 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         workspace.ensure()
         log_fn("info", "Workspace ready, running update agent…")
 
-        if settings.BUILD_MODEL == "Qwen3":
+        from app.core.build_model import get_effective_build_model
+        build_model = await get_effective_build_model(db, settings)
+
+        # Build a condensed history of previous requests + what was done so the
+        # agent understands what already exists and doesn't repeat or contradict it.
+        contextual_prompt = prompt
+        try:
+            chat_doc = await db.collection("project_chats").document(project_id).get()
+            if chat_doc.exists:
+                all_msgs = (chat_doc.to_dict() or {}).get("messages", [])
+                # Exclude the very last message (the current request — already in prompt)
+                prior_msgs = all_msgs[-21:-1]
+                lines = []
+                for m in prior_msgs:
+                    role = m.get("role", "user")
+                    text = (m.get("text") or "")[:400].strip()
+                    if not text or role == "error":
+                        continue
+                    if role == "user":
+                        lines.append(f"User requested: {text}")
+                    else:
+                        lines.append(f"You replied / implemented: {text}")
+                if lines:
+                    contextual_prompt = (
+                        "HISTORY OF PREVIOUS REQUESTS AND IMPLEMENTATIONS\n"
+                        "(Use this to understand what already exists in the codebase "
+                        "and avoid re-implementing or contradicting prior work)\n"
+                        + "\n".join(lines)
+                        + "\n\nCURRENT REQUEST\n"
+                        + prompt
+                    )
+        except Exception:
+            pass  # non-fatal — fall back to the bare prompt
+
+        if build_model == "Qwen3":
             from app.build.build_agent import run_update_agent_ollama
             summary, tokens_used = run_update_agent_ollama(
                 workspace=workspace.path,
-                prompt=prompt,
+                prompt=contextual_prompt,
                 blueprint=blueprint_context,
                 app_name=app_name,
                 template_key=template_key,
@@ -98,10 +132,34 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
                 timeout=settings.OLLAMA_TIMEOUT,
                 log_fn=log_fn,
             )
+        elif build_model == "gemini":
+            from app.build.build_agent import run_update_agent_gemini
+            summary, tokens_used = run_update_agent_gemini(
+                workspace=workspace.path,
+                prompt=contextual_prompt,
+                blueprint=blueprint_context,
+                app_name=app_name,
+                template_key=template_key,
+                api_key=settings.GEMINI_API_KEY,
+                model=settings.GEMINI_MODEL,
+                log_fn=log_fn,
+            )
+        elif build_model in ("gpt", "openai"):
+            from app.build.build_agent import run_update_agent_openai
+            summary, tokens_used = run_update_agent_openai(
+                workspace=workspace.path,
+                prompt=contextual_prompt,
+                blueprint=blueprint_context,
+                app_name=app_name,
+                template_key=template_key,
+                api_key=settings.OPENAI_API_KEY,
+                model=settings.OPENAI_MODEL,
+                log_fn=log_fn,
+            )
         else:
             summary, tokens_used = run_update_agent(
                 workspace=workspace.path,
-                prompt=prompt,
+                prompt=contextual_prompt,
                 blueprint=blueprint_context,
                 app_name=app_name,
                 template_key=template_key,
@@ -114,7 +172,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
 
         log_fn("info", "Pushing changes to GitHub…")
         pushed = workspace.sync_to_github(
-            commit_message=f"feat: {prompt[:60]}",
+            commit_message=f"feat: {prompt[:60]}",  # original short prompt, not the full context
             push_url=push_url,
         )
 

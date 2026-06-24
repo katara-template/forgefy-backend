@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     # Embeddings
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4o-mini"
 
     # Recall.ai
     RECALL_API_KEY: str = ""

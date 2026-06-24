@@ -21,8 +21,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      ollama:
-        condition: service_healthy
+      # ollama:
+      #   condition: service_healthy
     environment:
       APP_ENV: development
 
@@ -41,8 +41,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      ollama:
-        condition: service_healthy
+      # ollama:
+      #   condition: service_healthy
     environment:
       APP_ENV: development
 
@@ -74,30 +74,30 @@ services:
       - .:/app
     command: celery -A app.workers.celery_app beat --loglevel=info
 
-  ollama:
-    image: ollama/ollama
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
-    entrypoint: ["/bin/sh", "-c"]
-    command: [
-      "(until ollama list >/dev/null 2>&1; do sleep 2; done && ollama pull qwen3:1.7b) & exec ollama serve"
-    ]
-    healthcheck:
-      test: ["CMD-SHELL", "ollama list 2>/dev/null | grep -q 'qwen3:1.7b' || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 40
-      start_period: 60s
+  # ollama:
+  #   image: ollama/ollama
+  #   restart: unless-stopped
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama_data:/root/.ollama
+  #   # deploy:
+  #   #   resources:
+  #   #     reservations:
+  #   #       devices:
+  #   #         - driver: nvidia
+  #   #           count: all
+  #   #           capabilities: [gpu]
+  #   entrypoint: ["/bin/sh", "-c"]
+  #   command: [
+  #     "(until ollama list >/dev/null 2>&1; do sleep 2; done && ollama pull qwen3:8b) & exec ollama serve"
+  #   ]
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "ollama list 2>/dev/null | grep -q 'qwen3:8b' || exit 1"]
+  #     interval: 15s
+  #     timeout: 10s
+  #     retries: 40
+  #     start_period: 60s
 
-volumes:
-  ollama_data:
+# volumes:
+#   ollama_data:
