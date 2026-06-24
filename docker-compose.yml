@@ -74,9 +74,10 @@ services:
       - .:/app
     command: celery -A app.workers.celery_app beat --loglevel=info
 
-  # ollama:                          # Uncomment this entire block to enable local Qwen3.
-  #   image: ollama/ollama           # Also uncomment the ollama depends_on in api and worker,
-  #   ports:                         # and set BP_MODEL=Qwen3 in .env.
+  # ollama:
+  #   image: ollama/ollama
+  #   restart: unless-stopped
+  #   ports:
   #     - "11434:11434"
   #   volumes:
   #     - ollama_data:/root/.ollama
@@ -88,20 +89,15 @@ services:
   #   #           count: all
   #   #           capabilities: [gpu]
   #   entrypoint: ["/bin/sh", "-c"]
-  #   command: |
-  #     ollama serve &
-  #     until curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; do
-  #       echo 'Waiting for Ollama server...'
-  #       sleep 2
-  #     done
-  #     ollama pull qwen3:8b
-  #     wait
+  #   command: [
+  #     "(until ollama list >/dev/null 2>&1; do sleep 2; done && ollama pull qwen3:8b) & exec ollama serve"
+  #   ]
   #   healthcheck:
-  #     test: ["CMD-SHELL", "ollama list 2>/dev/null | grep -q 'qwen3' || exit 1"]
+  #     test: ["CMD-SHELL", "ollama list 2>/dev/null | grep -q 'qwen3:8b' || exit 1"]
   #     interval: 15s
   #     timeout: 10s
   #     retries: 40
-  #     start_period: 30s
+  #     start_period: 60s
 
 # volumes:
-#   ollama_data:  # Uncomment when the ollama service is enabled.
+#   ollama_data:

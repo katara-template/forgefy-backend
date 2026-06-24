@@ -17,9 +17,130 @@ logger = logging.getLogger(__name__)
 _TEMPLATE_KEYS = frozenset({"flutter", "react_native", "next"})
 
 
+# ---------------------------------------------------------------------------
+# Auto-fix helpers
+# ---------------------------------------------------------------------------
+
+def _make_fix_prompt(error_msg: str, template_key: str) -> str:
+    """Turn a raw compilation error into a precise agent fix prompt."""
+    # Take the tail — compile errors accumulate at the end of the output
+    snippet = error_msg[-2000:].strip() if len(error_msg) > 2000 else error_msg.strip()
+
+    framework = {
+        "flutter": "Flutter/Dart",
+        "next": "Next.js/TypeScript",
+        "react_native": "React Native/TypeScript",
+    }.get(template_key, template_key)
+
+    hints = {
+        "flutter": (
+            "• BorderRadius.circular(), NOT BorderRadiusGeometry.circular()\n"
+            "• Colors.blue, NOT Color.blue\n"
+            "• Add missing 'const' where required by the compiler\n"
+            "• Fix null-safety issues (add ?, ! or explicit null checks)\n"
+            "• Verify package names in pubspec.yaml match the imports"
+        ),
+        "next": (
+            "• Add 'use client' for components that use hooks or browser APIs\n"
+            "• Fix @/ import aliases (must match tsconfig paths)\n"
+            "• Resolve TypeScript type mismatches and missing generics"
+        ),
+        "react_native": (
+            "• Fix incorrect import paths\n"
+            "• Resolve TypeScript type errors\n"
+            "• Add missing package imports"
+        ),
+    }.get(template_key, "• Fix all compilation errors listed above")
+
+    return f"""The {framework} app failed to compile. Diagnose and fix ALL errors so the build succeeds.
+
+COMPILATION ERROR OUTPUT:
+{snippet}
+
+INSTRUCTIONS:
+1. Call list_files('.') to understand the project structure.
+2. Read every file mentioned in the error output above.
+3. Fix the exact errors — wrong API names, missing imports, type mismatches, undefined identifiers.
+4. Only modify existing files. Do NOT add new packages or dependencies.
+5. After fixing everything output: DONE: <brief summary of fixes>
+
+COMMON {framework.upper()} MISTAKES TO CHECK:
+{hints}"""
+
+
+def _run_agent_fix(
+    workspace_path: "Path",
+    error_msg: str,
+    template_key: str,
+    app_name: str,
+    blueprint: dict,
+    settings,
+    log_fn,
+) -> None:
+    """Run the update agent to fix compilation errors (synchronous, safe for Celery)."""
+    fix_prompt = _make_fix_prompt(error_msg, template_key)
+
+    if settings.BUILD_MODEL == "Qwen3":
+        from app.build.build_agent import run_update_agent_ollama
+        run_update_agent_ollama(
+            workspace=workspace_path,
+            prompt=fix_prompt,
+            blueprint=blueprint,
+            app_name=app_name,
+            template_key=template_key,
+            base_url=settings.OLLAMA_URL,
+            model=settings.OLLAMA_MODEL,
+            timeout=settings.OLLAMA_TIMEOUT,
+            log_fn=log_fn,
+        )
+    elif settings.BUILD_MODEL == "gemini":
+        from app.build.build_agent import run_update_agent_gemini
+        run_update_agent_gemini(
+            workspace=workspace_path,
+            prompt=fix_prompt,
+            blueprint=blueprint,
+            app_name=app_name,
+            template_key=template_key,
+            api_key=settings.GEMINI_API_KEY,
+            model=settings.GEMINI_MODEL,
+            log_fn=log_fn,
+        )
+    elif settings.BUILD_MODEL in ("gpt", "openai"):
+        from app.build.build_agent import run_update_agent_openai
+        run_update_agent_openai(
+            workspace=workspace_path,
+            prompt=fix_prompt,
+            blueprint=blueprint,
+            app_name=app_name,
+            template_key=template_key,
+            api_key=settings.OPENAI_API_KEY,
+            model=settings.OPENAI_MODEL,
+            log_fn=log_fn,
+        )
+    else:
+        from app.build.build_agent import run_update_agent
+        run_update_agent(
+            workspace=workspace_path,
+            prompt=fix_prompt,
+            blueprint=blueprint,
+            app_name=app_name,
+            template_key=template_key,
+            api_key=settings.ANTHROPIC_API_KEY,
+            model=settings.ANTHROPIC_MODEL,
+            log_fn=log_fn,
+        )
+
+
 def _slugify(name: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9._-]", "-", name).strip("-").lower()
     return (slug or "forgefy-app")[:100]
+
+
+def _cf_project_name(name: str) -> str:
+    """Cloudflare Pages project names: lowercase, alphanumeric + hyphens, max 28 chars."""
+    slug = re.sub(r"[^a-z0-9-]", "-", name.lower())
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return (slug or "forgefy-app")[:28].rstrip("-")
 
 
 def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
@@ -28,30 +149,43 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
 
     settings = get_settings()
     if not settings.CLOUDFLARE_ACCOUNT_ID or not settings.CLOUDFLARE_API_TOKEN:
+        logger.warning("Cloudflare Pages skipped — CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_API_TOKEN not set")
         return None
 
+    cf_name = _cf_project_name(project_name)
     env = os.environ.copy()
     env["CLOUDFLARE_ACCOUNT_ID"] = settings.CLOUDFLARE_ACCOUNT_ID
     env["CLOUDFLARE_API_TOKEN"] = settings.CLOUDFLARE_API_TOKEN
     env["CI"] = "true"
+    # Stop wrangler from trying to open a browser for auth
+    env["WRANGLER_SEND_METRICS"] = "false"
 
     try:
         result = subprocess.run(
             [
-                "npx", "--yes", "wrangler", "pages", "deploy", str(build_dir),
-                "--project-name", project_name,
+                "npx", "--yes", "wrangler@3", "pages", "deploy", str(build_dir),
+                "--project-name", cf_name,
                 "--branch", "main",
                 "--commit-dirty", "true",
             ],
-            capture_output=True, text=True, env=env, timeout=120,
+            capture_output=True, text=True, env=env, timeout=180,
         )
         output = result.stdout + result.stderr
-        match = re.search(r"https://[^\s]+\.pages\.dev", output)
+        logger.info("Wrangler output (rc=%d):\n%s", result.returncode, output[-1500:])
+
+        match = re.search(r"https://[^\s]+\.pages\.dev[^\s]*", output)
         if match:
-            url = match.group(0)
+            url = match.group(0).rstrip(".")
             logger.info("Cloudflare Pages deployed → %s", url)
             return url
-        logger.warning("Wrangler ran but no pages.dev URL found in output")
+
+        if result.returncode != 0:
+            logger.warning("Wrangler exited with code %d — deploy failed", result.returncode)
+        else:
+            logger.warning("Wrangler succeeded but no pages.dev URL found in output")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("Cloudflare Pages deploy timed out after 180 s")
         return None
     except Exception as exc:
         logger.warning("Cloudflare Pages deploy failed (non-fatal): %s", exc)
@@ -350,16 +484,51 @@ async def _run(session_id: str, project_id: str) -> dict:
         })
         log_fn("info", f"Repository live on GitHub ({repo_url}). Running build agent…")
 
-        # 9. Run Claude build agent — modifies files in the local workspace
-        summary, tokens_used = run_build_agent(
-            workspace=workspace.path,
-            blueprint=json_output,
-            app_name=app_name,
-            template_key=template_key,
-            api_key=settings.ANTHROPIC_API_KEY,
-            model=settings.ANTHROPIC_MODEL,
-            log_fn=log_fn,
-        )
+        # 9. Run build agent — model selected by BUILD_MODEL (independent of BP_MODEL)
+        if settings.BUILD_MODEL == "Qwen3":
+            from app.build.build_agent import run_build_agent_ollama
+            summary, tokens_used = run_build_agent_ollama(
+                workspace=workspace.path,
+                blueprint=json_output,
+                app_name=app_name,
+                template_key=template_key,
+                base_url=settings.OLLAMA_URL,
+                model=settings.OLLAMA_MODEL,
+                timeout=settings.OLLAMA_TIMEOUT,
+                log_fn=log_fn,
+            )
+        elif settings.BUILD_MODEL == "gemini":
+            from app.build.build_agent import run_build_agent_gemini
+            summary, tokens_used = run_build_agent_gemini(
+                workspace=workspace.path,
+                blueprint=json_output,
+                app_name=app_name,
+                template_key=template_key,
+                api_key=settings.GEMINI_API_KEY,
+                model=settings.GEMINI_MODEL,
+                log_fn=log_fn,
+            )
+        elif settings.BUILD_MODEL in ("gpt", "openai"):
+            from app.build.build_agent import run_build_agent_openai
+            summary, tokens_used = run_build_agent_openai(
+                workspace=workspace.path,
+                blueprint=json_output,
+                app_name=app_name,
+                template_key=template_key,
+                api_key=settings.OPENAI_API_KEY,
+                model=settings.OPENAI_MODEL,
+                log_fn=log_fn,
+            )
+        else:
+            summary, tokens_used = run_build_agent(
+                workspace=workspace.path,
+                blueprint=json_output,
+                app_name=app_name,
+                template_key=template_key,
+                api_key=settings.ANTHROPIC_API_KEY,
+                model=settings.ANTHROPIC_MODEL,
+                log_fn=log_fn,
+            )
         logger.info("Build agent used %d tokens session=%s", tokens_used, session_id)
 
         # Record usage against the user's monthly quota
@@ -380,9 +549,25 @@ async def _run(session_id: str, project_id: str) -> dict:
             if template_key == "react_native":
                 preview_url = _deploy_expo_snack(workspace.path, app_name)
 
-            artifact_path = workspace.build_artifacts()
+            log_fn("info", f"Compiling {stack_label} project (this may take a few minutes)…")
+            artifact_path = None
+            for _fix_attempt in range(2):
+                try:
+                    artifact_path = workspace.build_artifacts()
+                    break
+                except Exception as _compile_exc:
+                    if _fix_attempt >= 1:
+                        raise
+                    _err = str(_compile_exc)
+                    log_fn("warning", "Compilation failed — running auto-fix agent…")
+                    logger.warning("Auto-fix triggered session=%s attempt=%d: %s", session_id, _fix_attempt, _err[:200])
+                    _run_agent_fix(workspace.path, _err, template_key, app_name, json_output, settings, log_fn)
+                    workspace.commit_all("fix: auto-fix compilation errors")
+                    workspace.push(push_url)
+                    log_fn("info", "Fixes applied and pushed — retrying compilation…")
 
             if artifact_path:
+                log_fn("info", "Compilation successful — deploying preview…")
                 if template_key == "flutter" and artifact_path.is_file():
                     if settings.APPETIZE_API_TOKEN:
                         preview_url = _deploy_appetize(artifact_path, settings.APPETIZE_API_TOKEN)
@@ -397,10 +582,15 @@ async def _run(session_id: str, project_id: str) -> dict:
 
                 if settings.CLOUDINARY_CLOUD_NAME:
                     artifact_url = _upload_artifact(artifact_path, session_id)
+            else:
+                log_fn("warning", "Compilation produced no output — preview unavailable. Check the GitHub repo for errors.")
 
         except Exception as exc:
+            error_detail = str(exc)
+            # Show the last 800 chars of the error — compilation errors are at the end
+            snippet = error_detail[-800:].strip() if len(error_detail) > 800 else error_detail.strip()
             logger.warning("Build/preview failed (non-fatal) session=%s: %s", session_id, exc)
-            log_fn("warning", f"Preview deployment failed (code is still on GitHub): {exc}")
+            log_fn("warning", f"Preview build failed (code is still on GitHub):\n{snippet}")
 
         # 12. Update blueprint
         bp_updates: dict = {
@@ -428,7 +618,10 @@ async def _run(session_id: str, project_id: str) -> dict:
             "updated_at": now,
         })
 
-        log_fn("done", "Build complete! Code is live on GitHub.")
+        clean_summary = (summary or "").strip()
+        if clean_summary.upper().startswith("DONE"):
+            clean_summary = clean_summary[4:].lstrip(":").strip()
+        log_fn("done", clean_summary or "Your app has been built successfully!")
         logger.info("Build SUCCESS session=%s repo=%s preview=%s", session_id, repo_url, preview_url)
 
         return {
@@ -477,5 +670,121 @@ def run_build(self, session_id: str, project_id: str) -> dict:
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(_run(session_id, project_id))
+    finally:
+        loop.close()
+
+
+async def _run_preview(project_id: str, user_id: str) -> dict:
+    """Clone the project repo, compile, deploy preview, update Firestore."""
+    from app.build.workspace import EditWorkspace
+    from app.build.build_logger import make_log_publisher
+    from app.build.github_token import get_valid_github_token
+    from app.db.firebase import refresh_async_firestore_client
+
+    settings = get_settings()
+    db = refresh_async_firestore_client()
+
+    doc = await db.collection("projects").document(project_id).get()
+    if not doc.exists:
+        raise ValueError(f"Project {project_id} not found")
+    project_data = doc.to_dict()
+
+    repo_full_name: str = project_data["repo_full_name"]
+    template_key: str = project_data.get("template_key", "next")
+    app_name: str = project_data["app_name"]
+    session_id: str = project_data.get("session_id", project_id)
+
+    github_token = await get_valid_github_token(user_id, settings.GITHUB_TOKEN)
+    log_fn = make_log_publisher(project_id, settings.REDIS_URL)
+    stack_label = {"flutter": "Flutter", "react_native": "React Native", "next": "Next.js"}.get(template_key, template_key)
+
+    # Mark project as busy so the frontend log panel activates and the WebSocket
+    # delivers updates. Cleared in both the success and failure paths below.
+    await db.collection("projects").document(project_id).update({
+        "is_updating": True,
+        "build_error": None,
+        "updated_at": datetime.now(timezone.utc),
+    })
+    log_fn("started", f"Building preview for {app_name}…")
+
+    workspace = EditWorkspace(uuid.UUID(project_id), repo_full_name, github_token)
+    push_url = f"https://{github_token}@github.com/{repo_full_name}.git"
+    try:
+        workspace.ensure()
+        log_fn("info", f"Compiling {stack_label} project (this may take a few minutes)…")
+
+        artifact_path = None
+        blueprint = project_data.get("blueprint_context") or {}
+        for _fix_attempt in range(2):
+            try:
+                artifact_path = workspace.build_artifacts(template_key)
+                break
+            except Exception as _compile_exc:
+                if _fix_attempt >= 1:
+                    raise
+                _err = str(_compile_exc)
+                log_fn("warning", "Compilation failed — running auto-fix agent…")
+                logger.warning("Auto-fix triggered project=%s attempt=%d: %s", project_id, _fix_attempt, _err[:200])
+                _run_agent_fix(workspace.path, _err, template_key, app_name, blueprint, settings, log_fn)
+                workspace.sync_to_github(
+                    commit_message="fix: auto-fix compilation errors",
+                    push_url=push_url,
+                )
+                log_fn("info", "Fixes applied and pushed — retrying compilation…")
+
+        preview_url: str | None = None
+        artifact_url: str | None = None
+
+        if artifact_path:
+            log_fn("info", "Compilation successful — deploying preview…")
+
+            if template_key == "flutter" and artifact_path.is_file() and settings.APPETIZE_API_TOKEN:
+                preview_url = _deploy_appetize(artifact_path, settings.APPETIZE_API_TOKEN)
+            elif template_key == "next" and artifact_path.is_dir():
+                preview_url = _deploy_cloudflare_pages(artifact_path, app_name)
+            elif template_key == "react_native" and artifact_path.is_dir():
+                preview_url = _deploy_cloudflare_pages(artifact_path, app_name)
+
+            if settings.CLOUDINARY_CLOUD_NAME:
+                artifact_url = _upload_artifact(artifact_path, session_id)
+        else:
+            log_fn("warning", "Compilation produced no output — check the GitHub repo for errors.")
+
+        now = datetime.now(timezone.utc)
+        updates: dict = {"is_updating": False, "updated_at": now}
+        if preview_url:
+            updates["preview_url"] = preview_url
+            log_fn("done", f"Preview deployed → {preview_url}")
+        else:
+            log_fn("warning", "Preview deployment skipped — no artifact or missing deploy credentials.")
+        if artifact_url:
+            updates["artifact_url"] = artifact_url
+
+        await db.collection("projects").document(project_id).update(updates)
+        return {"preview_url": preview_url, "artifact_url": artifact_url}
+
+    except Exception as exc:
+        error_detail = str(exc)
+        snippet = error_detail[-800:].strip() if len(error_detail) > 800 else error_detail.strip()
+        log_fn("error", f"Preview build failed:\n{snippet}")
+        logger.error("Preview build FAILED project=%s: %s", project_id, exc, exc_info=True)
+        await db.collection("projects").document(project_id).update({
+            "is_updating": False,
+            "build_error": snippet[:500],
+            "build_error_action": "retry",
+            "updated_at": datetime.now(timezone.utc),
+        })
+        raise
+    finally:
+        workspace.cleanup()
+
+
+@celery_app.task(name="app.workers.build_worker.build_preview", bind=True, max_retries=0)
+def build_preview(self, project_id: str, user_id: str) -> dict:
+    """Celery entry point — manually triggered preview build."""
+    logger.info("Preview build task started project=%s", project_id)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_run_preview(project_id, user_id))
     finally:
         loop.close()

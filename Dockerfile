@@ -52,6 +52,7 @@ RUN curl -o /tmp/flutter.tar.xz \
       "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz" && \
     tar xf /tmp/flutter.tar.xz -C /opt && \
     rm /tmp/flutter.tar.xz && \
+    git config --global --add safe.directory /opt/flutter && \
     flutter config --no-analytics && \
     flutter precache --android && \
     flutter doctor --android-licenses || true

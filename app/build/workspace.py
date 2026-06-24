@@ -97,116 +97,105 @@ class Workspace:
 
     # ── Build ─────────────────────────────────────────────────────────────────
 
-
     def build_artifacts(self) -> Path | None:
         """Run the platform-appropriate build; return path to the artifact or None."""
-        if self.template_key == "flutter":
-            return self._build_flutter()
-        if self.template_key == "react_native":
-            return self._build_react_native()
-        if self.template_key == "next":
-            return self._build_next()
-        return None
+        return build_artifacts_at(self.path, self.template_key)
 
-    def _build_flutter(self) -> Path | None:
-        logger.info("Flutter: pub get + build apk (session=%s)", self.session_id)
-        _run(["flutter", "pub", "get"], cwd=self.path, timeout=300)
-        _run(
-            ["flutter", "build", "apk", "--release", "--no-tree-shake-icons"],
-            cwd=self.path,
-            timeout=600,
+
+# ---------------------------------------------------------------------------
+# Shared artifact-build helpers (used by Workspace and EditWorkspace)
+# ---------------------------------------------------------------------------
+
+def _patch_next_config(path: Path) -> None:
+    for name in ("next.config.js", "next.config.ts", "next.config.mjs"):
+        cfg = path / name
+        if not cfg.exists():
+            continue
+        text = cfg.read_text(encoding="utf-8")
+        if "output" in text:
+            return
+        patched = text.replace(
+            "module.exports = nextConfig",
+            "nextConfig.output = 'export';\nmodule.exports = nextConfig",
+        ).replace(
+            "export default nextConfig",
+            "nextConfig.output = 'export';\nexport default nextConfig",
         )
-        apk = self.path / "build/app/outputs/flutter-apk/app-release.apk"
+        cfg.write_text(patched, encoding="utf-8")
+        logger.info("Patched %s with output: 'export'", name)
+        return
+    (path / "next.config.js").write_text(
+        "/** @type {import('next').NextConfig} */\n"
+        "const nextConfig = { output: 'export' };\n"
+        "module.exports = nextConfig;\n",
+        encoding="utf-8",
+    )
+    logger.info("Created next.config.js with output: 'export'")
+
+
+def _find_package_root(path: Path) -> Path:
+    """Return the directory containing package.json.
+
+    The build agent sometimes creates files in a subdirectory rather than the
+    workspace root. Search one level deep so npm/expo are run in the right place.
+    """
+    if (path / "package.json").exists():
+        return path
+    for child in sorted(path.iterdir()):
+        if child.is_dir() and not child.name.startswith(".") and (child / "package.json").exists():
+            logger.info("package.json found in subdirectory %s — using as project root", child.name)
+            return child
+    logger.warning("No package.json found in %s or its subdirectories — using root", path)
+    return path
+
+
+def build_artifacts_at(path: Path, template_key: str) -> Path | None:
+    """Compile and return the artifact path for the given workspace directory."""
+    if template_key == "flutter":
+        logger.info("Flutter: pub get + build apk path=%s", path)
+        _run(["flutter", "pub", "get"], cwd=path, timeout=300)
+        _run(["flutter", "build", "apk", "--release", "--no-tree-shake-icons"], cwd=path, timeout=600)
+        apk = path / "build/app/outputs/flutter-apk/app-release.apk"
         if apk.exists():
             logger.info("APK ready: %s (%.1f MB)", apk, apk.stat().st_size / 1_048_576)
             return apk
         logger.warning("APK not found after flutter build")
         return None
 
-    def _build_react_native(self) -> Path | None:
-        logger.info("React Native: npm install + expo export (session=%s)", self.session_id)
-        _run(["npm", "install", "--legacy-peer-deps"], cwd=self.path, timeout=300)
-
-        # Try Expo web export first (no Android SDK needed)
+    if template_key == "react_native":
+        root = _find_package_root(path)
+        logger.info("React Native: npm install + expo export path=%s", root)
+        _run(["npm", "install", "--legacy-peer-deps"], cwd=root, timeout=300)
         try:
-            _run(["npx", "expo", "export", "--platform", "web"], cwd=self.path, timeout=300)
-            dist = self.path / "dist"
+            _run(["npx", "expo", "export", "--platform", "web"], cwd=root, timeout=300)
+            dist = root / "dist"
             if dist.exists():
-                logger.info("Expo web export ready: %s", dist)
                 return dist
         except RuntimeError:
             pass
-
-        # Fallback: bare React Native Android release build
-        gradlew = self.path / "android" / "gradlew"
+        gradlew = root / "android" / "gradlew"
         if gradlew.exists():
             _run(["chmod", "+x", str(gradlew)])
-            _run(
-                ["./gradlew", "assembleRelease", "--no-daemon"],
-                cwd=self.path / "android",
-                timeout=600,
-            )
-            apk = self.path / "android/app/build/outputs/apk/release/app-release.apk"
+            _run(["./gradlew", "assembleRelease", "--no-daemon"], cwd=root / "android", timeout=600)
+            apk = root / "android/app/build/outputs/apk/release/app-release.apk"
             if apk.exists():
-                logger.info("React Native APK ready: %s", apk)
                 return apk
-
         logger.warning("No artifact produced for react_native build")
         return None
 
-    def _build_next(self) -> Path | None:
-        logger.info("Next.js: npm install + static export (session=%s)", self.session_id)
-        _run(["npm", "install", "--legacy-peer-deps"], cwd=self.path, timeout=300)
-
-        # Patch next.config.js/ts to add output: 'export' for Cloudflare Pages
-        self._patch_next_config_for_export()
-
-        _run(["npm", "run", "build"], cwd=self.path, timeout=300)
-
-        # Static export lands in out/
-        out = self.path / "out"
+    if template_key == "next":
+        root = _find_package_root(path)
+        logger.info("Next.js: npm install + static export path=%s", root)
+        _run(["npm", "install", "--legacy-peer-deps"], cwd=root, timeout=300)
+        _patch_next_config(root)
+        _run(["npm", "run", "build"], cwd=root, timeout=300)
+        out = root / "out"
         if out.exists():
-            logger.info("Next.js static export ready: %s", out)
             return out
-
-        logger.warning("No out/ dir after next build — static export may have failed")
+        logger.warning("No out/ dir after next build")
         return None
 
-    def _patch_next_config_for_export(self) -> None:
-        """Ensure next.config.js has output: 'export' so the build produces a static out/ dir."""
-        for name in ("next.config.js", "next.config.ts", "next.config.mjs"):
-            cfg = self.path / name
-            if not cfg.exists():
-                continue
-            text = cfg.read_text(encoding="utf-8")
-            if "output" in text:
-                return  # already configured — respect what the agent wrote
-            # Inject output: 'export' into the first nextConfig object literal
-            patched = text.replace(
-                "const nextConfig",
-                "const nextConfig",
-                1,
-            )
-            # Simple injection: add output before the closing brace of the config object
-            patched = patched.replace(
-                "module.exports = nextConfig",
-                "nextConfig.output = 'export';\nmodule.exports = nextConfig",
-            ).replace(
-                "export default nextConfig",
-                "nextConfig.output = 'export';\nexport default nextConfig",
-            )
-            cfg.write_text(patched, encoding="utf-8")
-            logger.info("Patched %s with output: 'export'", name)
-            return
-
-        # No config file found — create a minimal one
-        (self.path / "next.config.js").write_text(
-            "/** @type {import('next').NextConfig} */\n"
-            "const nextConfig = { output: 'export' };\n"
-            "module.exports = nextConfig;\n",
-            encoding="utf-8",
-        )
-        logger.info("Created next.config.js with output: 'export'")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +227,38 @@ class EditWorkspace:
             _run(["git", "config", "user.name", "Forgefy Build"], cwd=self.path)
             logger.info("Edit workspace cloned: %s", self.path)
 
-    def sync_to_github(self, commit_message: str, push_url: str) -> None:
+    # Patterns that must never be committed regardless of what the repo's
+    # .gitignore says (or doesn't say).
+    _REQUIRED_IGNORES = [
+        "node_modules/",
+        ".next/",
+        ".expo/",
+        "dist/",
+        "build/",
+        ".dart_tool/",
+        "*.g.dart",
+        ".flutter-plugins",
+        ".flutter-plugins-dependencies",
+        "__pycache__/",
+        "*.pyc",
+        ".env",
+        ".env.local",
+        ".env*.local",
+        "*.tsbuildinfo",
+    ]
+
+    def _patch_gitignore(self) -> None:
+        """Ensure critical build-output patterns are always gitignored."""
+        gitignore_path = self.path / ".gitignore"
+        existing = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
+        missing = [p for p in self._REQUIRED_IGNORES if p not in existing]
+        if missing:
+            with gitignore_path.open("a", encoding="utf-8") as f:
+                f.write("\n# --- build outputs (auto-patched by Forgefy) ---\n")
+                f.write("\n".join(missing) + "\n")
+            logger.info("Patched .gitignore with %d missing entries", len(missing))
+
+    def sync_to_github(self, commit_message: str, push_url: str) -> bool:
         """Stage all changes, commit, rebase onto remote, then push.
 
         Handles the case where the remote is ahead of local (e.g. user pushed
@@ -246,6 +266,8 @@ class EditWorkspace:
         Agent changes always win on conflict — the agent's code is the canonical
         output for this update.
         """
+        # Always ensure node_modules and build outputs are ignored before staging.
+        self._patch_gitignore()
         _run(["git", "add", "-A"], cwd=self.path)
         nothing_staged = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
@@ -253,7 +275,7 @@ class EditWorkspace:
         ).returncode == 0
         if nothing_staged:
             logger.info("No changes to commit in edit workspace")
-            return
+            return False
 
         _run(["git", "commit", "-m", commit_message], cwd=self.path)
         _run(["git", "remote", "set-url", "origin", push_url], cwd=self.path)
@@ -279,10 +301,15 @@ class EditWorkspace:
                 self.repo_full_name,
             )
             _run(["git", "push", "--force-with-lease", "origin", "main"], cwd=self.path)
-            return
+            return True
 
         _run(["git", "push", "origin", "main"], cwd=self.path)
         logger.info("Synced edit workspace to GitHub: %s", self.repo_full_name)
+        return True
+
+    def build_artifacts(self, template_key: str) -> Path | None:
+        """Compile the cloned repo and return the artifact path."""
+        return build_artifacts_at(self.path, template_key)
 
     def cleanup(self) -> None:
         """Delete the workspace directory to free disk space."""

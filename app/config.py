@@ -41,12 +41,15 @@ class Settings(BaseSettings):
     OLLAMA_MODEL: str = "qwen3:8b"
     OLLAMA_TIMEOUT: int = 300
 
-    # Blueprint generation backend: "claude" | "gemini" | "Qwen3"
+    # Blueprint generation backend (extraction + synthesis): "claude" | "gemini" | "Qwen3"
     BP_MODEL: str = "claude"
+    # App build backend (code generation): "claude" | "gemini" | "Qwen3"
+    BUILD_MODEL: str = "claude"
 
     # Embeddings
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4o-mini"
 
     # Recall.ai
     RECALL_API_KEY: str = ""

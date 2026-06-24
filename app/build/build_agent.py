@@ -365,7 +365,7 @@ PHASE 7 · Configuration
 RULES
   • Write real, working code — zero placeholders, zero TODOs
   • Narrate each step (one short sentence) so the user sees live progress
-  • After ALL features are implemented, write a summary starting with DONE
+  • After ALL features are implemented, write a clear user-facing summary starting with DONE: that describes what was built — e.g. "DONE: Built a task manager with home screen, add-task form, and local storage. Screens: Home, AddTask, Settings."
 
 """
 
@@ -389,18 +389,300 @@ def _build_system(template_key: str) -> str:
 # ---------------------------------------------------------------------------
 # Update agent system prompt
 # ---------------------------------------------------------------------------
-_UPDATE_SYSTEM = """You are the Forgefy Update Agent making targeted changes to an existing application.
+_UPDATE_SYSTEM = """You are the Forgefy Update Agent. You make precise, targeted changes to existing applications.
+
+══════════════════════════════════════════
+MANDATORY WORKFLOW — follow every time
+══════════════════════════════════════════
+1. Call list_files('.') to see the full project tree.
+2. Read the navigator / router file so you know existing screens and routes.
+3. Read any file you will modify before writing it.
+4. Implement every part of the request with write_file — one call per file.
+5. After all writes, output a summary starting with DONE:.
+
+══════════════════════════════════════════
+CRITICAL RULES
+══════════════════════════════════════════
+- You MUST call write_file at least once. Text descriptions alone fail the task.
+- Never output "." or a single word as your response — always write code.
+- Never say DONE without having written at least one file.
+- If a new screen is added, also update the navigator/router to include it.
+- Narrate briefly before each tool call: "Reading AppNavigator…", "Writing OnboardingPage…"
+
+══════════════════════════════════════════
+DEPENDENCY RULE — CRITICAL FOR BUILDS
+══════════════════════════════════════════
+ANY time you use a package that is not already in package.json / pubspec.yaml,
+you MUST update the manifest file FIRST before writing any file that imports it.
+
+Next.js: read package.json, add the package to "dependencies", write package.json.
+React Native / Expo: read package.json, add to "dependencies", write package.json.
+Flutter: read pubspec.yaml, add under "dependencies:", write pubspec.yaml.
+
+Common packages you must add when you use them:
+  next-themes        → "next-themes": "^0.3.0"
+  framer-motion      → "framer-motion": "^11.0.0"
+  lucide-react       → "lucide-react": "^0.400.0"
+  @radix-ui/*        → "@radix-ui/<name>": "^1.0.0"
+  clsx               → "clsx": "^2.0.0"
+  date-fns           → "date-fns": "^3.0.0"
+  zustand            → "zustand": "^4.4.0"
+  react-hook-form    → "react-hook-form": "^7.0.0"
+  zod                → "zod": "^3.22.0"
+  axios              → "axios": "^1.6.0"
+  @tanstack/react-query → "@tanstack/react-query": "^5.0.0"
+  leaflet / react-leaflet → "leaflet": "^1.9.0", "react-leaflet": "^4.2.0"
+  mapbox-gl          → "mapbox-gl": "^3.0.0"
+  chart.js / react-chartjs-2 → both at latest stable
+  recharts           → "recharts": "^2.10.0"
+  stripe / @stripe/stripe-js → add both
+  firebase           → "firebase": "^10.0.0"
+  socket.io-client   → "socket.io-client": "^4.7.0"
+
+If unsure of a version, use "^<major>.0.0" with the current major version.
+Never import a package without first confirming it is in the manifest.
+
+══════════════════════════════════════════
+FLUTTER PATTERNS
+══════════════════════════════════════════
+Onboarding screen:
+  File: lib/features/onboarding/presentation/pages/onboarding_page.dart
+  Use PageView with individual step widgets (icon, title, body, skip/next).
+  Store completion in SharedPreferences; check in main.dart to decide initial route.
+  Register route in lib/app.dart.
+
+Animations:
+  Entrance: AnimatedOpacity + SlideTransition triggered in initState via AnimationController.
+  List stagger: wrap each item in AnimationBuilder with staggered begin values.
+  Page transitions: use PageRouteBuilder with custom transitionsBuilder.
+  Hero: wrap shared elements in Hero widget with matching tag.
+
+Dark mode:
+  Add ThemeMode state to MaterialApp. Toggle via a provider/bloc. Persist in SharedPreferences.
+
+New screen:
+  Create in lib/features/{feature}/presentation/pages/.
+  Add named route to lib/app.dart routes map or GoRouter.
+
+══════════════════════════════════════════
+NEXT.JS PATTERNS
+══════════════════════════════════════════
+Onboarding screen:
+  File: app/(app)/onboarding/page.tsx
+  Multi-step with useState for step index. Store completion in localStorage or cookie.
+  Redirect to dashboard if already completed (check in useEffect or middleware).
+
+Animations:
+  CSS: add keyframes to globals.css, apply with className.
+  Framer Motion: wrap elements in <motion.div> with initial/animate/exit props.
+  Tailwind: use transition-*, animate-*, or custom @keyframes in config.
+
+Dark mode:
+  Add "next-themes": "^0.3.0" to package.json dependencies FIRST.
+  Then wrap <body> in <ThemeProvider> in layout.tsx. Toggle with useTheme hook.
+
+New page:
+  Create app/(app)/{feature}/page.tsx. Add link to layout sidebar/nav.
+
+══════════════════════════════════════════
+REACT NATIVE PATTERNS
+══════════════════════════════════════════
+Onboarding screen:
+  File: src/features/onboarding/screens/OnboardingScreen.tsx
+  Use FlatList or ScrollView with pagingEnabled. Store completion in AsyncStorage.
+  Add to AppNavigator.tsx as the initial screen when not completed.
+
+Animations:
+  Entrance: Animated.timing with useRef(new Animated.Value(0)).
+  List stagger: run Animated.stagger on mount.
+  Layout: LayoutAnimation.configureNext before state changes.
+
+New screen:
+  Create in src/features/{feature}/screens/.
+  Add to Stack.Navigator in src/navigation/AppNavigator.tsx."""
+
+
+# ---------------------------------------------------------------------------
+# Planner — single text-only API call that returns a structured execution plan
+# ---------------------------------------------------------------------------
+
+_PLANNER_SYSTEM = """You are a software architect. Your ONLY job is to analyse a change request and produce a precise execution plan.
+
+You do NOT write code. You do NOT call tools. You do NOT modify files.
+
+Return ONLY valid JSON — absolutely no other text before or after:
+{
+  "summary": "<one sentence — what will be built or changed>",
+  "files_to_create": [
+    {"path": "<relative/path/to/file>", "purpose": "<what this file contains and does>"}
+  ],
+  "files_to_modify": [
+    {"path": "<relative/path/to/file>", "changes": "<exact changes required — be specific>"}
+  ],
+  "dependencies": [
+    {"package": "<package_name: ^version>", "reason": "<why it is needed>"}
+  ],
+  "steps": [
+    "<atomic step 1>",
+    "<atomic step 2>"
+  ],
+  "constraints": [
+    "<anything the executor must NOT change or break>"
+  ]
+}
 
 Rules:
-• Read the relevant files first — understand what already exists before touching anything
-• Apply only what the user asked for; do not rewrite working code unnecessarily
-• Narrate what you are doing: "Updating HomeScreen to add search bar…"
-• If the change requires a new screen, add it to the navigator/router as well
-• If the change requires new images or videos, use generate_image / generate_video,
-  save to the assets folder, and reference the saved path in code
-  (Flutter: also declare new asset paths in pubspec.yaml)
-• After completing the change, write a short summary starting with DONE
-"""
+- All file paths must be relative to the workspace root
+- Never invent packages that do not exist in the target framework ecosystem
+- Each step must be atomic — one conceptual change per step
+- Production-quality plan only — no placeholders, no TODOs, no vague steps
+- JSON only. Zero prose outside the JSON."""
+
+
+def _build_planner_msg(
+    prompt: str,
+    blueprint: dict[str, Any],
+    workspace: Path,
+    template_key: str,
+    app_name: str,
+) -> str:
+    framework = {
+        "flutter": "Flutter/Dart (flutter_bloc)",
+        "next": "Next.js / TypeScript / Tailwind CSS",
+        "react_native": "React Native / TypeScript / Expo",
+    }.get(template_key, template_key)
+    try:
+        file_tree = execute_tool("list_files", {"path": "."}, workspace)
+    except Exception:
+        file_tree = "(unavailable)"
+    bp_excerpt = json.dumps({
+        "features": blueprint.get("features", [])[:10],
+        "entities": blueprint.get("entities", [])[:8],
+        "description": (blueprint.get("app_description") or blueprint.get("description", ""))[:300],
+    })
+    # Strip the history preamble that update_worker prepends — the planner only
+    # needs the current request, not the conversation history.
+    planner_prompt = prompt
+    if "\nCURRENT REQUEST\n" in prompt:
+        planner_prompt = prompt.split("\nCURRENT REQUEST\n", 1)[-1].strip()
+    # Cap so the plan JSON output isn't squeezed by a huge input.
+    if len(planner_prompt) > 4000:
+        planner_prompt = planner_prompt[:4000]
+    return (
+        f"App: {app_name}\n"
+        f"Framework: {framework}\n\n"
+        f"Blueprint excerpt:\n{bp_excerpt}\n\n"
+        f"Current workspace files:\n{file_tree[:1200]}\n\n"
+        f"Change request:\n{planner_prompt}"
+    )
+
+
+def _call_planner(
+    planner_input: str,
+    *,
+    backend: str = "claude",
+    api_key: str = "",
+    model: str = "",
+    base_url: str = "",
+    ollama_model: str = "",
+    ollama_timeout: int = 120,
+) -> dict[str, Any] | None:
+    """Single text-only call to get an execution plan. Returns parsed dict or None on failure."""
+    try:
+        if backend == "claude":
+            client = anthropic.Anthropic(api_key=api_key)
+            resp = client.messages.create(
+                model=model, max_tokens=4096,
+                system=_PLANNER_SYSTEM,
+                messages=[{"role": "user", "content": planner_input}],
+            )
+            raw = resp.content[0].text.strip() if resp.content else ""
+
+        elif backend == "gemini":
+            import requests as _req
+            url = _GEMINI_URL.format(model=model)
+            r = _req.post(
+                url, params={"key": api_key},
+                json={
+                    "system_instruction": {"parts": [{"text": _PLANNER_SYSTEM}]},
+                    "contents": [{"role": "user", "parts": [{"text": planner_input}]}],
+                    "generationConfig": {"maxOutputTokens": 4096},
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+            parts = (r.json().get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+            raw = "".join(p.get("text", "") for p in parts).strip()
+
+        elif backend in ("gpt", "openai"):
+            from openai import OpenAI
+            client_oai = OpenAI(api_key=api_key)
+            resp_oai = client_oai.chat.completions.create(
+                model=model, max_tokens=4096,
+                messages=[
+                    {"role": "system", "content": _PLANNER_SYSTEM},
+                    {"role": "user", "content": planner_input},
+                ],
+            )
+            raw = (resp_oai.choices[0].message.content or "").strip()
+
+        else:  # Qwen3 / Ollama
+            import requests as _req
+            r = _req.post(
+                f"{base_url.rstrip('/')}/api/chat",
+                json={
+                    "model": ollama_model,
+                    "messages": [
+                        {"role": "system", "content": _PLANNER_SYSTEM},
+                        {"role": "user", "content": planner_input},
+                    ],
+                    "stream": False,
+                },
+                timeout=ollama_timeout,
+            )
+            r.raise_for_status()
+            raw = (r.json().get("message") or {}).get("content", "").strip()
+
+        # Normalise: strip think tags, markdown fences, extract first {...}
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        raw = m.group(0) if m else raw
+        return json.loads(raw)
+
+    except Exception as exc:
+        logger.warning("Planner call failed (%s) — proceeding without plan: %s", backend, exc)
+        return None
+
+
+def _log_plan(plan: dict[str, Any] | None, log_fn: Callable[[str, str], None] | None) -> None:
+    if not log_fn or not plan:
+        return
+    # Structured event → frontend renders this as an interactive checklist
+    log_fn("plan", json.dumps(plan))
+    # Human-readable summary in the text log as well
+    log_fn("info", f"Plan: {plan.get('summary', 'no summary')}")
+
+
+def _plan_prefix(plan: dict[str, Any]) -> str:
+    return (
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "IMPLEMENTATION PLAN — follow this exactly\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{json.dumps(plan, indent=2)}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Execute every item in this plan:\n"
+        "• Create all files listed in files_to_create\n"
+        "• Apply all changes listed in files_to_modify\n"
+        "• Add all packages in dependencies to pubspec.yaml / package.json\n"
+        "• Follow steps in order\n"
+        "• Production-quality code only — no placeholders, no TODOs\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -424,9 +706,252 @@ def run_build_agent(
         f"Template: {template_key}\n\n"
         f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
         "Build this application now following the phases in your instructions. "
-        "Narrate each step as you go. Finish by writing a summary starting with DONE."
+        "Narrate each step as you go. When finished, write a user-friendly summary starting with DONE: that describes what was built — screens, features, and anything notable."
     )
     return _loop(client, model, system, workspace, user_msg, log_fn)
+
+
+def _tools_to_ollama_format(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {}),
+            },
+        }
+        for t in tools
+    ]
+
+
+def _ollama_loop(
+    base_url: str,
+    model: str,
+    system: str,
+    workspace: Path,
+    initial_user_msg: str,
+    timeout: int = 300,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    """Ollama tool-use agent loop. Returns (summary, 0) — Ollama doesn't expose token counts."""
+    import requests as _req
+
+    # Keep tool results short so the context doesn't balloon across iterations.
+    _TOOL_RESULT_LIMIT = 1500
+    # Sliding window: system + first user msg are always kept; only the last N
+    # assistant/tool pairs are retained so the context stays within num_ctx.
+    _HISTORY_PAIRS = 6  # = 12 messages max in the rolling window
+
+    url = f"{base_url.rstrip('/')}/api/chat"
+    ollama_tools = _tools_to_ollama_format(TOOLS)
+    # Slot 0 = system, slot 1 = initial user task — never dropped.
+    anchor: list[dict[str, Any]] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": initial_user_msg},
+    ]
+    history: list[dict[str, Any]] = []  # assistant + tool messages, pruned each turn
+    last_text = ""
+    write_calls = 0  # track whether the agent actually wrote any files
+
+    def _trimmed_messages() -> list[dict[str, Any]]:
+        """Return anchor + the last _HISTORY_PAIRS*2 history messages."""
+        return anchor + history[-(_HISTORY_PAIRS * 2):]
+
+    for iteration in range(_MAX_ITERATIONS):
+        if iteration == _WARN_AT_ITERATION and log_fn:
+            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
+
+        try:
+            # stream=True: timeout applies per-chunk, not for the full response,
+            # so long generations don't hit the read timeout.
+            with _req.post(
+                url,
+                json={
+                    "model": model,
+                    "messages": _trimmed_messages(),
+                    "tools": ollama_tools,
+                    "stream": True,
+                    "options": {
+                        "num_ctx": 8192,
+                        "num_predict": 4096,
+                    },
+                },
+                timeout=(30, timeout),
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                content_parts: list[str] = []
+                tool_calls: list[dict] = []
+                stream_buf = ""       # accumulate content tokens until a flush boundary
+                think_buf = ""        # accumulate thinking tokens separately
+                in_think_tag = False  # track inline <think> blocks in content
+                for raw_line in resp.iter_lines():
+                    if not raw_line:
+                        continue
+                    chunk = json.loads(raw_line)
+                    msg = chunk.get("message", {})
+
+                    # ── Thinking tokens (Ollama thinking-model field) ──────────
+                    think_token = msg.get("thinking") or ""
+                    if think_token:
+                        think_buf += think_token
+                        if log_fn and len(think_buf) >= 120:
+                            log_fn("thinking", think_buf.strip())
+                            think_buf = ""
+
+                    # ── Content tokens ─────────────────────────────────────────
+                    token = msg.get("content") or ""
+                    if token:
+                        # Route inline <think>…</think> to the thinking buffer
+                        # so they don't pollute the content sent back to the model.
+                        if "<think>" in token:
+                            in_think_tag = True
+                        if in_think_tag:
+                            think_buf += token
+                            if log_fn and len(think_buf) >= 120:
+                                log_fn("thinking", think_buf.strip())
+                                think_buf = ""
+                            if "</think>" in token:
+                                in_think_tag = False
+                                think_buf = ""  # done with this think block
+                        else:
+                            content_parts.append(token)
+                            stream_buf += token
+                            # Flush to log at natural sentence boundaries or 120 chars
+                            if log_fn and (
+                                "\n" in stream_buf
+                                or stream_buf.endswith((".", "!", "?", "…"))
+                                or len(stream_buf) >= 120
+                            ):
+                                log_fn("text", stream_buf.strip())
+                                stream_buf = ""
+
+                    if chunk.get("done"):
+                        tool_calls = msg.get("tool_calls") or []
+                        if log_fn:
+                            if think_buf.strip():
+                                log_fn("thinking", think_buf.strip())
+                                think_buf = ""
+                            if stream_buf.strip():
+                                log_fn("text", stream_buf.strip())
+                                stream_buf = ""
+
+                content_text: str = "".join(content_parts)
+        except Exception as exc:
+            raise RuntimeError(f"Ollama build agent request failed: {exc}") from exc
+
+        history.append({
+            "role": "assistant",
+            "content": content_text,
+            **({"tool_calls": tool_calls} if tool_calls else {}),
+        })
+
+        if content_text:
+            last_text = content_text
+            if "DONE" in content_text.upper():
+                if write_calls == 0:
+                    # Agent claimed done without writing anything — push back once
+                    if log_fn:
+                        log_fn("info", "Agent said DONE without writing files — asking it to implement…")
+                    # assistant message already appended above — only add the user pushback
+                    history.append({
+                        "role": "user",
+                        "content": (
+                            "You said you were done but you haven't called write_file yet. "
+                            "Please implement the changes now using write_file. "
+                            "Do not just describe what to do — actually write the code."
+                        ),
+                    })
+                    continue
+                # Don't emit done here — update_worker will use the returned summary
+                return content_text, 0
+
+        if not tool_calls:
+            if write_calls == 0 and last_text:
+                # No tool calls and no writes — push back once to get actual file output
+                if log_fn:
+                    log_fn("info", "No files written yet — asking agent to write the code…")
+                history.append({"role": "assistant", "content": last_text})
+                history.append({
+                    "role": "user",
+                    "content": (
+                        "You haven't written any files yet. "
+                        "Use the write_file tool to implement the changes now."
+                    ),
+                })
+                continue
+            # Don't emit done here — update_worker will use the returned summary
+            return last_text or "Done.", 0
+
+        for call in tool_calls:
+            func = call.get("function", {})
+            tool_name = func.get("name", "")
+            tool_input = func.get("arguments", {})
+            if isinstance(tool_input, str):
+                try:
+                    tool_input = json.loads(tool_input)
+                except json.JSONDecodeError:
+                    tool_input = {}
+            if tool_name == "write_file":
+                write_calls += 1
+                if log_fn:
+                    log_fn("file_written", tool_input.get("path", ""))
+            if log_fn:
+                log_fn("tool", tool_message(tool_name, tool_input))
+            result = execute_tool(tool_name, tool_input, workspace)
+            # Truncate large results (e.g. read_file on a big file) so they
+            # don't blow up the context window on the next iteration.
+            if len(result) > _TOOL_RESULT_LIMIT:
+                result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
+            history.append({"role": "tool", "content": result})
+
+    if log_fn:
+        log_fn("error", "Agent reached iteration limit.")
+    return "Agent reached iteration limit.", 0
+
+
+def run_build_agent_ollama(
+    workspace: Path,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    base_url: str,
+    model: str,
+    timeout: int = 300,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    """Run the build agent using local Ollama with tool calls; return (summary, 0)."""
+    system = _build_system(template_key)
+    user_msg = (
+        f"App name: {app_name}\n"
+        f"Template: {template_key}\n\n"
+        f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
+        "Build this application now following the phases in your instructions. "
+        "Narrate each step as you go. When finished, write a user-friendly summary starting with DONE: that describes what was built — screens, features, and anything notable."
+    )
+    return _ollama_loop(base_url, model, system, workspace, user_msg, timeout, log_fn)
+
+
+def _update_user_msg(
+    app_name: str,
+    template_key: str,
+    blueprint: dict[str, Any],
+    prompt: str,
+    plan: dict[str, Any] | None,
+) -> str:
+    framework = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(template_key, template_key)
+    prefix = _plan_prefix(plan) if plan else ""
+    return (
+        f"{prefix}"
+        f"App name: {app_name}\n"
+        f"Framework: {framework}\n"
+        f"Existing blueprint context:\n{json.dumps(blueprint, indent=2)}\n\n"
+        f"User's update request: {prompt}\n\n"
+        "Apply this change now. Use list_files('.') to explore the workspace, read the relevant files, "
+        "implement every part of the request with write_file, "
+        "then write a user-friendly summary starting with DONE: that describes exactly what was changed."
+    )
 
 
 def run_update_agent(
@@ -434,20 +959,358 @@ def run_update_agent(
     prompt: str,
     blueprint: dict[str, Any],
     app_name: str,
+    template_key: str,
     api_key: str,
     model: str,
     log_fn: Callable[[str, str], None] | None = None,
 ) -> tuple[str, int]:
-    """Run the update agent; return (summary, total_tokens_used)."""
-    client = anthropic.Anthropic(api_key=api_key)
-    user_msg = (
-        f"App name: {app_name}\n"
-        f"Existing blueprint context:\n{json.dumps(blueprint, indent=2)}\n\n"
-        f"User's update request: {prompt}\n\n"
-        "Apply this change now. Read the relevant files first, make the changes, "
-        "then write a summary starting with DONE."
+    """Plan then execute an update using Claude/Anthropic."""
+    if log_fn:
+        log_fn("thinking", "Planning changes…")
+    plan = _call_planner(
+        _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
+        backend="claude", api_key=api_key, model=model,
     )
-    return _loop(client, model, _UPDATE_SYSTEM, workspace, user_msg, log_fn)
+    _log_plan(plan, log_fn)
+    client = anthropic.Anthropic(api_key=api_key)
+    return _loop(client, model, _UPDATE_SYSTEM, workspace, _update_user_msg(app_name, template_key, blueprint, prompt, plan), log_fn)
+
+
+def run_update_agent_ollama(
+    workspace: Path,
+    prompt: str,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    base_url: str,
+    model: str,
+    timeout: int = 300,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    """Plan then execute an update using Ollama/Qwen3."""
+    if log_fn:
+        log_fn("thinking", "Planning changes…")
+    plan = _call_planner(
+        _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
+        backend="Qwen3", base_url=base_url, ollama_model=model, ollama_timeout=timeout,
+    )
+    _log_plan(plan, log_fn)
+    return _ollama_loop(base_url, model, _UPDATE_SYSTEM, workspace, _update_user_msg(app_name, template_key, blueprint, prompt, plan), timeout, log_fn)
+
+
+# ---------------------------------------------------------------------------
+# Gemini agent loop
+# ---------------------------------------------------------------------------
+
+_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+_TOOL_RESULT_LIMIT = 1500
+
+
+def _tools_to_gemini_format(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"functionDeclarations": [
+        {
+            "name": t["name"],
+            "description": t.get("description", ""),
+            "parameters": t.get("input_schema", {}),
+        }
+        for t in tools
+    ]}]
+
+
+def _gemini_loop(
+    api_key: str,
+    model: str,
+    system: str,
+    workspace: Path,
+    initial_user_msg: str,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    """Gemini tool-use agent loop via REST API. Returns (summary, 0)."""
+    import requests as _req
+
+    url = _GEMINI_URL.format(model=model)
+    gemini_tools = _tools_to_gemini_format(TOOLS)
+    contents: list[dict[str, Any]] = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
+    last_text = ""
+    write_calls = 0
+    pushback_sent = False
+
+    for iteration in range(_MAX_ITERATIONS):
+        if iteration == _WARN_AT_ITERATION and log_fn:
+            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
+
+        try:
+            resp = _req.post(
+                url,
+                params={"key": api_key},
+                json={
+                    "system_instruction": {"parts": [{"text": system}]},
+                    "contents": contents,
+                    "tools": gemini_tools,
+                    "generationConfig": {"maxOutputTokens": 8192},
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            raise RuntimeError(f"Gemini agent request failed: {exc}") from exc
+
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise RuntimeError(f"Gemini returned no candidates: {data}")
+
+        candidate = candidates[0]
+        parts = candidate.get("content", {}).get("parts", [])
+        finish_reason = candidate.get("finishReason", "")
+        contents.append({"role": "model", "parts": parts})
+
+        tool_calls: list[dict] = []
+        done_text: str | None = None
+
+        for part in parts:
+            if "text" in part:
+                txt = part["text"]
+                last_text = txt
+                if log_fn and txt.strip():
+                    log_fn("text", txt.strip()[:160])
+                if "DONE" in txt.upper():
+                    done_text = txt
+            elif "functionCall" in part:
+                tool_calls.append(part["functionCall"])
+
+        if done_text is not None and not tool_calls:
+            if write_calls == 0 and not pushback_sent:
+                pushback_sent = True
+                if log_fn:
+                    log_fn("info", "Agent said DONE without writing files — asking it to implement…")
+                contents.append({"role": "user", "parts": [{"text": (
+                    "You said you were done but haven't called write_file yet. "
+                    "Implement the changes now using write_file."
+                )}]})
+                continue
+            return done_text, 0
+
+        if finish_reason in ("STOP", "MAX_TOKENS") and not tool_calls:
+            if write_calls == 0 and not pushback_sent:
+                pushback_sent = True
+                if log_fn:
+                    log_fn("info", "No files written yet — asking agent to write the code…")
+                contents.append({"role": "user", "parts": [{"text": (
+                    "You haven't written any files yet. Use write_file to implement the changes."
+                )}]})
+                continue
+            return last_text or "Done.", 0
+
+        tool_responses: list[dict] = []
+        for call in tool_calls:
+            tool_name = call.get("name", "")
+            tool_input = call.get("args", {})
+            if tool_name == "write_file":
+                write_calls += 1
+                if log_fn:
+                    log_fn("file_written", tool_input.get("path", ""))
+            if log_fn:
+                log_fn("tool", tool_message(tool_name, tool_input))
+            result = execute_tool(tool_name, tool_input, workspace)
+            if len(result) > _TOOL_RESULT_LIMIT:
+                result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
+            tool_responses.append({"functionResponse": {"name": tool_name, "response": {"output": result}}})
+
+        if tool_responses:
+            contents.append({"role": "user", "parts": tool_responses})
+
+    if log_fn:
+        log_fn("error", "Agent reached iteration limit.")
+    return "Agent reached iteration limit.", 0
+
+
+def run_build_agent_gemini(
+    workspace: Path,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    api_key: str,
+    model: str,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    system = _build_system(template_key)
+    user_msg = (
+        f"App name: {app_name}\nTemplate: {template_key}\n\n"
+        f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
+        "Build this application now following the phases in your instructions. "
+        "Narrate each step. When finished, write DONE: <summary of what was built>."
+    )
+    return _gemini_loop(api_key, model, system, workspace, user_msg, log_fn)
+
+
+def run_update_agent_gemini(
+    workspace: Path,
+    prompt: str,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    api_key: str,
+    model: str,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    """Plan then execute an update using Gemini."""
+    if log_fn:
+        log_fn("thinking", "Planning changes…")
+    plan = _call_planner(
+        _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
+        backend="gemini", api_key=api_key, model=model,
+    )
+    _log_plan(plan, log_fn)
+    return _gemini_loop(api_key, model, _UPDATE_SYSTEM, workspace, _update_user_msg(app_name, template_key, blueprint, prompt, plan), log_fn)
+
+
+# ---------------------------------------------------------------------------
+# OpenAI / GPT agent loop
+# ---------------------------------------------------------------------------
+
+def _openai_loop(
+    api_key: str,
+    model: str,
+    system: str,
+    workspace: Path,
+    initial_user_msg: str,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    """OpenAI tool-use agent loop. Returns (summary, total_tokens)."""
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key)
+    openai_tools = _tools_to_ollama_format(TOOLS)  # same OpenAI-compatible format
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": initial_user_msg},
+    ]
+    last_text = ""
+    write_calls = 0
+    pushback_sent = False
+    total_tokens = 0
+
+    for iteration in range(_MAX_ITERATIONS):
+        if iteration == _WARN_AT_ITERATION and log_fn:
+            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
+
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=openai_tools,
+                tool_choice="auto",
+                max_tokens=8096,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"OpenAI agent request failed: {exc}") from exc
+
+        if response.usage:
+            total_tokens += response.usage.total_tokens
+
+        msg = response.choices[0].message
+        # Append as dict so it's serialisable for the next round
+        messages.append({"role": "assistant", "content": msg.content or "", **({"tool_calls": [
+            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+            for tc in (msg.tool_calls or [])
+        ]} if msg.tool_calls else {})})
+
+        tool_calls = msg.tool_calls or []
+        text = msg.content or ""
+        done_text: str | None = None
+
+        if text:
+            last_text = text
+            if log_fn and text.strip():
+                log_fn("text", text.strip()[:160])
+            if "DONE" in text.upper():
+                done_text = text
+
+        if done_text is not None and not tool_calls:
+            if write_calls == 0 and not pushback_sent:
+                pushback_sent = True
+                if log_fn:
+                    log_fn("info", "Agent said DONE without writing files — asking it to implement…")
+                messages.append({"role": "user", "content": (
+                    "You said you were done but haven't called write_file yet. "
+                    "Implement the changes now using write_file."
+                )})
+                continue
+            return done_text, total_tokens
+
+        finish_reason = response.choices[0].finish_reason
+        if finish_reason == "stop" and not tool_calls:
+            if write_calls == 0 and not pushback_sent:
+                pushback_sent = True
+                if log_fn:
+                    log_fn("info", "No files written yet — asking agent to write the code…")
+                messages.append({"role": "user", "content": (
+                    "You haven't written any files yet. Use write_file to implement the changes."
+                )})
+                continue
+            return last_text or "Done.", total_tokens
+
+        for tc in tool_calls:
+            tool_name = tc.function.name
+            try:
+                tool_input = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                tool_input = {}
+            if tool_name == "write_file":
+                write_calls += 1
+                if log_fn:
+                    log_fn("file_written", tool_input.get("path", ""))
+            if log_fn:
+                log_fn("tool", tool_message(tool_name, tool_input))
+            result = execute_tool(tool_name, tool_input, workspace)
+            if len(result) > _TOOL_RESULT_LIMIT:
+                result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+    if log_fn:
+        log_fn("error", "Agent reached iteration limit.")
+    return "Agent reached iteration limit.", total_tokens
+
+
+def run_build_agent_openai(
+    workspace: Path,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    api_key: str,
+    model: str,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    system = _build_system(template_key)
+    user_msg = (
+        f"App name: {app_name}\nTemplate: {template_key}\n\n"
+        f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
+        "Build this application now following the phases in your instructions. "
+        "Narrate each step. When finished, write DONE: <summary of what was built>."
+    )
+    return _openai_loop(api_key, model, system, workspace, user_msg, log_fn)
+
+
+def run_update_agent_openai(
+    workspace: Path,
+    prompt: str,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    api_key: str,
+    model: str,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    """Plan then execute an update using OpenAI/GPT."""
+    if log_fn:
+        log_fn("thinking", "Planning changes…")
+    plan = _call_planner(
+        _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
+        backend="gpt", api_key=api_key, model=model,
+    )
+    _log_plan(plan, log_fn)
+    return _openai_loop(api_key, model, _UPDATE_SYSTEM, workspace, _update_user_msg(app_name, template_key, blueprint, prompt, plan), log_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -465,13 +1328,12 @@ def _loop(
     """Agent tool loop. Returns (summary, total_tokens_used)."""
     messages: list[dict[str, Any]] = [{"role": "user", "content": initial_user_msg}]
     total_tokens = 0
+    write_calls = 0
+    pushback_sent = False
 
     for iteration in range(_MAX_ITERATIONS):
         if iteration == _WARN_AT_ITERATION and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
-
-        if log_fn:
-            log_fn("thinking", "Thinking…")
 
         response = client.messages.create(
             model=model,
@@ -486,6 +1348,7 @@ def _loop(
 
         tool_results: list[dict[str, Any]] = []
         last_text = ""
+        done_text: str | None = None
 
         for block in response.content:
             if block.type == "text":
@@ -497,11 +1360,13 @@ def _loop(
                         preview += "…"
                     log_fn("text", preview)
                 if "DONE" in block.text.upper():
-                    if log_fn:
-                        log_fn("done", "Agent finished.")
-                    return block.text, total_tokens
+                    done_text = block.text
 
             elif block.type == "tool_use":
+                if block.name == "write_file":
+                    write_calls += 1
+                    if log_fn:
+                        log_fn("file_written", (block.input or {}).get("path", ""))
                 msg = tool_message(block.name, block.input)
                 logger.debug("Tool %s → %s", block.name, msg)
                 if log_fn:
@@ -511,9 +1376,39 @@ def _loop(
                     {"type": "tool_result", "tool_use_id": block.id, "content": result}
                 )
 
+        # If agent said DONE but hasn't written any files, push back once
+        if done_text is not None and not tool_results:
+            if write_calls == 0 and not pushback_sent:
+                pushback_sent = True
+                if log_fn:
+                    log_fn("info", "Agent said DONE without writing files — asking it to implement…")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You said you were done but you haven't called write_file yet. "
+                        "Please implement the changes now using write_file. "
+                        "Start with list_files('.') to explore the project, then write the code."
+                    ),
+                })
+                continue
+            return done_text, total_tokens
+
         if response.stop_reason == "end_turn":
-            if log_fn:
-                log_fn("done", "Agent finished.")
+            if write_calls == 0 and not pushback_sent:
+                # Agent stopped without writing any files — push back once
+                pushback_sent = True
+                if log_fn:
+                    log_fn("info", "No files written yet — asking agent to write the code…")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You haven't written any files yet. "
+                        "Use the write_file tool to implement the changes now. "
+                        "Start by calling list_files('.') to see the project structure, "
+                        "then read the relevant files and write the implementation."
+                    ),
+                })
+                continue
             return last_text or "Done.", total_tokens
 
         if tool_results:
