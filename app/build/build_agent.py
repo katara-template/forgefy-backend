@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -950,7 +951,8 @@ def _update_user_msg(
         f"User's update request: {prompt}\n\n"
         "Apply this change now. Use list_files('.') to explore the workspace, read the relevant files, "
         "implement every part of the request with write_file, "
-        "then write a user-friendly summary starting with DONE: that describes exactly what was changed."
+        "then write a markdown-formatted summary starting with DONE: that describes exactly what was changed. "
+        "Use **bold** for feature names, bullet lists for multiple changes, and `code` for file paths and package names."
     )
 
 

@@ -190,6 +190,18 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
 
         if pushed:
             log_fn("done", clean_summary or "Your app has been updated successfully!")
+            # Automatically rebuild the preview so users don't have to click manually
+            try:
+                from app.workers.build_worker import build_preview
+                build_preview.apply_async(
+                    args=[project_id, user_id],
+                    queue="build",
+                    countdown=3,  # small delay so the push is visible on GitHub before we clone
+                )
+                log_fn("info", "Preview build queued…")
+                logger.info("Auto-queued preview build project=%s", project_id)
+            except Exception as preview_exc:
+                logger.warning("Could not queue preview build project=%s: %s", project_id, preview_exc)
         else:
             agent_said = f'\n\nAgent response: "{clean_summary}"' if clean_summary else ""
             log_fn(
