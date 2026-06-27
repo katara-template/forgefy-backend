@@ -32,7 +32,7 @@ EXACT FOLDER STRUCTURE — call create_directory for every path below before wri
   lib/core/utils/
   lib/core/theme/
 
-  For EACH feature extracted from the blueprint, create:
+  For EACH feature extracted from the blueprint, create ALL of these:
   lib/features/{feature}/data/datasources/
   lib/features/{feature}/data/models/
   lib/features/{feature}/data/repositories/
@@ -50,59 +50,33 @@ EXACT FOLDER STRUCTURE — call create_directory for every path below before wri
   assets/images/
   assets/videos/   (if video assets are needed)
 
-LAYER RESPONSIBILITIES:
+CANONICAL FILE NAMES — use these exact names, no variations:
 
-  core/error/
-    exceptions.dart  — AppException subclasses (NetworkException, CacheException, etc.)
-    failures.dart    — Failure sealed class / subclasses for Either<Failure, T>
+  lib/core/error/exceptions.dart        — AppException subclasses
+  lib/core/error/failures.dart          — Failure sealed class / subclasses
+  lib/core/network/api_client.dart      — Dio/http base client with interceptors
+  lib/core/network/network_info.dart    — connectivity check
+  lib/core/usecases/usecase.dart        — abstract UseCase<Type, Params> interface
+  lib/core/utils/constants.dart         — API base URL, timeout durations, string keys
+  lib/core/theme/app_theme.dart         — ThemeData (light + dark), palette, typography
 
-  core/network/
-    api_client.dart  — Dio / http base client with interceptors (auth header, logging)
-    network_info.dart — connectivity check (dart:io InternetAddress.lookup)
+  lib/features/{feature}/data/datasources/{feature}_remote_datasource.dart
+  lib/features/{feature}/data/datasources/{feature}_local_datasource.dart
+  lib/features/{feature}/data/models/{entity}_model.dart
+  lib/features/{feature}/data/repositories/{feature}_repository_impl.dart
+  lib/features/{feature}/domain/entities/{entity}.dart
+  lib/features/{feature}/domain/repositories/{feature}_repository.dart
+  lib/features/{feature}/domain/usecases/{action}_usecase.dart
+  lib/features/{feature}/presentation/bloc/{feature}_bloc.dart
+  lib/features/{feature}/presentation/bloc/{feature}_event.dart
+  lib/features/{feature}/presentation/bloc/{feature}_state.dart
+  lib/features/{feature}/presentation/pages/{feature}_page.dart
+  lib/features/{feature}/presentation/widgets/{feature}_form.dart  (or _card, _tile, etc.)
 
-  core/usecases/
-    usecase.dart     — abstract UseCase<Type, Params> interface
-
-  core/utils/
-    constants.dart   — API base URL, timeout durations, shared string keys
-
-  core/theme/
-    app_theme.dart   — ThemeData (light + dark), color palette, typography, spacing
-
-  features/{feature}/data/datasources/
-    {feature}_remote_datasource.dart  — HTTP/Firebase calls, returns Models
-    {feature}_local_datasource.dart   — SharedPreferences / Hive / SQLite caching
-
-  features/{feature}/data/models/
-    {entity}_model.dart  — extends the domain Entity, adds fromJson / toJson
-
-  features/{feature}/data/repositories/
-    {feature}_repository_impl.dart  — implements domain repository, wires remote+local
-
-  features/{feature}/domain/entities/
-    {entity}.dart  — plain Dart class, no framework dependencies
-
-  features/{feature}/domain/repositories/
-    {feature}_repository.dart  — abstract repository interface
-
-  features/{feature}/domain/usecases/
-    {action}_usecase.dart  — single public call() that returns Either<Failure, T>
-
-  features/{feature}/presentation/bloc/
-    {feature}_bloc.dart   — BLoC class
-    {feature}_event.dart  — sealed event classes
-    {feature}_state.dart  — sealed state classes
-
-  features/{feature}/presentation/pages/
-    {feature}_page.dart   — full screen, uses BlocBuilder/BlocConsumer
-
-  features/{feature}/presentation/widgets/
-    {feature}_form.dart, {feature}_card.dart, etc. — stateless/stateful sub-widgets
-
-ROOT FILES:
-  lib/injection_container.dart — GetIt service locator registering all blocs, repos, usecases, datasources
-  lib/app.dart                 — MaterialApp with theme, BlocProviders, named routes
-  lib/main.dart                — runApp, WidgetsFlutterBinding, init injection_container
+ROOT FILES (mandatory — do NOT rename these):
+  lib/injection_container.dart  — GetIt registering all blocs, repos, usecases, datasources
+  lib/app.dart                  — MaterialApp with theme, BlocProviders, named routes
+  lib/main.dart                 — runApp, WidgetsFlutterBinding, init injection_container
 
 pubspec.yaml — add: flutter_bloc, equatable, get_it, dartz, dio, shared_preferences,
                connectivity_plus, and any feature-specific packages (firebase_*, etc.)
@@ -243,35 +217,22 @@ EXACT FOLDER STRUCTURE — call create_directory for every path before writing f
   src/utils/                    — constants, helpers
   assets/images/                — AI-generated assets
 
-LAYER RESPONSIBILITIES:
+CANONICAL FILE NAMES — use these exact names, no variations:
 
-  src/app/store.ts              — configureStore with all slice reducers
-  src/app/rootReducer.ts        — combineReducers
-
-  src/features/{feature}/api/{feature}Api.ts
-    — RTK Query createApi endpoints or plain axios calls
-
-  src/features/{feature}/components/{FeatureName}Form.tsx
-    — reusable feature-specific UI components (no navigation logic)
-
-  src/features/{feature}/screens/{FeatureName}Screen.tsx
-    — full screen component, connects store, uses feature components
-
-  src/features/{feature}/slice/{feature}Slice.ts
-    — createSlice with actions, reducers, selectors
-
-  src/features/{feature}/types/{feature}.types.ts
-    — TypeScript interfaces for this feature's data
-
-  src/features/{feature}/hooks/use{FeatureName}.ts
-    — custom hook encapsulating slice dispatch + selectors
-
-  src/navigation/AppNavigator.tsx   — root Stack/Tab navigator
-  src/services/httpClient.ts        — axios instance with interceptors
-  src/hooks/useAppDispatch.ts       — typed dispatch hook
-  src/styles/tailwind.config.js     — NativeWind / StyleSheet tokens
-  src/utils/constants.ts            — API_URL, storage keys, etc.
-  src/App.tsx                       — Provider + NavigationContainer root
+  src/app/store.ts                                   — configureStore with all slice reducers
+  src/app/rootReducer.ts                             — combineReducers
+  src/features/{feature}/api/{feature}Api.ts         — RTK Query or axios calls
+  src/features/{feature}/components/{Feature}Form.tsx — reusable UI (no navigation logic)
+  src/features/{feature}/screens/{Feature}Screen.tsx  — full screen, connects store
+  src/features/{feature}/slice/{feature}Slice.ts     — createSlice actions/reducers/selectors
+  src/features/{feature}/types/{feature}.types.ts    — TypeScript interfaces for this feature
+  src/features/{feature}/hooks/use{Feature}.ts       — hook encapsulating dispatch + selectors
+  src/navigation/AppNavigator.tsx                    — root Stack/Tab navigator (DO NOT rename)
+  src/services/httpClient.ts                         — axios instance with interceptors
+  src/hooks/useAppDispatch.ts                        — typed dispatch hook
+  src/styles/tailwind.config.js                      — NativeWind / StyleSheet tokens
+  src/utils/constants.ts                             — API_URL, storage keys, etc.
+  src/App.tsx                                        — Provider + NavigationContainer root
 
 BUILD ORDER (strictly follow; skip auth feature steps if auth decision is NO):
   1. src/utils/constants.ts and src/services/httpClient.ts
@@ -292,6 +253,91 @@ _STRUCTURE_MAP = {
     "flutter": _FLUTTER_STRUCTURE,
     "next": _NEXT_STRUCTURE,
     "react_native": _RN_STRUCTURE,
+}
+
+# Compact structure rules injected into update-agent user messages.
+# These are shorter than the full build-agent structures — focused on
+# "where does a new file go?" rather than "how do I scaffold the whole app?"
+_UPDATE_STRUCTURE_RULES: dict[str, str] = {
+    "flutter": """\
+FLUTTER FOLDER STRUCTURE — every file you create MUST follow this layout:
+
+  lib/core/error/exceptions.dart          lib/core/error/failures.dart
+  lib/core/network/api_client.dart        lib/core/network/network_info.dart
+  lib/core/usecases/usecase.dart
+  lib/core/utils/constants.dart
+  lib/core/theme/app_theme.dart
+
+  For each feature → ALL sub-folders are mandatory:
+  lib/features/{feature}/data/datasources/{feature}_remote_datasource.dart
+  lib/features/{feature}/data/datasources/{feature}_local_datasource.dart
+  lib/features/{feature}/data/models/{entity}_model.dart
+  lib/features/{feature}/data/repositories/{feature}_repository_impl.dart
+  lib/features/{feature}/domain/entities/{entity}.dart
+  lib/features/{feature}/domain/repositories/{feature}_repository.dart
+  lib/features/{feature}/domain/usecases/{action}_usecase.dart
+  lib/features/{feature}/presentation/bloc/{feature}_bloc.dart
+  lib/features/{feature}/presentation/bloc/{feature}_event.dart
+  lib/features/{feature}/presentation/bloc/{feature}_state.dart
+  lib/features/{feature}/presentation/pages/{feature}_page.dart
+  lib/features/{feature}/presentation/widgets/{feature}_*.dart
+
+  Root (mandatory, do NOT rename):
+  lib/injection_container.dart   lib/app.dart   lib/main.dart
+
+RULES:
+  • Pages go in presentation/pages/ ONLY. Never at lib/ root or lib/screens/.
+  • Widgets go in presentation/widgets/ ONLY.
+  • Data models go in data/models/ ONLY.
+  • If you add a new feature, create ALL sub-folders listed above.
+  • If you add a new screen, register it in lib/app.dart (GoRouter or named routes).
+""",
+    "react_native": """\
+REACT NATIVE FOLDER STRUCTURE — every file you create MUST follow this layout:
+
+  src/app/store.ts               src/app/rootReducer.ts
+  src/navigation/AppNavigator.tsx   ← only navigator file, do NOT rename
+  src/services/httpClient.ts
+  src/hooks/useAppDispatch.ts
+  src/styles/tailwind.config.js
+  src/utils/constants.ts
+  src/App.tsx                       ← root entry, do NOT rename
+
+  For each feature → ALL sub-folders are mandatory:
+  src/features/{feature}/api/{feature}Api.ts
+  src/features/{feature}/components/{Feature}Form.tsx   (or Card, List, etc.)
+  src/features/{feature}/screens/{Feature}Screen.tsx
+  src/features/{feature}/slice/{feature}Slice.ts
+  src/features/{feature}/types/{feature}.types.ts
+  src/features/{feature}/hooks/use{Feature}.ts
+
+RULES:
+  • Screens go in features/{feature}/screens/ ONLY. Never in src/screens/ or root.
+  • Components go in features/{feature}/components/ ONLY.
+  • Slice files go in features/{feature}/slice/ ONLY.
+  • If you add a new screen, register it in src/navigation/AppNavigator.tsx.
+  • If you add a new slice, add it to src/app/store.ts and rootReducer.ts.
+""",
+    "next": """\
+NEXT.JS FOLDER STRUCTURE — every file you create MUST follow this layout:
+
+  app/api/{feature}/route.ts          — server-side: GET (list) + POST (create)
+  app/api/{feature}/[id]/route.ts     — server-side: GET + PUT + DELETE
+  app/(app)/{feature}/page.tsx        — client page for this feature
+  components/{feature}/               — feature-specific reusable components
+  components/ui/                      — shared primitive components
+  components/layout/                  — Header, Sidebar, Footer, etc.
+  lib/db.ts   lib/auth.ts   lib/validations.ts   lib/api.ts   lib/utils.ts
+  hooks/use{Feature}.ts
+  types/index.ts
+  middleware.ts                        — route protection [auth only]
+
+RULES:
+  • API logic goes in app/api/ ONLY — never in page.tsx files.
+  • New pages go in app/(app)/{feature}/page.tsx.
+  • Add a nav link in components/layout/ when adding a new page.
+  • All shared types in types/index.ts — do not scatter them across files.
+""",
 }
 
 _BUILD_PREAMBLE = """You are the Forgefy Build Agent.
@@ -395,20 +441,43 @@ _UPDATE_SYSTEM = """You are the Forgefy Update Agent. You make precise, targeted
 ══════════════════════════════════════════
 MANDATORY WORKFLOW — follow every time
 ══════════════════════════════════════════
-1. Call list_files('.') to see the full project tree.
-2. Read the navigator / router file so you know existing screens and routes.
-3. Read any file you will modify before writing it.
-4. Implement every part of the request with write_file — one call per file.
-5. After all writes, output a summary starting with DONE:.
+1. Check the RECENT GIT HISTORY and EXISTING PROJECT FILES sections in your task.
+   - Git history shows what was already committed. Do NOT redo that work.
+   - If a previous run hit the iteration limit, read the already-changed files to
+     understand their current state, then continue with the REMAINING work only.
+2. Call list_files('.') to confirm the current workspace structure.
+3. Read the navigator / router file so you know existing screens and routes.
+4. For EVERY file you will write_file to — read it first with read_file.
+   This is mandatory, not optional. Reading first prevents overwriting existing logic.
+5. Implement the remaining (not-yet-done) parts of the request with write_file.
+6. After all writes, output a summary starting with DONE:.
 
 ══════════════════════════════════════════
 CRITICAL RULES
 ══════════════════════════════════════════
+- ALWAYS read a file with read_file before writing it. No exceptions.
+  Writing without reading first will overwrite code that already works.
 - You MUST call write_file at least once. Text descriptions alone fail the task.
 - Never output "." or a single word as your response — always write code.
 - Never say DONE without having written at least one file.
 - If a new screen is added, also update the navigator/router to include it.
 - Narrate briefly before each tool call: "Reading AppNavigator…", "Writing OnboardingPage…"
+- If you see a file in the git history that was already correctly implemented,
+  skip it and move on to what is still missing.
+
+══════════════════════════════════════════
+NO DUPLICATE FILES — CHECK BEFORE CREATING
+══════════════════════════════════════════
+Your task message includes an "EXISTING PROJECT FILES" list.
+BEFORE calling write_file for any file:
+  • Check if a file with the EXACT SAME filename already exists anywhere in that list.
+  • Check if a file with a SIMILAR name doing the SAME THING exists
+    (e.g. auth_service.dart / authentication_service.dart,
+         home_page.dart / home_screen.dart,
+         userApi.ts / user_service.ts / UserRepository.ts).
+  • If either is true → read that existing file first, then write_file to THAT SAME PATH.
+  • Only create a brand-new path if you confirm nothing similar already exists.
+ONE SOURCE OF TRUTH PER CONCEPT. Never create two files that do the same job.
 
 ══════════════════════════════════════════
 DEPENDENCY RULE — CRITICAL FOR BUILDS
@@ -660,6 +729,109 @@ def _call_planner(
         return None
 
 
+_VALIDATOR_SYSTEM = """You are the Forgefy Validation Agent. You run AFTER the executor to verify
+the implementation is complete, correct, and follows the required folder structure.
+
+══════════════════════════════════════════
+MANDATORY WORKFLOW
+══════════════════════════════════════════
+1. Call list_files('.') to see the full current workspace.
+2. Read the execution plan to know what was supposed to be built.
+3. For EVERY file listed in the plan:
+   a. Read the file with read_file.
+   b. Check: Does it exist? Is the implementation complete (no TODO/placeholder/pass)?
+      Are all imports valid and present in pubspec.yaml or package.json?
+      Are all referenced classes/functions/widgets actually defined?
+4. Check integration points:
+   - Flutter: new screens must be registered in lib/app.dart (GoRouter or named routes)
+   - Next.js: new pages must have a link in components/layout/; new packages in package.json
+   - React Native: new screens must be in src/navigation/AppNavigator.tsx
+5. ── STRUCTURE CHECK (see FOLDER STRUCTURE RULES in your task) ──
+   a. For Flutter: verify every new feature has ALL required sub-folders:
+      data/datasources/, data/models/, data/repositories/,
+      domain/entities/, domain/repositories/, domain/usecases/,
+      presentation/bloc/, presentation/pages/, presentation/widgets/
+      And that lib/injection_container.dart, lib/app.dart, lib/main.dart exist.
+   b. For React Native: verify every new feature has ALL required sub-folders:
+      api/, components/, screens/, slice/, types/, hooks/
+      And that src/App.tsx, src/navigation/AppNavigator.tsx exist.
+   c. For Next.js: verify pages are in app/(app)/, API routes in app/api/, shared
+      components in components/ui/ or components/layout/.
+   d. If ANY file is in the WRONG location — move it with write_file to the correct
+      path, then delete the old file with delete_file. Never leave files out of place.
+6. Check for duplicate files (two files doing the same job). If found, merge into
+   the canonical path and delete_file the redundant one.
+7. Fix EVERY problem found. Do not leave broken code or misplaced files.
+8. After all checks and fixes, output a report starting with VALIDATED:
+   Use markdown: list what was checked, what was fixed/moved, and confirm the build should succeed.
+
+══════════════════════════════════════════
+CRITICAL RULES
+══════════════════════════════════════════
+- Be thorough. Check every file in the plan — not just the ones you wrote.
+- Fix silently — do not ask questions, do not leave issues unfixed.
+- Do NOT rewrite working code. Only fix actual problems and misplacements.
+- If everything is correct: output "VALIDATED: All checks passed — no issues found."
+- If you fixed things: output "VALIDATED: Fixed N issue(s) — <brief description>."
+"""
+
+
+def _validator_user_msg(
+    app_name: str,
+    template_key: str,
+    plan: dict[str, Any] | None,
+    prompt: str,
+    workspace: Path | None = None,
+) -> str:
+    framework = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(
+        template_key, template_key
+    )
+    plan_section = (
+        f"Execution plan to validate:\n{json.dumps(plan, indent=2)}"
+        if plan
+        else "No structured plan — validate based on the change request below."
+    )
+    # Only use the core request (strip history preamble if present)
+    core_prompt = prompt.split("\nCURRENT REQUEST\n", 1)[-1].strip() if "\nCURRENT REQUEST\n" in prompt else prompt
+
+    structure_rules = _UPDATE_STRUCTURE_RULES.get(template_key, "")
+    structure_section = (
+        "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "FOLDER STRUCTURE RULES — validate all files are in the right place\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + structure_rules
+        + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ) if structure_rules else ""
+
+    workspace_section = ""
+    if workspace is not None:
+        scan = _scan_workspace(workspace)
+        workspace_section = (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "CURRENT FILE TREE — check structure and duplicates\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "1. Verify every file is in the correct folder per the FOLDER STRUCTURE RULES above.\n"
+            "   If a file is in the wrong place, move it: write_file to correct path, delete_file the old one.\n"
+            "2. Check for two files doing the same job "
+            "(e.g. home_page.dart AND home_screen.dart, userApi.ts AND user_service.ts).\n"
+            "   If duplicates exist, merge into the canonical path and delete_file the redundant one.\n\n"
+            + scan + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
+    return (
+        f"App: {app_name}\nFramework: {framework}\n\n"
+        f"Original change request:\n{core_prompt[:600]}\n\n"
+        f"{plan_section}\n"
+        f"{structure_section}"
+        f"{workspace_section}\n"
+        "Validate that every item in the plan was correctly and completely implemented, "
+        "every file is in the correct folder per the structure rules, "
+        "no duplicates exist, and the code will build without errors. "
+        "Fix anything wrong, then output your validation report starting with VALIDATED:"
+    )
+
+
 def _log_plan(plan: dict[str, Any] | None, log_fn: Callable[[str, str], None] | None) -> None:
     if not log_fn or not plan:
         return
@@ -734,6 +906,7 @@ def _ollama_loop(
     initial_user_msg: str,
     timeout: int = 300,
     log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
     """Ollama tool-use agent loop. Returns (summary, 0) — Ollama doesn't expose token counts."""
     import requests as _req
@@ -760,6 +933,10 @@ def _ollama_loop(
         return anchor + history[-(_HISTORY_PAIRS * 2):]
 
     for iteration in range(_MAX_ITERATIONS):
+        if cancel_fn and cancel_fn():
+            if log_fn:
+                log_fn("warning", "Agent stopped by user.")
+            return "Stopped by user.", 0
         if iteration == _WARN_AT_ITERATION and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
@@ -900,7 +1077,7 @@ def _ollama_loop(
                     log_fn("file_written", tool_input.get("path", ""))
             if log_fn:
                 log_fn("tool", tool_message(tool_name, tool_input))
-            result = execute_tool(tool_name, tool_input, workspace)
+            result = execute_tool(tool_name, tool_input, workspace, log_fn)
             # Truncate large results (e.g. read_file on a big file) so they
             # don't blow up the context window on the next iteration.
             if len(result) > _TOOL_RESULT_LIMIT:
@@ -934,23 +1111,150 @@ def run_build_agent_ollama(
     return _ollama_loop(base_url, model, system, workspace, user_msg, timeout, log_fn)
 
 
+_SCAN_SKIP_DIRS = frozenset({
+    "node_modules", ".next", ".expo", "dist", "build", ".dart_tool",
+    "__pycache__", ".git", ".gradle", ".idea", ".vscode",
+    "android/.gradle", "ios/Pods", ".pub-cache",
+})
+_SCAN_SKIP_EXTS = frozenset({
+    ".lock", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    ".ttf", ".otf", ".woff", ".woff2", ".eot", ".mp4", ".mp3",
+    ".zip", ".tar", ".gz", ".apk", ".aab", ".ipa", ".so", ".dylib",
+})
+
+
+def _get_git_log(workspace: Path, n: int = 10) -> str:
+    """Return the last N git commit messages from the workspace repo.
+
+    This gives the agent ground-truth evidence of what was already implemented
+    in previous runs so it can continue rather than re-do work.
+    """
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ["git", "log", "--oneline", f"-{n}", "--no-color"],
+            cwd=workspace, capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _get_recent_changed_files(workspace: Path, n: int = 3) -> str:
+    """Return the files touched in the last N commits (shows what's already done)."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ["git", "diff", "--name-only", f"HEAD~{n}", "HEAD"],
+            cwd=workspace, capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _scan_workspace(workspace: Path, max_files: int = 300) -> str:
+    """Return a compact file listing of all source files in the workspace.
+
+    Used to inject project structure into the agent's initial message so it
+    can check for existing files before creating new ones.
+    """
+    lines: list[str] = []
+    count = 0
+    try:
+        for p in sorted(workspace.rglob("*")):
+            if count >= max_files:
+                lines.append(f"… (truncated at {max_files} files)")
+                break
+            # Skip hidden dirs and known non-source directories
+            parts = p.parts
+            if any(
+                part.startswith(".") or part in _SCAN_SKIP_DIRS
+                for part in parts[len(workspace.parts):]
+            ):
+                continue
+            if p.is_file() and p.suffix.lower() not in _SCAN_SKIP_EXTS:
+                lines.append(str(p.relative_to(workspace)))
+                count += 1
+    except Exception:
+        pass
+    return "\n".join(lines) if lines else "(empty workspace)"
+
+
 def _update_user_msg(
     app_name: str,
     template_key: str,
     blueprint: dict[str, Any],
     prompt: str,
     plan: dict[str, Any] | None,
+    workspace: Path | None = None,
 ) -> str:
     framework = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(template_key, template_key)
     prefix = _plan_prefix(plan) if plan else ""
+
+    # Inject the canonical folder structure so the agent puts files in the right place
+    structure_rules = _UPDATE_STRUCTURE_RULES.get(template_key, "")
+    structure_section = (
+        "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "MANDATORY FOLDER STRUCTURE — all new files must follow this\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + structure_rules
+        + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ) if structure_rules else ""
+
+    file_listing = ""
+    if workspace is not None:
+        scan = _scan_workspace(workspace)
+        git_log = _get_git_log(workspace)
+        recent_files = _get_recent_changed_files(workspace)
+
+        git_section = ""
+        if git_log:
+            git_section = (
+                "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "RECENT GIT HISTORY — what has already been committed\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "These commits are ALREADY in the repo. Do NOT re-implement work that is done.\n"
+                "If the previous run hit an iteration limit, READ these files to understand\n"
+                "the current state, then continue from where the work stopped.\n\n"
+                + git_log + "\n"
+            )
+            if recent_files:
+                git_section += f"\nFiles changed in recent commits:\n{recent_files}\n"
+            git_section += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+
+        file_listing = (
+            git_section
+            + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "EXISTING PROJECT FILES — read before creating anything\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Before calling write_file for any new file:\n"
+            "  1. Search this list for any file with the SAME NAME.\n"
+            "  2. Search for any file that serves the SAME PURPOSE\n"
+            "     (e.g. auth_service.dart ≈ authentication_service.dart,\n"
+            "      home_screen.dart ≈ home_page.dart, userApi.ts ≈ user_service.ts).\n"
+            "  3. If found → read it first, then WRITE YOUR CHANGES TO THAT EXISTING PATH.\n"
+            "  4. Only create a brand-new path if you confirm nothing similar already exists.\n"
+            "  NEVER create a second file that does the same job as an existing one.\n\n"
+            + scan + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
     return (
         f"{prefix}"
         f"App name: {app_name}\n"
         f"Framework: {framework}\n"
-        f"Existing blueprint context:\n{json.dumps(blueprint, indent=2)}\n\n"
+        f"Existing blueprint context:\n{json.dumps(blueprint, indent=2)}\n"
+        f"{structure_section}"
+        f"{file_listing}\n"
         f"User's update request: {prompt}\n\n"
         "Apply this change now. Use list_files('.') to explore the workspace, read the relevant files, "
-        "implement every part of the request with write_file, "
+        "implement every part of the request with write_file — placing every file in the correct "
+        "folder per the MANDATORY FOLDER STRUCTURE above, "
         "then write a markdown-formatted summary starting with DONE: that describes exactly what was changed. "
         "Use **bold** for feature names, bullet lists for multiple changes, and `code` for file paths and package names."
     )
@@ -965,8 +1269,9 @@ def run_update_agent(
     api_key: str,
     model: str,
     log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
-    """Plan then execute an update using Claude/Anthropic."""
+    """Plan → execute → validate using Claude/Anthropic."""
     if log_fn:
         log_fn("thinking", "Planning changes…")
     plan = _call_planner(
@@ -975,7 +1280,20 @@ def run_update_agent(
     )
     _log_plan(plan, log_fn)
     client = anthropic.Anthropic(api_key=api_key)
-    return _loop(client, model, _UPDATE_SYSTEM, workspace, _update_user_msg(app_name, template_key, blueprint, prompt, plan), log_fn)
+    exec_summary, exec_tokens = _loop(
+        client, model, _UPDATE_SYSTEM, workspace,
+        _update_user_msg(app_name, template_key, blueprint, prompt, plan, workspace), log_fn, cancel_fn,
+    )
+    if cancel_fn and cancel_fn():
+        return exec_summary or "Stopped by user.", exec_tokens
+    if log_fn:
+        log_fn("info", "━━━ Validation phase ━━━")
+        log_fn("thinking", "Validating implementation…")
+    val_summary, val_tokens = _loop(
+        client, model, _VALIDATOR_SYSTEM, workspace,
+        _validator_user_msg(app_name, template_key, plan, prompt, workspace), log_fn, cancel_fn,
+    )
+    return val_summary or exec_summary, exec_tokens + val_tokens
 
 
 def run_update_agent_ollama(
@@ -988,8 +1306,9 @@ def run_update_agent_ollama(
     model: str,
     timeout: int = 300,
     log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
-    """Plan then execute an update using Ollama/Qwen3."""
+    """Plan → execute → validate using Ollama/Qwen3."""
     if log_fn:
         log_fn("thinking", "Planning changes…")
     plan = _call_planner(
@@ -997,7 +1316,20 @@ def run_update_agent_ollama(
         backend="Qwen3", base_url=base_url, ollama_model=model, ollama_timeout=timeout,
     )
     _log_plan(plan, log_fn)
-    return _ollama_loop(base_url, model, _UPDATE_SYSTEM, workspace, _update_user_msg(app_name, template_key, blueprint, prompt, plan), timeout, log_fn)
+    exec_summary, exec_tokens = _ollama_loop(
+        base_url, model, _UPDATE_SYSTEM, workspace,
+        _update_user_msg(app_name, template_key, blueprint, prompt, plan, workspace), timeout, log_fn, cancel_fn,
+    )
+    if cancel_fn and cancel_fn():
+        return exec_summary or "Stopped by user.", exec_tokens
+    if log_fn:
+        log_fn("info", "━━━ Validation phase ━━━")
+        log_fn("thinking", "Validating implementation…")
+    val_summary, val_tokens = _ollama_loop(
+        base_url, model, _VALIDATOR_SYSTEM, workspace,
+        _validator_user_msg(app_name, template_key, plan, prompt, workspace), timeout, log_fn, cancel_fn,
+    )
+    return val_summary or exec_summary, exec_tokens + val_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -1026,6 +1358,7 @@ def _gemini_loop(
     workspace: Path,
     initial_user_msg: str,
     log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
     """Gemini tool-use agent loop via REST API. Returns (summary, 0)."""
     import requests as _req
@@ -1038,6 +1371,10 @@ def _gemini_loop(
     pushback_sent = False
 
     for iteration in range(_MAX_ITERATIONS):
+        if cancel_fn and cancel_fn():
+            if log_fn:
+                log_fn("warning", "Agent stopped by user.")
+            return "Stopped by user.", 0
         if iteration == _WARN_AT_ITERATION and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
@@ -1114,7 +1451,7 @@ def _gemini_loop(
                     log_fn("file_written", tool_input.get("path", ""))
             if log_fn:
                 log_fn("tool", tool_message(tool_name, tool_input))
-            result = execute_tool(tool_name, tool_input, workspace)
+            result = execute_tool(tool_name, tool_input, workspace, log_fn)
             if len(result) > _TOOL_RESULT_LIMIT:
                 result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
             tool_responses.append({"functionResponse": {"name": tool_name, "response": {"output": result}}})
@@ -1155,6 +1492,7 @@ def run_update_agent_gemini(
     api_key: str,
     model: str,
     log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
     """Plan then execute an update using Gemini."""
     if log_fn:
@@ -1164,7 +1502,20 @@ def run_update_agent_gemini(
         backend="gemini", api_key=api_key, model=model,
     )
     _log_plan(plan, log_fn)
-    return _gemini_loop(api_key, model, _UPDATE_SYSTEM, workspace, _update_user_msg(app_name, template_key, blueprint, prompt, plan), log_fn)
+    exec_summary, exec_tokens = _gemini_loop(
+        api_key, model, _UPDATE_SYSTEM, workspace,
+        _update_user_msg(app_name, template_key, blueprint, prompt, plan, workspace), log_fn, cancel_fn,
+    )
+    if cancel_fn and cancel_fn():
+        return exec_summary or "Stopped by user.", exec_tokens
+    if log_fn:
+        log_fn("info", "━━━ Validation phase ━━━")
+        log_fn("thinking", "Validating implementation…")
+    val_summary, val_tokens = _gemini_loop(
+        api_key, model, _VALIDATOR_SYSTEM, workspace,
+        _validator_user_msg(app_name, template_key, plan, prompt, workspace), log_fn, cancel_fn,
+    )
+    return val_summary or exec_summary, exec_tokens + val_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -1178,6 +1529,7 @@ def _openai_loop(
     workspace: Path,
     initial_user_msg: str,
     log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
     """OpenAI tool-use agent loop. Returns (summary, total_tokens)."""
     from openai import OpenAI
@@ -1194,6 +1546,10 @@ def _openai_loop(
     total_tokens = 0
 
     for iteration in range(_MAX_ITERATIONS):
+        if cancel_fn and cancel_fn():
+            if log_fn:
+                log_fn("warning", "Agent stopped by user.")
+            return "Stopped by user.", 0
         if iteration == _WARN_AT_ITERATION and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
@@ -1265,7 +1621,7 @@ def _openai_loop(
                     log_fn("file_written", tool_input.get("path", ""))
             if log_fn:
                 log_fn("tool", tool_message(tool_name, tool_input))
-            result = execute_tool(tool_name, tool_input, workspace)
+            result = execute_tool(tool_name, tool_input, workspace, log_fn)
             if len(result) > _TOOL_RESULT_LIMIT:
                 result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
@@ -1303,6 +1659,7 @@ def run_update_agent_openai(
     api_key: str,
     model: str,
     log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
     """Plan then execute an update using OpenAI/GPT."""
     if log_fn:
@@ -1312,7 +1669,20 @@ def run_update_agent_openai(
         backend="gpt", api_key=api_key, model=model,
     )
     _log_plan(plan, log_fn)
-    return _openai_loop(api_key, model, _UPDATE_SYSTEM, workspace, _update_user_msg(app_name, template_key, blueprint, prompt, plan), log_fn)
+    exec_summary, exec_tokens = _openai_loop(
+        api_key, model, _UPDATE_SYSTEM, workspace,
+        _update_user_msg(app_name, template_key, blueprint, prompt, plan, workspace), log_fn, cancel_fn,
+    )
+    if cancel_fn and cancel_fn():
+        return exec_summary or "Stopped by user.", exec_tokens
+    if log_fn:
+        log_fn("info", "━━━ Validation phase ━━━")
+        log_fn("thinking", "Validating implementation…")
+    val_summary, val_tokens = _openai_loop(
+        api_key, model, _VALIDATOR_SYSTEM, workspace,
+        _validator_user_msg(app_name, template_key, plan, prompt, workspace), log_fn, cancel_fn,
+    )
+    return val_summary or exec_summary, exec_tokens + val_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -1326,6 +1696,7 @@ def _loop(
     workspace: Path,
     initial_user_msg: str,
     log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
     """Agent tool loop. Returns (summary, total_tokens_used)."""
     messages: list[dict[str, Any]] = [{"role": "user", "content": initial_user_msg}]
@@ -1334,6 +1705,10 @@ def _loop(
     pushback_sent = False
 
     for iteration in range(_MAX_ITERATIONS):
+        if cancel_fn and cancel_fn():
+            if log_fn:
+                log_fn("warning", "Agent stopped by user.")
+            return "Stopped by user.", 0
         if iteration == _WARN_AT_ITERATION and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
@@ -1373,7 +1748,7 @@ def _loop(
                 logger.debug("Tool %s → %s", block.name, msg)
                 if log_fn:
                     log_fn("tool", msg)
-                result = execute_tool(block.name, block.input, workspace)
+                result = execute_tool(block.name, block.input, workspace, log_fn)
                 tool_results.append(
                     {"type": "tool_result", "tool_use_id": block.id, "content": result}
                 )

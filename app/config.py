@@ -43,8 +43,8 @@ class Settings(BaseSettings):
 
     # Blueprint generation backend (extraction + synthesis): "claude" | "gemini" | "Qwen3"
     BP_MODEL: str = "claude"
-    # App build backend (code generation): "claude" | "gemini" | "Qwen3"
-    BUILD_MODEL: str = "claude"
+    # App build backend (code generation): "claude" | "gemini" | "Qwen3" | "gpt"
+    BUILD_MODEL: str = "gemini"
 
     # Embeddings
     EMBEDDING_MODEL: str = "text-embedding-3-small"

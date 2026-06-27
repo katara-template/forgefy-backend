@@ -22,7 +22,9 @@ def _run(args: list[str], cwd: Path | None = None, timeout: int = 600) -> str:
         args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env
     )
     if result.returncode != 0:
-        raise RuntimeError(f"{' '.join(args)} failed:\n{result.stderr.strip()}")
+        # Combine stdout + stderr: Flutter/Gradle print the Dart error on stdout
+        combined = (result.stdout + "\n" + result.stderr).strip()
+        raise RuntimeError(f"{' '.join(args)} failed:\n{combined}")
     return result.stdout
 
 

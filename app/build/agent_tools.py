@@ -169,7 +169,41 @@ def _ensure_extension(filename: str, default_ext: str) -> str:
     return filename if "." in filename else f"{filename}{default_ext}"
 
 
-def _generate_image(prompt: str, filename: str, workspace: Path) -> str:
+def _placeholder_png() -> bytes:
+    """Return a minimal valid 1×1 transparent PNG (no external deps)."""
+    import struct, zlib
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    signature = b"\x89PNG\r\n\x1a\n"
+    ihdr = chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+    idat = chunk(b"IDAT", zlib.compress(b"\x00\xcc\xcc\xcc"))  # grey pixel
+    iend = chunk(b"IEND", b"")
+    return signature + ihdr + idat + iend
+
+
+def _save_placeholder(asset_dir: Path, filename: str, media_type: str) -> str:
+    """Save a placeholder asset so code references compile even when generation fails."""
+    out_path = asset_dir / filename
+    if media_type == "image":
+        out_path.write_bytes(_placeholder_png())
+    else:
+        out_path.write_bytes(b"")  # empty mp4 placeholder — won't play but won't break build
+    return str(out_path.relative_to(asset_dir.parent.parent) if asset_dir.parent.parent.exists() else out_path)
+
+
+def _generate_image(
+    prompt: str,
+    filename: str,
+    workspace: Path,
+    log_fn=None,
+) -> str:
+    asset_dir = _detect_asset_dir(workspace, "image")
+    filename = _ensure_extension(filename, ".png")
+    out_path = asset_dir / filename
+    is_flutter = (workspace / "pubspec.yaml").exists()
+    flutter_note = " — declare 'assets/images/' under flutter > assets in pubspec.yaml" if is_flutter else ""
+
     try:
         import fal_client
         import httpx
@@ -177,7 +211,12 @@ def _generate_image(prompt: str, filename: str, workspace: Path) -> str:
 
         settings = get_settings()
         if not settings.FAL_API_KEY:
-            return "ERROR: FAL_API_KEY not configured — skipping image generation"
+            msg = "Image generation skipped — FAL_API_KEY not configured. A placeholder was saved instead."
+            if log_fn:
+                log_fn("warning", msg)
+            out_path.write_bytes(_placeholder_png())
+            rel = out_path.relative_to(workspace)
+            return f"PLACEHOLDER: {rel} (no FAL key){flutter_note}. Reference this path in code — replace with real asset later."
 
         os.environ["FAL_KEY"] = settings.FAL_API_KEY
 
@@ -192,24 +231,47 @@ def _generate_image(prompt: str, filename: str, workspace: Path) -> str:
         )
         image_url: str = result["images"][0]["url"]
 
-        asset_dir = _detect_asset_dir(workspace, "image")
-        filename = _ensure_extension(filename, ".png")
-        out_path = asset_dir / filename
-
         resp = httpx.get(image_url, timeout=60, follow_redirects=True)
         resp.raise_for_status()
         out_path.write_bytes(resp.content)
 
         rel = out_path.relative_to(workspace)
-        is_flutter = (workspace / "pubspec.yaml").exists()
-        flutter_note = " — remember to declare 'assets/images/' under flutter > assets in pubspec.yaml" if is_flutter else ""
         return f"OK: image saved to {rel}{flutter_note}"
 
     except Exception as exc:
-        return f"ERROR: image generation failed: {exc}"
+        raw = str(exc)
+        # Detect billing / balance issues and surface them clearly
+        if "exhausted balance" in raw.lower() or "locked" in raw.lower() or "billing" in raw.lower():
+            user_msg = "Image generation unavailable — fal.ai account balance is exhausted. Top up at fal.ai/dashboard/billing."
+        elif "unauthorized" in raw.lower() or "invalid" in raw.lower():
+            user_msg = "Image generation unavailable — FAL_API_KEY is invalid. Check your .env file."
+        else:
+            user_msg = f"Image generation failed — saving placeholder instead. ({raw[:120]})"
+
+        if log_fn:
+            log_fn("warning", user_msg)
+
+        # Always write a placeholder so asset references in code don't break the build
+        try:
+            out_path.write_bytes(_placeholder_png())
+            rel = out_path.relative_to(workspace)
+            return f"PLACEHOLDER: {rel} ({user_msg}){flutter_note}. Use this path in code — the image will be grey until generation works."
+        except Exception:
+            return f"ERROR: {user_msg}"
 
 
-def _generate_video(prompt: str, filename: str, workspace: Path) -> str:
+def _generate_video(
+    prompt: str,
+    filename: str,
+    workspace: Path,
+    log_fn=None,
+) -> str:
+    asset_dir = _detect_asset_dir(workspace, "video")
+    filename = _ensure_extension(filename, ".mp4")
+    out_path = asset_dir / filename
+    is_flutter = (workspace / "pubspec.yaml").exists()
+    flutter_note = " — declare 'assets/videos/' under flutter > assets in pubspec.yaml" if is_flutter else ""
+
     try:
         import fal_client
         import httpx
@@ -217,7 +279,12 @@ def _generate_video(prompt: str, filename: str, workspace: Path) -> str:
 
         settings = get_settings()
         if not settings.FAL_API_KEY:
-            return "ERROR: FAL_API_KEY not configured — skipping video generation"
+            msg = "Video generation skipped — FAL_API_KEY not configured. A placeholder was saved."
+            if log_fn:
+                log_fn("warning", msg)
+            out_path.write_bytes(b"")
+            rel = out_path.relative_to(workspace)
+            return f"PLACEHOLDER: {rel} (no FAL key){flutter_note}. Reference this path in code."
 
         os.environ["FAL_KEY"] = settings.FAL_API_KEY
 
@@ -231,24 +298,39 @@ def _generate_video(prompt: str, filename: str, workspace: Path) -> str:
         )
         video_url: str = result["video"]["url"]
 
-        asset_dir = _detect_asset_dir(workspace, "video")
-        filename = _ensure_extension(filename, ".mp4")
-        out_path = asset_dir / filename
-
         resp = httpx.get(video_url, timeout=300, follow_redirects=True)
         resp.raise_for_status()
         out_path.write_bytes(resp.content)
 
         rel = out_path.relative_to(workspace)
-        is_flutter = (workspace / "pubspec.yaml").exists()
-        flutter_note = " — remember to declare 'assets/videos/' under flutter > assets in pubspec.yaml" if is_flutter else ""
         return f"OK: video saved to {rel}{flutter_note}"
 
     except Exception as exc:
-        return f"ERROR: video generation failed: {exc}"
+        raw = str(exc)
+        if "exhausted balance" in raw.lower() or "locked" in raw.lower() or "billing" in raw.lower():
+            user_msg = "Video generation unavailable — fal.ai account balance is exhausted. Top up at fal.ai/dashboard/billing."
+        elif "unauthorized" in raw.lower() or "invalid" in raw.lower():
+            user_msg = "Video generation unavailable — FAL_API_KEY is invalid."
+        else:
+            user_msg = f"Video generation failed — saving placeholder instead. ({raw[:120]})"
+
+        if log_fn:
+            log_fn("warning", user_msg)
+
+        try:
+            out_path.write_bytes(b"")
+            rel = out_path.relative_to(workspace)
+            return f"PLACEHOLDER: {rel} ({user_msg}){flutter_note}. Use this path in code."
+        except Exception:
+            return f"ERROR: {user_msg}"
 
 
-def execute_tool(name: str, inputs: dict[str, Any], workspace: Path) -> str:
+def execute_tool(
+    name: str,
+    inputs: dict[str, Any],
+    workspace: Path,
+    log_fn=None,
+) -> str:
     """Dispatch a tool call and return the result as a string."""
     match name:
         case "read_file":
@@ -301,10 +383,10 @@ def execute_tool(name: str, inputs: dict[str, Any], workspace: Path) -> str:
             return f"OK: moved {inputs['source']} → {inputs['destination']}"
 
         case "generate_image":
-            return _generate_image(inputs["prompt"], inputs["filename"], workspace)
+            return _generate_image(inputs["prompt"], inputs["filename"], workspace, log_fn)
 
         case "generate_video":
-            return _generate_video(inputs["prompt"], inputs["filename"], workspace)
+            return _generate_video(inputs["prompt"], inputs["filename"], workspace, log_fn)
 
         case _:
             return f"ERROR: unknown tool {name!r}"
