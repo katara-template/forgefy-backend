@@ -17,20 +17,39 @@ logger = logging.getLogger(__name__)
 _TEMPLATE_KEYS = frozenset({"flutter", "react_native", "next"})
 
 
+class _BuildFixExhausted(RuntimeError):
+    """Raised when the auto-fix loop gives up — lets outer handlers show the right message."""
+
+
 # ---------------------------------------------------------------------------
 # Auto-fix helpers
 # ---------------------------------------------------------------------------
 
+def _extract_dart_errors(error_msg: str) -> str:
+    """Pull out just the Dart compiler error lines from a Flutter/Gradle build log."""
+    import re as _re
+    # Dart errors look like: lib/foo/bar.dart:12:5: Error: ...
+    dart_lines = _re.findall(r"(?:lib|test)/[^\n]+\.dart:\d+:\d+:[^\n]+", error_msg)
+    if dart_lines:
+        return "\n".join(dict.fromkeys(dart_lines))  # deduplicate, preserve order
+    # fallback: last 3000 chars of combined output (stdout+stderr both captured now)
+    return error_msg[-3000:].strip()
+
+
 def _make_fix_prompt(error_msg: str, template_key: str) -> str:
     """Turn a raw compilation error into a precise agent fix prompt."""
-    # Take the tail — compile errors accumulate at the end of the output
-    snippet = error_msg[-2000:].strip() if len(error_msg) > 2000 else error_msg.strip()
-
     framework = {
         "flutter": "Flutter/Dart",
         "next": "Next.js/TypeScript",
         "react_native": "React Native/TypeScript",
     }.get(template_key, template_key)
+
+    if template_key == "flutter":
+        # Extract the precise Dart error lines so the agent knows exactly which files to fix
+        dart_errors = _extract_dart_errors(error_msg)
+        snippet = dart_errors + "\n\n--- full tail ---\n" + error_msg[-1500:].strip()
+    else:
+        snippet = error_msg[-3000:].strip()
 
     hints = {
         "flutter": (
@@ -38,12 +57,15 @@ def _make_fix_prompt(error_msg: str, template_key: str) -> str:
             "• Colors.blue, NOT Color.blue\n"
             "• Add missing 'const' where required by the compiler\n"
             "• Fix null-safety issues (add ?, ! or explicit null checks)\n"
-            "• Verify package names in pubspec.yaml match the imports"
+            "• Verify package names in pubspec.yaml match the imports\n"
+            "• Undefined class/method → check import statements and pubspec.yaml\n"
+            "• 'Target kernel_snapshot_program failed' → Dart type/syntax error in the listed file"
         ),
         "next": (
             "• Add 'use client' for components that use hooks or browser APIs\n"
             "• Fix @/ import aliases (must match tsconfig paths)\n"
-            "• Resolve TypeScript type mismatches and missing generics"
+            "• Resolve TypeScript type mismatches and missing generics\n"
+            "• Missing packages → add to package.json dependencies"
         ),
         "react_native": (
             "• Fix incorrect import paths\n"
@@ -53,19 +75,34 @@ def _make_fix_prompt(error_msg: str, template_key: str) -> str:
     }.get(template_key, "• Fix all compilation errors listed above")
 
     return f"""The {framework} app failed to compile. Diagnose and fix ALL errors so the build succeeds.
-
 COMPILATION ERROR OUTPUT:
 {snippet}
 
 INSTRUCTIONS:
 1. Call list_files('.') to understand the project structure.
-2. Read every file mentioned in the error output above.
+2. Read EVERY file mentioned in the error output above (the exact file:line references).
 3. Fix the exact errors — wrong API names, missing imports, type mismatches, undefined identifiers.
-4. Only modify existing files. Do NOT add new packages or dependencies.
+4. Only modify existing files. Do NOT add new packages or change pubspec.yaml unless a package is clearly missing.
 5. After fixing everything output: DONE: <brief summary of fixes>
 
 COMMON {framework.upper()} MISTAKES TO CHECK:
 {hints}"""
+
+
+def _make_fix_prompt_with_hint(error_msg: str, template_key: str, retry_hint: bool = False) -> str:
+    """Like _make_fix_prompt but prepends a stronger warning when the same error repeats."""
+    base = _make_fix_prompt(error_msg, template_key)
+    if not retry_hint:
+        return base
+    warning = (
+        "⚠️  PREVIOUS FIX DID NOT WORK — the EXACT SAME error is still occurring after your last attempt.\n"
+        "You MUST try a completely different approach:\n"
+        "  • Read MORE surrounding files to find the real root cause\n"
+        "  • Check that the file you edited actually exists at the path you used\n"
+        "  • Look for the error upstream — it may originate in a file you haven't read yet\n"
+        "  • Verify all imports resolve to real files in the workspace\n\n"
+    )
+    return warning + base
 
 
 def _run_agent_fix(
@@ -76,9 +113,10 @@ def _run_agent_fix(
     blueprint: dict,
     settings,
     log_fn,
+    retry_hint: bool = False,
 ) -> None:
     """Run the update agent to fix compilation errors (synchronous, safe for Celery)."""
-    fix_prompt = _make_fix_prompt(error_msg, template_key)
+    fix_prompt = _make_fix_prompt_with_hint(error_msg, template_key, retry_hint)
 
     if settings.BUILD_MODEL == "Qwen3":
         from app.build.build_agent import run_update_agent_ollama
@@ -551,20 +589,41 @@ async def _run(session_id: str, project_id: str) -> dict:
 
             log_fn("info", f"Compiling {stack_label} project (this may take a few minutes)…")
             artifact_path = None
-            for _fix_attempt in range(2):
+            _fix_attempt = 0
+            _prev_err: str | None = None
+            _same_err_streak = 0
+            _MAX_FIX = 10
+            _MAX_SAME_STREAK = 3  # only give up if identical error 3 times in a row
+            from app.build.cancel import is_cancelled, clear_cancel
+            while True:
+                if is_cancelled(settings.REDIS_URL, session_id):
+                    clear_cancel(settings.REDIS_URL, session_id)
+                    log_fn("warning", "Build stopped by user.")
+                    return {}
                 try:
                     artifact_path = workspace.build_artifacts()
-                    break
+                    break  # compiled clean
                 except Exception as _compile_exc:
-                    if _fix_attempt >= 1:
-                        raise
                     _err = str(_compile_exc)
-                    log_fn("warning", "Compilation failed — running auto-fix agent…")
-                    logger.warning("Auto-fix triggered session=%s attempt=%d: %s", session_id, _fix_attempt, _err[:200])
-                    _run_agent_fix(workspace.path, _err, template_key, app_name, json_output, settings, log_fn)
+                    _fix_attempt += 1
+                    if _fix_attempt > _MAX_FIX:
+                        log_fn("warning", f"Build could not be fixed after {_MAX_FIX} attempts. Try sending a chat message describing what to fix.")
+                        raise _BuildFixExhausted(f"Auto-fix exhausted after {_MAX_FIX} attempts") from _compile_exc
+                    if _err == _prev_err:
+                        _same_err_streak += 1
+                    else:
+                        _same_err_streak = 0
+                    _prev_err = _err
+                    if _same_err_streak >= _MAX_SAME_STREAK:
+                        log_fn("warning", "The same error persisted after several fix attempts. Try sending a chat message to fix it manually.")
+                        raise _BuildFixExhausted(f"Auto-fix stalled — same error after {_same_err_streak} consecutive attempts") from _compile_exc
+                    retry_context = " (same error — trying a different approach)" if _same_err_streak > 0 else ""
+                    log_fn("info", f"Compilation failed — running auto-fix (attempt {_fix_attempt}){retry_context}…")
+                    logger.warning("Auto-fix triggered session=%s attempt=%d streak=%d: %s", session_id, _fix_attempt, _same_err_streak, _err[:200])
+                    _run_agent_fix(workspace.path, _err, template_key, app_name, json_output, settings, log_fn, retry_hint=_same_err_streak > 0)
                     workspace.commit_all("fix: auto-fix compilation errors")
                     workspace.push(push_url)
-                    log_fn("info", "Fixes applied and pushed — retrying compilation…")
+                    log_fn("info", "Fixes applied — retrying compilation…")
 
             if artifact_path:
                 log_fn("info", "Compilation successful — deploying preview…")
@@ -631,6 +690,31 @@ async def _run(session_id: str, project_id: str) -> dict:
             "artifact_url": artifact_url,
             "build_summary": summary,
         }
+
+    except _BuildFixExhausted as exc:
+        # Auto-fix ran out of attempts — code is on GitHub but wouldn't compile.
+        # Do NOT say "the agent will attempt to fix" — it already tried and stopped.
+        user_msg = (
+            "The preview couldn't be compiled automatically. "
+            "Your code is saved on GitHub — send a chat message like "
+            "'Fix the build errors' and the agent will try again."
+        )
+        logger.error("Build auto-fix exhausted session=%s: %s", session_id, exc)
+        await _patch_blueprint(blueprint_id, {"build_status": "FAILED", "build_error": user_msg})
+        now = datetime.now(timezone.utc)
+        proj_err: dict = {
+            "is_updating": False,
+            "build_error": user_msg,
+            "build_error_action": "user_fix",
+            "updated_at": now,
+        }
+        if repo_url:
+            proj_err["github_url"] = repo_url
+            proj_err["repo_full_name"] = repo_full_name
+            proj_err["repo_owner"] = "platform" if using_platform_github else "user"
+        await db.collection("projects").document(project_id).update(proj_err)
+        log_fn("warning", user_msg)
+        return {}
 
     except Exception as exc:
         from app.core.build_errors import sanitize_build_error
@@ -715,22 +799,43 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
 
         artifact_path = None
         blueprint = project_data.get("blueprint_context") or {}
-        for _fix_attempt in range(2):
+        _fix_attempt = 0
+        _prev_err: str | None = None
+        _same_err_streak = 0
+        _MAX_FIX = 10
+        _MAX_SAME_STREAK = 3
+        from app.build.cancel import is_cancelled, clear_cancel
+        while True:
+            if is_cancelled(settings.REDIS_URL, project_id):
+                clear_cancel(settings.REDIS_URL, project_id)
+                log_fn("warning", "Build stopped by user.")
+                return {}
             try:
                 artifact_path = workspace.build_artifacts(template_key)
-                break
+                break  # compiled clean
             except Exception as _compile_exc:
-                if _fix_attempt >= 1:
-                    raise
                 _err = str(_compile_exc)
-                log_fn("warning", "Compilation failed — running auto-fix agent…")
-                logger.warning("Auto-fix triggered project=%s attempt=%d: %s", project_id, _fix_attempt, _err[:200])
-                _run_agent_fix(workspace.path, _err, template_key, app_name, blueprint, settings, log_fn)
+                _fix_attempt += 1
+                if _fix_attempt > _MAX_FIX:
+                    log_fn("warning", f"Build could not be fixed after {_MAX_FIX} attempts. Try sending a chat message describing what to fix.")
+                    raise _BuildFixExhausted(f"Auto-fix exhausted after {_MAX_FIX} attempts") from _compile_exc
+                if _err == _prev_err:
+                    _same_err_streak += 1
+                else:
+                    _same_err_streak = 0
+                _prev_err = _err
+                if _same_err_streak >= _MAX_SAME_STREAK:
+                    log_fn("warning", "The same error persisted after several fix attempts. Try sending a chat message to fix it manually.")
+                    raise _BuildFixExhausted(f"Auto-fix stalled — same error after {_same_err_streak} consecutive attempts") from _compile_exc
+                retry_context = " (same error — trying a different approach)" if _same_err_streak > 0 else ""
+                log_fn("info", f"Compilation failed — running auto-fix (attempt {_fix_attempt}){retry_context}…")
+                logger.warning("Auto-fix triggered project=%s attempt=%d streak=%d: %s", project_id, _fix_attempt, _same_err_streak, _err[:200])
+                _run_agent_fix(workspace.path, _err, template_key, app_name, blueprint, settings, log_fn, retry_hint=_same_err_streak > 0)
                 workspace.sync_to_github(
                     commit_message="fix: auto-fix compilation errors",
                     push_url=push_url,
                 )
-                log_fn("info", "Fixes applied and pushed — retrying compilation…")
+                log_fn("info", "Fixes applied — retrying compilation…")
 
         preview_url: str | None = None
         artifact_url: str | None = None
@@ -763,15 +868,30 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         await db.collection("projects").document(project_id).update(updates)
         return {"preview_url": preview_url, "artifact_url": artifact_url}
 
-    except Exception as exc:
-        error_detail = str(exc)
-        snippet = error_detail[-800:].strip() if len(error_detail) > 800 else error_detail.strip()
-        log_fn("error", f"Preview build failed:\n{snippet}")
-        logger.error("Preview build FAILED project=%s: %s", project_id, exc, exc_info=True)
+    except _BuildFixExhausted as exc:
+        user_msg = (
+            "The preview couldn't be compiled automatically. "
+            "Send a chat message like 'Fix the build errors' and the agent will try again."
+        )
+        logger.error("Preview auto-fix exhausted project=%s: %s", project_id, exc)
+        log_fn("warning", user_msg)
         await db.collection("projects").document(project_id).update({
             "is_updating": False,
-            "build_error": snippet[:500],
-            "build_error_action": "retry",
+            "build_error": user_msg,
+            "build_error_action": "user_fix",
+            "updated_at": datetime.now(timezone.utc),
+        })
+        return {}
+
+    except Exception as exc:
+        from app.core.build_errors import sanitize_build_error
+        build_err = sanitize_build_error(exc)
+        logger.error("Preview build FAILED project=%s: %s", project_id, exc, exc_info=True)
+        log_fn("error", f"Preview build failed: {build_err.message}")
+        await db.collection("projects").document(project_id).update({
+            "is_updating": False,
+            "build_error": build_err.message,
+            "build_error_action": build_err.action,
             "updated_at": datetime.now(timezone.utc),
         })
         raise

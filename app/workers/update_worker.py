@@ -36,8 +36,10 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
     from app.build.build_agent import run_update_agent
     from app.db.firebase import refresh_async_firestore_client
     from app.core.usage import get_user_tier, is_over_limit, record_usage
+    from app.build.cancel import is_cancelled, clear_cancel
 
     settings = get_settings()
+    cancel_fn = lambda: is_cancelled(settings.REDIS_URL, project_id)
     db = refresh_async_firestore_client()  # bind fresh gRPC channel to this event loop
 
     project = await _load_project(project_id)
@@ -131,6 +133,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
                 model=settings.OLLAMA_MODEL,
                 timeout=settings.OLLAMA_TIMEOUT,
                 log_fn=log_fn,
+                cancel_fn=cancel_fn,
             )
         elif build_model == "gemini":
             from app.build.build_agent import run_update_agent_gemini
@@ -143,6 +146,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
                 api_key=settings.GEMINI_API_KEY,
                 model=settings.GEMINI_MODEL,
                 log_fn=log_fn,
+                cancel_fn=cancel_fn,
             )
         elif build_model in ("gpt", "openai"):
             from app.build.build_agent import run_update_agent_openai
@@ -155,6 +159,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
                 api_key=settings.OPENAI_API_KEY,
                 model=settings.OPENAI_MODEL,
                 log_fn=log_fn,
+                cancel_fn=cancel_fn,
             )
         else:
             summary, tokens_used = run_update_agent(
@@ -166,9 +171,13 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
                 api_key=settings.ANTHROPIC_API_KEY,
                 model=settings.ANTHROPIC_MODEL,
                 log_fn=log_fn,
+                cancel_fn=cancel_fn,
             )
         logger.info("Update agent used %d tokens project=%s", tokens_used, project_id)
         await record_usage(db, user_id, tokens_used, is_update=True)
+
+        was_stopped = cancel_fn()
+        clear_cancel(settings.REDIS_URL, project_id)
 
         log_fn("info", "Pushing changes to GitHub…")
         pushed = workspace.sync_to_github(
@@ -179,6 +188,10 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         clean_summary = (summary or "").strip()
         if clean_summary.upper().startswith("DONE"):
             clean_summary = clean_summary[4:].lstrip(":").strip()
+        if clean_summary.upper().startswith("VALIDATED"):
+            clean_summary = clean_summary[9:].lstrip(":").strip()
+
+        hit_limit = "Agent reached iteration limit." in (summary or "")
 
         now = datetime.now(timezone.utc)
         await _patch_project(project_id, {
@@ -188,7 +201,13 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
             "updated_at": now,
         })
 
-        if pushed:
+        if was_stopped:
+            if pushed:
+                log_fn("warning", "Agent stopped — partial changes have been saved to GitHub.")
+            else:
+                log_fn("warning", "Agent stopped before any changes were made.")
+            logger.info("Update stopped by user project=%s pushed=%s", project_id, pushed)
+        elif pushed and not hit_limit:
             log_fn("done", clean_summary or "Your app has been updated successfully!")
             # Automatically rebuild the preview so users don't have to click manually
             try:
@@ -202,6 +221,13 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
                 logger.info("Auto-queued preview build project=%s", project_id)
             except Exception as preview_exc:
                 logger.warning("Could not queue preview build project=%s: %s", project_id, preview_exc)
+        elif pushed and hit_limit:
+            log_fn(
+                "warning",
+                "The agent pushed partial changes but hit its step limit before finishing. "
+                "Send the same request again to continue — it will pick up where it left off."
+            )
+            logger.warning("Preview build skipped — agent hit iteration limit project=%s", project_id)
         else:
             agent_said = f'\n\nAgent response: "{clean_summary}"' if clean_summary else ""
             log_fn(

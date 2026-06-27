@@ -73,6 +73,134 @@ async def get_project(
     return await _get_owned(project_id, user.id, db)
 
 
+@router.post("/{project_id}/stop", response_model=dict)
+async def stop_project(
+    project_id: uuid.UUID,
+    db: DBSession,
+    user: CurrentUser,
+) -> dict:
+    """Signal any running agent or build task for this project to stop."""
+    await _get_owned(project_id, user.id, db)  # ownership check
+
+    from app.config import get_settings
+    from app.build.cancel import request_cancel
+    settings = get_settings()
+    request_cancel(settings.REDIS_URL, str(project_id))
+
+    # Immediately mark as not-updating so the UI unblocks
+    from datetime import datetime, timezone
+    await db.collection("projects").document(str(project_id)).update({
+        "is_updating": False,
+        "updated_at": datetime.now(timezone.utc),
+    })
+    return {"stopped": True}
+
+
+_CODE_SKIP = frozenset({
+    "node_modules", ".dart_tool", "build", ".gradle", ".idea",
+    "__pycache__", ".next", "dist", ".expo", "android", "ios",
+    ".git", "coverage",
+})
+_CODE_SKIP_EXT = frozenset({
+    ".lock", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    ".mp4", ".webp", ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".pyc", ".class", ".jar", ".aar", ".apk", ".so",
+})
+
+
+@router.get("/{project_id}/code/tree")
+async def get_code_tree(
+    project_id: uuid.UUID,
+    db: DBSession,
+    user: CurrentUser,
+) -> dict:
+    """Return a flat list of source file paths from the project's GitHub repo."""
+    import httpx
+    from app.config import get_settings
+    from app.build.github_token import get_valid_github_token
+
+    project = await _get_owned(project_id, user.id, db)
+    if not project.repo_full_name:
+        return {"files": []}
+
+    settings = get_settings()
+    token = await get_valid_github_token(str(user.id), settings.GITHUB_TOKEN)
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        # Try main branch first, then master
+        tree_data = None
+        for branch in ("main", "master"):
+            r = await client.get(
+                f"https://api.github.com/repos/{project.repo_full_name}/git/trees/{branch}?recursive=1",
+                headers=headers,
+            )
+            if r.status_code == 200:
+                tree_data = r.json()
+                break
+
+    if not tree_data:
+        return {"files": []}
+
+    files = []
+    for item in tree_data.get("tree", []):
+        if item.get("type") != "blob":
+            continue
+        path: str = item["path"]
+        parts = path.split("/")
+        # Skip build/vendor dirs and binary extensions
+        if any(p in _CODE_SKIP for p in parts):
+            continue
+        ext = "." + path.rsplit(".", 1)[-1] if "." in path else ""
+        if ext in _CODE_SKIP_EXT:
+            continue
+        files.append(path)
+
+    return {"files": sorted(files)}
+
+
+@router.get("/{project_id}/code/file")
+async def get_code_file(
+    project_id: uuid.UUID,
+    path: str,
+    db: DBSession,
+    user: CurrentUser,
+) -> dict:
+    """Return the text content of a single file from the project's GitHub repo."""
+    import base64
+    import httpx
+    from app.config import get_settings
+    from app.build.github_token import get_valid_github_token
+
+    project = await _get_owned(project_id, user.id, db)
+    if not project.repo_full_name:
+        raise NotFoundError("No repository linked to this project")
+
+    settings = get_settings()
+    token = await get_valid_github_token(str(user.id), settings.GITHUB_TOKEN)
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"https://api.github.com/repos/{project.repo_full_name}/contents/{path}",
+            headers=headers,
+        )
+
+    if r.status_code == 404:
+        raise NotFoundError(f"File not found: {path}")
+    if not r.ok:
+        raise NotFoundError(f"Could not fetch file: {r.status_code}")
+
+    data = r.json()
+    content_b64 = data.get("content", "")
+    try:
+        content = base64.b64decode(content_b64).decode("utf-8", errors="replace")
+    except Exception:
+        content = "(binary file)"
+
+    return {"path": path, "content": content}
+
+
 @router.post("/{project_id}/update", response_model=dict)
 async def update_project(
     project_id: uuid.UUID,
