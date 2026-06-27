@@ -188,7 +188,7 @@ async def get_code_file(
 
     if r.status_code == 404:
         raise NotFoundError(f"File not found: {path}")
-    if not r.ok:
+    if not r.is_success:
         raise NotFoundError(f"Could not fetch file: {r.status_code}")
 
     data = r.json()
