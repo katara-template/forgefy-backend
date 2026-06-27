@@ -11,6 +11,8 @@ from app.db.models.enums import Platform, SessionStatus
 from app.deps import CurrentUser, DBSession
 from app.modules.voxa.service import VoxaService
 from app.modules.voxa.state_machine import MeetingStateMachine
+from pydantic import BaseModel
+
 from app.schemas.session import (
     CreateSessionRequest,
     EndSessionRequest,
@@ -19,6 +21,10 @@ from app.schemas.session import (
     SessionEventOut,
     SessionOut,
 )
+
+
+class DeleteSessionRequest(BaseModel):
+    reason: str = ""
 
 _UPLOAD_DIR = Path("/app/tmp")
 
@@ -134,6 +140,36 @@ async def get_session_transcript(
         s.get("payload", {}).get("text", "") for s in segments
     ).strip()
     return {"session_id": str(session_id), "transcript": text, "segments": len(segments)}
+
+
+@router.delete("/{session_id}", response_model=dict)
+async def delete_session(
+    session_id: uuid.UUID,
+    body: DeleteSessionRequest,
+    db: DBSession,
+    user: CurrentUser,
+) -> dict:
+    """Permanently delete a session and all its sub-collections."""
+    service = VoxaService(db)
+    await service._require_owned(session_id, user.id)
+
+    sid = str(session_id)
+
+    # Delete the events sub-collection first
+    events_ref = db.collection("sessions").document(sid).collection("events")
+    event_docs = await events_ref.get()
+    for doc in event_docs:
+        await events_ref.document(doc.id).delete()
+
+    # Delete the session document itself
+    await db.collection("sessions").document(sid).delete()
+
+    if body.reason:
+        logger.info("Session deleted session=%s user=%s reason=%r", sid, user.id, body.reason)
+    else:
+        logger.info("Session deleted session=%s user=%s", sid, user.id)
+
+    return {"deleted": True}
 
 
 @router.get("/{session_id}", response_model=SessionDetailOut)
