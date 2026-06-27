@@ -96,6 +96,58 @@ async def stop_project(
     return {"stopped": True}
 
 
+@router.delete("/{project_id}", response_model=dict)
+async def delete_project(
+    project_id: uuid.UUID,
+    db: DBSession,
+    user: CurrentUser,
+) -> dict:
+    """Permanently delete a project and its associated resources."""
+    from datetime import datetime, timezone
+
+    project = await _get_owned(project_id, user.id, db)
+
+    if project.is_updating:
+        raise ValidationError("A build is in progress — stop it before deleting.")
+
+    pid = str(project_id)
+
+    # 1. Delete Firestore documents
+    await db.collection("projects").document(pid).delete()
+    try:
+        await db.collection("project_chats").document(pid).delete()
+    except Exception:
+        pass  # non-fatal
+
+    # 2. Try to delete the GitHub repo (needs delete_repo scope — may fail gracefully)
+    if project.repo_full_name:
+        try:
+            from app.config import get_settings
+            from app.build.github_token import get_valid_github_token
+            import httpx
+            settings = get_settings()
+            token = await get_valid_github_token(str(user.id), settings.GITHUB_TOKEN)
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.delete(
+                    f"https://api.github.com/repos/{project.repo_full_name}",
+                    headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+                )
+        except Exception as exc:
+            logger.warning("Could not delete GitHub repo %s: %s", project.repo_full_name, exc)
+
+    # 3. Clear any Redis cancel flag left over
+    try:
+        from app.config import get_settings
+        from app.build.cancel import clear_cancel
+        settings = get_settings()
+        clear_cancel(settings.REDIS_URL, pid)
+    except Exception:
+        pass
+
+    logger.info("Project deleted project=%s user=%s repo=%s", pid, user.id, project.repo_full_name)
+    return {"deleted": True}
+
+
 _CODE_SKIP = frozenset({
     "node_modules", ".dart_tool", "build", ".gradle", ".idea",
     "__pycache__", ".next", "dist", ".expo", "android", "ios",
