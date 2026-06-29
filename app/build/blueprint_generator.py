@@ -146,6 +146,10 @@ class BlueprintAggregator:
                 or await self._infer_app_name(json_output)
             )
 
+        # Generate design system for the build agent to use as visual source of truth
+        if not json_output.get("design_system"):
+            json_output["design_system"] = await self._generate_design_system(json_output)
+
         platform = _detect_platform(json_output)
         now = datetime.now(timezone.utc)
         feature_count = len(json_output.get("features", []))
@@ -326,6 +330,95 @@ class BlueprintAggregator:
         except Exception as exc:
             logger.warning("App name inference failed: %s", exc)
             return ""
+
+    async def _generate_design_system(self, blueprint: dict[str, Any]) -> dict:
+        """Ask the AI to generate a design_system block tailored to this app's domain."""
+        from app.config import get_settings
+        import json as _json
+
+        settings = get_settings()
+
+        app_name = (blueprint.get("app_name") or "").strip()
+        description = (blueprint.get("app_description") or "").strip()
+        features = blueprint.get("features") or []
+        feature_titles = ", ".join(f.get("title", "") for f in features[:8] if f.get("title"))
+
+        _SYSTEM = (
+            "You are a UI/UX design system architect. Given an app's details, produce a "
+            "design_system JSON block that drives all visual decisions. Make every choice "
+            "specific to the app's domain and audience — do NOT produce generic defaults.\n\n"
+            "Return ONLY valid JSON with this exact structure (no other text):\n"
+            "{\n"
+            '  "personality": "<one sentence: visual personality of this app>",\n'
+            '  "palette": {\n'
+            '    "primary": "#hex", "primary_dark": "#hex", "secondary": "#hex",\n'
+            '    "accent": "#hex", "background": "#hex", "surface": "#hex",\n'
+            '    "surface_variant": "#hex", "error": "#hex", "on_primary": "#hex",\n'
+            '    "on_background": "#hex", "on_surface": "#hex", "on_surface_muted": "#hex"\n'
+            "  },\n"
+            '  "typography": {\n'
+            '    "display_font": "<Google Font name>",\n'
+            '    "body_font": "<different Google Font name>"\n'
+            "  },\n"
+            '  "signature_element": "<ONE domain-specific design detail that makes this app memorable>",\n'
+            '  "icon_style": "outlined",\n'
+            '  "image_treatment": "<how images are cropped/styled>"\n'
+            "}\n\n"
+            "Rules:\n"
+            "- palette must have CONTRAST RATIO >= 4.5:1 between on_* and their backgrounds\n"
+            "- display_font must be different from body_font (both must be real Google Fonts)\n"
+            "- signature_element must be domain-specific, NOT a generic gradient card\n"
+            "- personality must reflect the actual app domain, NOT generic SaaS language\n"
+            "- JSON only — zero prose outside the JSON object"
+        )
+
+        content = f"App name: {app_name}\nDescription: {description}"
+        if feature_titles:
+            content += f"\nKey features: {feature_titles}"
+
+        try:
+            if settings.BP_MODEL == "Qwen3":
+                from app.ai.agents.ollama_synthesizer import call_ollama
+                result = call_ollama(
+                    system_prompt=_SYSTEM,
+                    user_content=content,
+                    base_url=settings.OLLAMA_URL,
+                    model=settings.OLLAMA_MODEL,
+                    timeout=settings.OLLAMA_TIMEOUT,
+                )
+                if isinstance(result, dict) and "palette" in result:
+                    return result
+            elif settings.BP_MODEL == "gemini":
+                from app.ai.agents.gemini_synthesizer import call_gemini
+                result = call_gemini(
+                    system_prompt=_SYSTEM,
+                    user_content=content,
+                    api_key=settings.GEMINI_API_KEY,
+                    model=settings.GEMINI_MODEL,
+                    max_tokens=1024,
+                )
+                if isinstance(result, dict) and "palette" in result:
+                    return result
+            else:
+                import anthropic
+                client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=120.0)
+                msg = client.messages.create(
+                    model=settings.ANTHROPIC_MODEL,
+                    max_tokens=1024,
+                    system=_SYSTEM,
+                    messages=[{"role": "user", "content": content}],
+                )
+                raw = (msg.content[0].text or "").strip()
+                # Strip markdown fences if present
+                import re as _re
+                raw = _re.sub(r"```[a-z]*\n?", "", raw).strip().strip("```").strip()
+                result = _json.loads(raw)
+                if isinstance(result, dict) and "palette" in result:
+                    return result
+        except Exception as exc:
+            logger.warning("Design system generation failed: %s", exc)
+
+        return {}
 
     async def _synthesize_from_segments(
         self,

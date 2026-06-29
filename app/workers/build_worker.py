@@ -520,7 +520,22 @@ async def _run(session_id: str, project_id: str) -> dict:
             "repo_owner": "platform" if using_platform_github else "user",
             "updated_at": now,
         })
-        log_fn("info", f"Repository live on GitHub ({repo_url}). Running build agent…")
+        log_fn("info", f"Repository live on GitHub ({repo_url}). Generating design system…")
+
+        # 8.5 Phase 0.5 — materialise design system files before the build agent reads them
+        try:
+            from app.build.design_system import generate_design_system_files
+            generate_design_system_files(
+                workspace_path=workspace.path,
+                blueprint=json_output,
+                framework=template_key,
+                log_fn=log_fn,
+            )
+        except Exception as _ds_exc:
+            logger.warning("Design system generation failed (non-fatal): %s", _ds_exc)
+            log_fn("info", "Design system generation skipped — build agent will create styles.")
+
+        log_fn("info", "Running build agent…")
 
         # 9. Run build agent — model selected by BUILD_MODEL (independent of BP_MODEL)
         if settings.BUILD_MODEL == "Qwen3":
