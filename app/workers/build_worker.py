@@ -218,14 +218,19 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
             return url
 
         if result.returncode != 0:
+            print(f"Wrangler deploy failed with code {result.returncode}:\n{output}")
             logger.warning("Wrangler exited with code %d — deploy failed", result.returncode)
         else:
+            print(f"Wrangler deploy succeeded but no pages.dev URL found:\n{output}")
             logger.warning("Wrangler succeeded but no pages.dev URL found in output")
         return None
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        # print exception error message and output for debugging
+        print(f"Wrangler deploy timed out: {exc}")
         logger.warning("Cloudflare Pages deploy timed out after 180 s")
         return None
     except Exception as exc:
+        print(f"Wrangler deploy failed: {exc}")
         logger.warning("Cloudflare Pages deploy failed (non-fatal): %s", exc)
         return None
 
@@ -876,7 +881,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
             updates["preview_url"] = preview_url
             log_fn("done", f"Preview deployed → {preview_url}")
         else:
-            log_fn("warning", "Preview deployment skipped — no artifact or missing deploy credentials.")
+            log_fn("warning", "Preview deployment skipped — no artifact or missing deploy credentials.", )
         if artifact_url:
             updates["artifact_url"] = artifact_url
 
