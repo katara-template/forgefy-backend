@@ -108,31 +108,120 @@ class Workspace:
 # Shared artifact-build helpers (used by Workspace and EditWorkspace)
 # ---------------------------------------------------------------------------
 
+_NEXT_CONFIG_CANONICAL = """\
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  // Built for Cloudflare Pages via @cloudflare/next-on-pages.
+  // Do NOT set output:'export' — that breaks API routes and SSR.
+  images: { unoptimized: true },
+  typescript: { ignoreBuildErrors: true },
+  eslint: { ignoreDuringBuilds: true },
+};
+
+module.exports = nextConfig;
+"""
+
+# Fallback config used when the Cloudflare adapter fails — static export only,
+# no API routes, no SSR. Better than nothing.
+_NEXT_CONFIG_STATIC_EXPORT = """\
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  output: 'export',
+  images: { unoptimized: true },
+  typescript: { ignoreBuildErrors: true },
+  eslint: { ignoreDuringBuilds: true },
+};
+
+module.exports = nextConfig;
+"""
+
+
 def _patch_next_config(path: Path) -> None:
-    for name in ("next.config.js", "next.config.ts", "next.config.mjs"):
+    """Write a Cloudflare-compatible next.config (no output:'export').
+
+    Always overwrites so the canonical flags are guaranteed to be present.
+    """
+    import re as _re
+    for name in ("next.config.ts", "next.config.mjs", "next.config.js"):
         cfg = path / name
         if not cfg.exists():
             continue
-        text = cfg.read_text(encoding="utf-8")
-        if "output" in text:
+        existing = cfg.read_text(encoding="utf-8").strip()
+        # Already patched to our canonical form — nothing to do
+        if "ignoreBuildErrors" in existing and "output:'export'" not in _re.sub(r"\s", "", existing):
             return
-        patched = text.replace(
-            "module.exports = nextConfig",
-            "nextConfig.output = 'export';\nmodule.exports = nextConfig",
-        ).replace(
-            "export default nextConfig",
-            "nextConfig.output = 'export';\nexport default nextConfig",
-        )
-        cfg.write_text(patched, encoding="utf-8")
-        logger.info("Patched %s with output: 'export'", name)
+        cfg.write_text(_NEXT_CONFIG_CANONICAL, encoding="utf-8")
+        logger.info("Patched %s for Cloudflare Pages (removed output:export)", name)
         return
-    (path / "next.config.js").write_text(
-        "/** @type {import('next').NextConfig} */\n"
-        "const nextConfig = { output: 'export' };\n"
-        "module.exports = nextConfig;\n",
+
+    (path / "next.config.js").write_text(_NEXT_CONFIG_CANONICAL, encoding="utf-8")
+    logger.info("Created next.config.js for Cloudflare Pages")
+
+
+def _patch_next_config_static(path: Path) -> None:
+    """Switch next.config to static export mode (fallback when Cloudflare adapter fails)."""
+    for name in ("next.config.ts", "next.config.mjs", "next.config.js"):
+        cfg = path / name
+        if cfg.exists():
+            cfg.write_text(_NEXT_CONFIG_STATIC_EXPORT, encoding="utf-8")
+            logger.info("Switched %s to static-export fallback", name)
+            return
+    (path / "next.config.js").write_text(_NEXT_CONFIG_STATIC_EXPORT, encoding="utf-8")
+
+
+def _ensure_wrangler_toml(path: Path, project_name: str) -> None:
+    """Write wrangler.toml for @cloudflare/next-on-pages if it doesn't already exist."""
+    import re as _re
+    wrangler = path / "wrangler.toml"
+    if wrangler.exists():
+        return
+    slug = _re.sub(r"[^a-z0-9-]", "-", project_name.lower()).strip("-")[:28] or "forgefy-app"
+    wrangler.write_text(
+        f'name = "{slug}"\n'
+        'pages_build_output_dir = ".vercel/output/static"\n'
+        'compatibility_date = "2025-01-01"\n'
+        'compatibility_flags = ["nodejs_compat"]\n',
         encoding="utf-8",
     )
-    logger.info("Created next.config.js with output: 'export'")
+    logger.info("Created wrangler.toml for Cloudflare Pages project: %s", slug)
+
+
+def _patch_tsconfig(path: Path) -> None:
+    """Relax tsconfig strictness so minor AI-generated type errors don't block builds."""
+    import json, re
+
+    tsconfig_path = path / "tsconfig.json"
+    if not tsconfig_path.exists():
+        return
+
+    text = tsconfig_path.read_text(encoding="utf-8")
+    # Strip JS-style comments before parsing (tsconfig allows them, json.loads doesn't)
+    clean = re.sub(r"//[^\n]*", "", text)
+    clean = re.sub(r"/\*.*?\*/", "", clean, flags=re.DOTALL)
+    try:
+        cfg = json.loads(clean)
+    except Exception:
+        logger.warning("Could not parse tsconfig.json — skipping patch")
+        return
+
+    compiler = cfg.setdefault("compilerOptions", {})
+    changed = False
+    relaxations: dict = {
+        "strict": False,
+        "noImplicitAny": False,
+        "strictNullChecks": False,
+        "skipLibCheck": True,           # skip type-checking inside node_modules
+        "noUnusedLocals": False,        # agent often leaves unused imports
+        "noUnusedParameters": False,
+    }
+    for key, value in relaxations.items():
+        if compiler.get(key) != value:
+            compiler[key] = value
+            changed = True
+
+    if changed:
+        tsconfig_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        logger.info("Relaxed tsconfig.json strictness for agent-generated code")
 
 
 def _find_package_root(path: Path) -> Path:
@@ -187,14 +276,36 @@ def build_artifacts_at(path: Path, template_key: str) -> Path | None:
 
     if template_key == "next":
         root = _find_package_root(path)
-        logger.info("Next.js: npm install + static export path=%s", root)
+        logger.info("Next.js: npm install + Cloudflare Pages build path=%s", root)
         _run(["npm", "install", "--legacy-peer-deps"], cwd=root, timeout=300)
         _patch_next_config(root)
+        _patch_tsconfig(root)
+
+        # Attempt 1: @cloudflare/next-on-pages (supports SSR + API routes)
+        try:
+            _ensure_wrangler_toml(root, root.name)
+            _run(
+                ["npx", "--yes", "@cloudflare/next-on-pages"],
+                cwd=root, timeout=600,
+            )
+            cf_out = root / ".vercel" / "output" / "static"
+            if cf_out.exists():
+                logger.info("Cloudflare Pages build succeeded → %s", cf_out)
+                return cf_out
+            logger.warning("@cloudflare/next-on-pages ran but .vercel/output/static not found")
+        except RuntimeError as exc:
+            logger.warning("@cloudflare/next-on-pages failed (%s) — falling back to static export", str(exc)[:200])
+
+        # Attempt 2: static export fallback (no SSR / no API routes)
+        logger.info("Next.js: falling back to next build with output:export")
+        _patch_next_config_static(root)
         _run(["npm", "run", "build"], cwd=root, timeout=300)
         out = root / "out"
         if out.exists():
+            logger.info("Static export fallback succeeded → %s", out)
             return out
-        logger.warning("No out/ dir after next build")
+
+        logger.warning("No artifact produced for next build (both approaches failed)")
         return None
 
     return None

@@ -522,7 +522,20 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return ChatResponse(type="chat", response="I'm here to help — what would you like to do?")
+        # Classifier returned invalid JSON — queue the raw message as an update so
+        # it always reaches the AI agent rather than silently dropping it.
+        if project.is_updating:
+            return ChatResponse(
+                type="chat",
+                response="An update is already in progress — I'll queue this as soon as it finishes.",
+            )
+        log_fn("started", f"Preparing update for {project.app_name}…")
+        from app.workers.update_worker import apply_update
+        apply_update.apply_async(
+            args=[str(project_id), message, str(user.id)],
+            queue="build",
+        )
+        return ChatResponse(type="update", response="On it — watch the build log for progress.", update_queued=True)
 
     intent = parsed.get("type", "chat")
     user_response = parsed.get("response", "")
