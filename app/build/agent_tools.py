@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +111,21 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "analyze_code",
+        "description": (
+            "Run the real static analyzer on the workspace to find type errors, missing imports, "
+            "undefined identifiers, and other issues that will cause a compilation failure. "
+            "Flutter → runs 'dart analyze'. Next.js / React Native → runs 'tsc --noEmit'. "
+            "Call this BEFORE reporting your validation result so real compiler errors are caught. "
+            "If it returns errors, fix them with write_file before finishing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
         "name": "generate_video",
         "description": (
             "Generate a short AI video (Kling Video) and save it to the app's assets folder. "
@@ -190,6 +206,57 @@ def _save_placeholder(asset_dir: Path, filename: str, media_type: str) -> str:
     else:
         out_path.write_bytes(b"")  # empty mp4 placeholder — won't play but won't break build
     return str(out_path.relative_to(asset_dir.parent.parent) if asset_dir.parent.parent.exists() else out_path)
+
+
+def _run_analysis(workspace: Path, log_fn=None) -> str:
+    """Run dart analyze or tsc --noEmit and return the output."""
+    is_flutter = (workspace / "pubspec.yaml").exists()
+    is_ts = (workspace / "tsconfig.json").exists()
+
+    if is_flutter:
+        dart = shutil.which("dart") or shutil.which("dart.exe")
+        if not dart:
+            return "dart not found on PATH — static analysis skipped."
+        try:
+            result = subprocess.run(
+                [dart, "analyze", "--no-fatal-infos"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            output = (result.stdout + result.stderr).strip()
+            if result.returncode == 0:
+                return "dart analyze: no issues found."
+            # Trim to the most useful tail
+            return ("dart analyze errors:\n" + output)[-4000:]
+        except subprocess.TimeoutExpired:
+            return "dart analyze timed out after 120 s."
+        except Exception as exc:
+            return f"dart analyze failed: {exc}"
+
+    if is_ts:
+        npx = shutil.which("npx") or shutil.which("npx.cmd")
+        if not npx:
+            return "npx not found on PATH — TypeScript analysis skipped."
+        try:
+            result = subprocess.run(
+                [npx, "tsc", "--noEmit", "--pretty", "false"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            output = (result.stdout + result.stderr).strip()
+            if result.returncode == 0:
+                return "tsc --noEmit: no type errors found."
+            return ("TypeScript errors:\n" + output)[-4000:]
+        except subprocess.TimeoutExpired:
+            return "tsc --noEmit timed out after 120 s."
+        except Exception as exc:
+            return f"tsc --noEmit failed: {exc}"
+
+    return "No recognisable project type in workspace (no pubspec.yaml or tsconfig.json)."
 
 
 def _generate_image(
@@ -381,6 +448,9 @@ def execute_tool(
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dst))
             return f"OK: moved {inputs['source']} → {inputs['destination']}"
+
+        case "analyze_code":
+            return _run_analysis(workspace, log_fn)
 
         case "generate_image":
             return _generate_image(inputs["prompt"], inputs["filename"], workspace, log_fn)

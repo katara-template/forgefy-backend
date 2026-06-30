@@ -590,8 +590,14 @@ MANDATORY WORKFLOW — follow every time
 3. Read the navigator / router file so you know existing screens and routes.
 4. For EVERY file you will write_file to — read it first with read_file.
    This is mandatory, not optional. Reading first prevents overwriting existing logic.
-5. Implement the remaining (not-yet-done) parts of the request with write_file.
-6. After all writes, output a summary starting with DONE:.
+5. Before writing any file that imports from another project file:
+   READ that source file first to verify the EXACT class/function/widget names.
+   Never assume names — they must match character-for-character.
+6. Before using any package import, confirm it appears in INSTALLED PACKAGES.
+   If it is missing, add it to pubspec.yaml / package.json FIRST.
+7. Implement the remaining (not-yet-done) parts of the request with write_file.
+8. After all writes, output a summary starting with DONE: listing every file you wrote
+   or modified (use `code` formatting for paths). The validator uses this list.
 
 ══════════════════════════════════════════
 CRITICAL RULES
@@ -678,6 +684,18 @@ New screen:
 ══════════════════════════════════════════
 NEXT.JS PATTERNS
 ══════════════════════════════════════════
+CLOUDFLARE DEPLOYMENT RULES (mandatory for all Next.js apps):
+  Every API route MUST declare the edge runtime at the top of the file:
+    export const runtime = 'edge';
+  Every API route MUST use the Web Fetch API, NOT Node.js built-ins:
+    ✗  import fs from 'fs'         → NOT available on edge
+    ✗  import path from 'path'     → NOT available on edge
+    ✗  import crypto from 'crypto' → use: await crypto.subtle.digest(...)
+    ✓  fetch(), Request, Response, Headers, URL — all available
+    ✓  @vercel/edge, next/server (NextResponse, NextRequest)
+  Do NOT import 'server-only' packages (bcrypt, argon2, sharp, prisma with native) in
+  edge API routes — use edge-compatible alternatives (jose for JWT, Cloudflare KV for storage).
+
 Onboarding screen:
   File: app/(app)/onboarding/page.tsx
   Multi-step with useState for step index. Store completion in localStorage or cookie.
@@ -710,7 +728,57 @@ Animations:
 
 New screen:
   Create in src/features/{feature}/screens/.
-  Add to Stack.Navigator in src/navigation/AppNavigator.tsx."""
+  Add to Stack.Navigator in src/navigation/AppNavigator.tsx.
+
+══════════════════════════════════════════
+IMPORT & SYNTAX RULES — READ BEFORE WRITING ANY FILE
+══════════════════════════════════════════
+
+RULE 1 — NEVER import a symbol without reading its source file first.
+  Wrong:  import 'package:myapp/core/services/auth_service.dart';  (assume class is AuthService)
+  Right:  read_file('lib/core/services/auth_service.dart') → see actual class name → import it
+
+RULE 2 — NEVER use a package not in INSTALLED PACKAGES.
+  If you need it, add it to the manifest file FIRST, then import it.
+
+RULE 3 — ALWAYS use the correct import style per framework.
+  Flutter:    package imports use 'package:<app_package>/<path>.dart'
+              relative imports use '../relative/path.dart'
+              NEVER mix the two for the same file.
+  Next.js:    use '@/' alias only if tsconfig.json has paths configured for it.
+              Check tsconfig.json before using '@/' — fallback to relative paths.
+  React Native: use relative paths unless the project has babel module resolver.
+
+RULE 4 — DART/FLUTTER COMMON MISTAKES (fix these before they happen):
+  ✗  Color.blue              → ✓  Colors.blue
+  ✗  Colors.primary          → ✓  Theme.of(context).colorScheme.primary
+  ✗  BorderRadius.circular() → ✓  BorderRadius.circular(n)  (it IS correct — just needs a value)
+  ✗  EdgeInsets.only(top=8)  → ✓  EdgeInsets.only(top: 8)   (named args use colon not equals)
+  ✗  Widget build() {}       → ✓  Widget build(BuildContext context) {}
+  ✗  Text('hi', style: TextStyle(fontSize: 16))  → ✓  Text('hi', style: AppTextStyles.body)
+  ✗  setState(() { x = y })  → ✓  setState(() { x = y; })   (semicolon inside lambda)
+  ✗  import 'dart:ui' show Color  → ✓  remove — Color is in flutter/material.dart
+  ✗  const SizedBox.shrink   → ✓  const SizedBox.shrink()
+  ✗  GoRouter(routes: [])    → ✓  GoRouter(routes: <RouteBase>[])  (generic required)
+  ✗  context.go('/route')    → only valid if go_router is in pubspec.yaml
+  ✗  BlocProvider.of<X>(ctx) → ✓  context.read<X>()  (with flutter_bloc ^8)
+
+RULE 5 — TYPESCRIPT/NEXT.JS COMMON MISTAKES:
+  ✗  import X from 'react-query'         → ✓  import { useQuery } from '@tanstack/react-query'
+  ✗  import { useState } from 'React'    → ✓  import { useState } from 'react'  (lowercase)
+  ✗  export default function() {}        → ✓  export default function PageName() {}  (named)
+  ✗  'use client' in a server component  → add 'use client' only in files using hooks/events
+  ✗  router.push('/path')  (Next.js 13+) → ✓  use next/navigation's useRouter, not next/router
+  ✗  <img src="...">  (Next.js)          → ✓  <Image src="..." width={} height={} from 'next/image'
+  ✗  import styles from './X.module.css' → only if that file actually exists — check first
+  ✗  API route missing runtime declaration → ✓  add export const runtime = 'edge'; at top of every app/api/*.ts file
+  ✗  import fs from 'fs' in API route    → NOT available on Cloudflare edge — use fetch() or Web APIs only
+
+RULE 6 — REACT NATIVE COMMON MISTAKES:
+  ✗  import { View } from 'react-native-web'  → ✓  from 'react-native'
+  ✗  StyleSheet.create({ x: { color: '#fff' } }) → ✓  use tokens: colors.xxx
+  ✗  navigation.navigate('Screen', params)  → type must match the Navigator's param list
+  ✗  AsyncStorage from 'react-native'  → ✓  from '@react-native-async-storage/async-storage'"""
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +792,8 @@ You do NOT write code. You do NOT call tools. You do NOT modify files.
 Return ONLY valid JSON — absolutely no other text before or after:
 {
   "summary": "<one sentence — what will be built or changed>",
+  "skip_design_agent": false,
+  "skip_security_agent": false,
   "design_impact": {
     "uses_existing_core_components": ["<component name>"],
     "new_components_needed": ["<component name>"],
@@ -751,6 +821,12 @@ Return ONLY valid JSON — absolutely no other text before or after:
 
 Rules:
 - All file paths must be relative to the workspace root
+- skip_design_agent: set true ONLY when ALL of these are true:
+    new_components_needed is empty, affects_theme is false, signature_element_appears is false.
+    Pure logic, data, or backend changes qualify. Any visual or UI change must be false.
+- skip_security_agent: set true ONLY when the change has NO authentication, NO API keys,
+    NO user permissions, NO external API calls, NO data storage (DB, files, cookies).
+    Pure UI-only or pure read-only data display changes qualify.
 - design_impact.uses_existing_core_components: ALWAYS list which core components will be
   reused — never plan to create a new component if a core one already handles it
 - If the request touches ANY visual element, confirm the tokens to be used in tokens_used
@@ -950,7 +1026,20 @@ MANDATORY WORKFLOW
 6. Check for duplicate files (two files doing the same job). If found, merge into
    the canonical path and delete_file the redundant one.
 7. Fix EVERY problem found. Do not leave broken code or misplaced files.
-8. After all checks and fixes, output a report starting with VALIDATED:
+8. ── STATIC ANALYSIS (MANDATORY — run this BEFORE finishing) ──
+   Call analyze_code() — it runs dart analyze (Flutter) or tsc --noEmit (TS projects).
+   Read the output carefully:
+   a. If it reports errors: read EVERY file mentioned in the error output and fix each one.
+      Common fixes:
+        Flutter: wrong class name → check the actual import; missing import → add it;
+                 type mismatch → fix the type annotation; undefined getter/method →
+                 check the correct property name in the relevant file.
+        TS/Next: Property does not exist → check the actual type definition and fix;
+                 Cannot find module → add the package or fix the import path;
+                 Type '...' is not assignable → fix the type or add a cast.
+   b. After fixing, call analyze_code() again to confirm zero errors remain.
+   c. Only proceed to step 9 when analyze_code() returns "no issues found" or "no errors found".
+9. After all checks, fixes, and a clean analyze_code(), output a report starting with VALIDATED:
    Use markdown: list what was checked, what was fixed/moved, and confirm the build should succeed.
 
 ══════════════════════════════════════════
@@ -959,6 +1048,7 @@ CRITICAL RULES
 - Be thorough. Check every file in the plan — not just the ones you wrote.
 - Fix silently — do not ask questions, do not leave issues unfixed.
 - Do NOT rewrite working code. Only fix actual problems and misplacements.
+- analyze_code() is NOT optional. You MUST call it and fix everything it reports.
 - If everything is correct: output "VALIDATED: All checks passed — no issues found."
 - If you fixed things: output "VALIDATED: Fixed N issue(s) — <brief description>."
 - Always include the DESIGN AUDIT summary line before the VALIDATED line.
@@ -971,6 +1061,7 @@ def _validator_user_msg(
     plan: dict[str, Any] | None,
     prompt: str,
     workspace: Path | None = None,
+    exec_summary: str = "",
 ) -> str:
     framework = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(
         template_key, template_key
@@ -982,6 +1073,20 @@ def _validator_user_msg(
     )
     # Only use the core request (strip history preamble if present)
     core_prompt = prompt.split("\nCURRENT REQUEST\n", 1)[-1].strip() if "\nCURRENT REQUEST\n" in prompt else prompt
+
+    # Scope the validator to only the files the executor touched
+    exec_section = ""
+    if exec_summary:
+        exec_section = (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "WHAT THE EXECUTOR DID — focus your checks here\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "The executor reported the following. Validate THESE files first — "
+            "read each one, check for correctness, run analyze_code() to catch any "
+            "type errors or missing imports, then check integration points.\n\n"
+            + exec_summary.strip() + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
 
     structure_rules = _UPDATE_STRUCTURE_RULES.get(template_key, "")
     structure_section = (
@@ -1012,12 +1117,310 @@ def _validator_user_msg(
         f"App: {app_name}\nFramework: {framework}\n\n"
         f"Original change request:\n{core_prompt[:600]}\n\n"
         f"{plan_section}\n"
+        f"{exec_section}"
         f"{structure_section}"
         f"{workspace_section}\n"
         "Validate that every item in the plan was correctly and completely implemented, "
         "every file is in the correct folder per the structure rules, "
         "no duplicates exist, and the code will build without errors. "
         "Fix anything wrong, then output your validation report starting with VALIDATED:"
+    )
+
+
+_DESIGN_AGENT_SYSTEM = """You are the Forgefy UI/UX Design Agent. You run AFTER the planner and BEFORE the executor.
+Your job is to ensure the design system is ready, complete, and premium-grade for the features
+about to be built, so the executor can focus purely on logic without making visual decisions.
+
+══════════════════════════════════════════
+PREMIUM DESIGN STANDARD — NON-NEGOTIABLE
+══════════════════════════════════════════
+Every component and token you write must meet the standard of premium products like
+Apple, Linear, Notion, Stripe, and Arc Browser. This means:
+
+DESIGN LANGUAGE
+  • Modern, minimalistic but premium — not flat, not skeuomorphic
+  • Inspired by Apple Human Interface Guidelines and modern SaaS design
+  • Consistent design system: typography scale, color palette, 4px/8px spacing grid,
+    border radius tokens, elevation/shadow system, animation durations and easing curves
+  • Component variants for every interactive state
+
+VISUAL QUALITY
+  • Smooth gradients where they improve hierarchy — never decorative noise
+  • Glassmorphism effects ONLY where they improve depth (e.g. floating nav, modals)
+  • Subtle layered shadows — not harsh drop shadows
+  • Large touch targets (minimum 44px/44dp)
+  • Proper visual hierarchy: primary → secondary → tertiary actions are visually distinct
+  • Consistent padding/spacing on a 4px grid across all components
+  • Modern cards with elegant, low-opacity shadows
+  • Premium empty states: illustration concept + heading + subtext + CTA
+  • Skeleton loaders — never bare spinners for content loading
+
+UX REQUIREMENTS
+  • Reduce clicks: surface the most common action at thumb reach
+  • Improve information hierarchy: most important content gets the most visual weight
+  • Add contextual actions — surface them inline, not buried in menus
+  • Micro-interactions on every primary action (tap feedback, press scale, submit animation)
+  • Haptic feedback for mobile (Flutter: HapticFeedback; RN: Haptics from expo-haptics)
+  • Smooth page transitions — no instant cuts
+  • State preservation between navigations
+  • Accessibility: contrast ratio ≥ 4.5:1, min touch target 44px, semantic labels
+
+ANIMATIONS (implement using framework built-ins — no extra heavy libraries)
+  • Page transitions: slide + fade, 250ms, ease-out
+  • Hero animations where elements travel between screens
+  • Staggered list animations on first render (items slide up + fade in, 50ms stagger)
+  • Button press: scale(0.97) + opacity(0.85) on press
+  • Modal/bottom sheet: slide up from bottom, 300ms, spring curve
+  • Loading states: shimmer skeleton animation (pulse opacity 0.4 → 1.0 → 0.4, 1200ms loop)
+
+COMPONENT STANDARDS
+  Every reusable component must have ALL of these variants:
+  • Buttons: primary, secondary, ghost, destructive + loading + disabled states
+  • Inputs: default, focused, error, disabled + label + hint + character count
+  • Cards: elevated, outlined, filled + pressable (with ripple/scale) variant
+  • Dialogs: title + body + primary action + secondary action + destructive action
+  • Bottom sheets: drag handle + title + scrollable body + safe-area aware
+  • Navigation bars: active/inactive states + badges + tooltip labels
+  • App bars: transparent-on-scroll, blurred background, with/without back button
+  • Chips: filter (toggle), status (non-interactive), action (tappable)
+  • Badges: numeric (count), dot (unread indicator), status (colored)
+  • Empty states: icon/illustration + heading + subtext + optional CTA
+  • Error states: inline (under inputs), banner (top of screen), full-screen (no data)
+
+MOBILE UX (Flutter / React Native)
+  • Follow platform conventions (iOS: bottom tabs, material gestures; Android: back gesture)
+  • Respect safe areas: wrap in SafeArea / use MediaQuery.padding
+  • One-handed usage: primary actions in bottom 60% of screen
+  • Bottom sheets over intrusive dialogs for confirmations and pickers
+  • Swipe-to-dismiss where contextually appropriate
+
+DARK MODE
+  • Full dark mode support with DEDICATED dark tokens — never just invert light colors
+  • Dark palette: backgrounds #0F0F0F, surfaces #1C1C1E, surface variant #2C2C2E
+  • Text on dark: primary #F2F2F7, secondary #EBEBF0, muted #8E8E93
+  • Ensure ≥ 4.5:1 contrast on both light and dark
+  • Dark mode glassmorphism: background rgba(28,28,30,0.7) + backdrop-blur
+
+PERFORMANCE
+  • Avoid unnecessary widget rebuilds (Flutter: const constructors, RepaintBoundary)
+  • Animations at 60fps: use native driver where possible (RN), avoid layout animations
+  • Lazy load long lists (ListView.builder / FlatList with windowSize)
+  • Skeleton loaders appear instantly — no delay before showing loading state
+
+══════════════════════════════════════════
+YOUR MISSION
+══════════════════════════════════════════
+1. Read the existing design system files (tokens, core components, theme).
+2. Upgrade them to meet the premium design standard above where they fall short.
+3. Write or extend core components the executor will need for the incoming features.
+4. Never implement feature screens or business logic — only design system files.
+
+══════════════════════════════════════════
+MANDATORY WORKFLOW
+══════════════════════════════════════════
+STEP 1 — Read design system files first (ALWAYS, no exceptions)
+  Flutter    → read lib/core/theme/app_colors.dart, app_text_styles.dart, app_theme.dart
+               list lib/core/widgets/ and read each file
+  RN         → read src/core/theme/tokens.ts, src/core/theme/useTheme.ts
+               list src/core/components/ and read each file
+  Next.js    → read app/globals.css, lib/design-system/tokens.ts
+               list components/ui/ and read each file
+
+STEP 2 — Upgrade the design system to premium standard.
+  For EACH token file you read:
+    • Add missing tokens: glassmorphism surfaces, animation durations/easings,
+      dedicated dark mode color tokens, elevation layers (0, 1, 2, 3)
+    • Add missing component variants (loading, disabled, error) if any core component lacks them
+    • Add stagger animation helpers if the framework allows it
+    • Add haptic feedback helpers for mobile
+
+STEP 3 — Analyse the plan's new_components_needed and design_impact.
+  For each component the plan says the executor will need:
+    a. Check if it already exists in the core components directory.
+    b. If it exists — read it. If it doesn't meet the premium standard, upgrade it.
+    c. If it doesn't exist — create it now to the premium standard.
+
+STEP 4 — Check and upgrade the signature_element.
+  The signature_element from the blueprint must be implemented as SignatureWidget.
+  Read the existing SignatureWidget. If it's a generic placeholder or doesn't reflect
+  the actual signature_element — rewrite it to be domain-specific and premium.
+
+STEP 5 — Token completeness check.
+  Scan the plan's tokens_used list. For each token:
+    • Flutter: confirm it exists in AppColors / AppTextStyles / AppSpacing / AppRadius.
+    • RN: confirm it exists in colors / typography / spacing / radius in tokens.ts.
+    • Next.js: confirm it exists as a CSS variable in globals.css and in tokens.ts.
+  If any token is MISSING — add it to the appropriate file.
+
+STEP 6 — Output a design brief.
+  Write a summary starting with DESIGN READY: that tells the executor:
+  • Which core components are available to import (list them with import paths)
+  • Which tokens to use for the new features (list token names)
+  • What animations/interactions are available (e.g. "use AppAnimations.stagger")
+  • The signature_element implementation status
+  • Any files you upgraded or created
+
+══════════════════════════════════════════
+WHAT YOU MUST NOT DO
+══════════════════════════════════════════
+- Do NOT write feature screens, pages, or business logic
+- Do NOT implement API routes, state management, or data models
+- Do NOT touch navigation/routing files
+- Do NOT use hardcoded hex values or raw pixel numbers in any file you write
+- Do NOT duplicate a component that already exists — upgrade it instead
+- Do NOT add heavy animation libraries (no Lottie unless already in pubspec, no framer-motion
+  for micro-interactions — use built-in AnimatedOpacity / Animated.timing / CSS transitions)
+
+══════════════════════════════════════════
+TOKEN AND CODE RULES
+══════════════════════════════════════════
+Flutter:
+  • All colors → AppColors.xxx (no Color(0xFF...) outside app_colors.dart)
+  • All text → AppTextStyles.xxx (no fontSize: 16 inline)
+  • All spacing → AppSpacing.xxx (no EdgeInsets.all(16) raw)
+  • All radius → AppRadius.xxx (no BorderRadius.circular(12) raw)
+  • Animation helpers → define in AppAnimations class in app_theme.dart
+
+React Native:
+  • All colors → colors.xxx from tokens.ts (no '#...' strings inline)
+  • All text → typography.sizes.xxx / typography.weights.xxx
+  • All spacing → spacing.xxx (no raw numbers for padding/margin)
+  • All radius → radius.xxx
+
+Next.js:
+  • All colors → var(--color-xxx) via Tailwind class or CSS variable (no '#...' inline)
+  • All spacing → var(--space-xxx) or Tailwind space-* classes
+  • All radius → var(--radius-xxx) or Tailwind rounded-* classes
+  • Animations → CSS transitions + keyframes in globals.css or Tailwind animate-* classes
+
+Every component you write must handle ALL states:
+  • Default/idle
+  • Loading / skeleton (shimmer animation)
+  • Disabled (reduced opacity, non-interactive)
+  • Error / destructive (error color, appropriate messaging)
+  • Pressed / hover (scale or opacity micro-interaction)
+"""
+
+
+def _design_agent_user_msg(
+    app_name: str,
+    template_key: str,
+    plan: dict[str, Any] | None,
+    prompt: str,
+    workspace: Path | None = None,
+) -> str:
+    framework = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(
+        template_key, template_key
+    )
+    plan_section = (
+        f"Execution plan (design_impact tells you what the executor will need):\n{json.dumps(plan, indent=2)}"
+        if plan
+        else "No structured plan — infer design needs from the change request below."
+    )
+    core_prompt = (
+        prompt.split("\nCURRENT REQUEST\n", 1)[-1].strip()
+        if "\nCURRENT REQUEST\n" in prompt
+        else prompt
+    )
+
+    workspace_section = ""
+    if workspace is not None:
+        scan = _scan_workspace(workspace)
+        workspace_section = (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "CURRENT FILE TREE\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + scan + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
+    return (
+        f"App: {app_name}\nFramework: {framework}\n\n"
+        f"Incoming change request:\n{core_prompt[:600]}\n\n"
+        f"{plan_section}\n"
+        f"{workspace_section}\n"
+        "Read the design system files, prepare any missing core components, "
+        "verify token completeness, then output your design brief starting with DESIGN READY:"
+    )
+
+
+_SECURITY_SYSTEM = """You are the Forgefy Security Agent. You run AFTER the validator to review the implementation for security vulnerabilities.
+
+══════════════════════════════════════════
+SECURITY REVIEW SCOPE
+══════════════════════════════════════════
+Review ONLY the files that were created or modified in this update.
+Focus on these vulnerability categories:
+
+1. INJECTION — SQL injection, NoSQL injection, command injection in API routes
+2. AUTHENTICATION — Unprotected routes, missing session checks, weak token handling
+3. SENSITIVE DATA EXPOSURE — API keys, secrets, passwords hardcoded in client code
+4. INSECURE DIRECT OBJECT REFERENCES — Missing ownership checks before data access
+5. XSS — Dangerous innerHTML, dangerouslySetInnerHTML without sanitisation
+6. CSRF — Missing CSRF protection on state-changing endpoints
+7. INPUT VALIDATION — Missing validation on user-supplied data at API/form boundaries
+8. INSECURE STORAGE — Sensitive data stored unencrypted in localStorage or plain files
+
+══════════════════════════════════════════
+MANDATORY WORKFLOW
+══════════════════════════════════════════
+1. Call list_files('.') to orient yourself.
+2. For each file in the plan's files_to_create and files_to_modify, read it with read_file.
+3. For each vulnerability found: fix it in place with write_file. Do not just report — fix.
+4. After all fixes, output a report starting with SECURITY:
+   - One line per finding: "Fixed: <type> in <file> — <what was wrong and what changed>"
+   - End with: "SECURITY: N issue(s) fixed." or "SECURITY: No issues found."
+
+══════════════════════════════════════════
+CRITICAL RULES
+══════════════════════════════════════════
+- Only review files from the current update — do not audit the entire codebase
+- Fix silently — do not ask questions, do not leave exploitable issues unfixed
+- Do NOT rewrite working code for non-security reasons
+- Only flag real, exploitable issues — not theoretical or style concerns
+- If everything is secure: output "SECURITY: No issues found."
+"""
+
+
+def _security_user_msg(
+    app_name: str,
+    template_key: str,
+    plan: dict[str, Any] | None,
+    prompt: str,
+    workspace: Path | None = None,
+) -> str:
+    framework = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(
+        template_key, template_key
+    )
+    plan_section = (
+        f"Files created/modified in this update:\n{json.dumps(plan, indent=2)}"
+        if plan
+        else "No structured plan — review files relevant to the change request below."
+    )
+    core_prompt = (
+        prompt.split("\nCURRENT REQUEST\n", 1)[-1].strip()
+        if "\nCURRENT REQUEST\n" in prompt
+        else prompt
+    )
+
+    workspace_section = ""
+    if workspace is not None:
+        scan = _scan_workspace(workspace)
+        workspace_section = (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "CURRENT FILE TREE\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + scan + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
+    return (
+        f"App: {app_name}\nFramework: {framework}\n\n"
+        f"Change request:\n{core_prompt[:600]}\n\n"
+        f"{plan_section}\n"
+        f"{workspace_section}\n"
+        "Review the files created/modified in this update for security vulnerabilities. "
+        "Fix any issues found with write_file, then output your security report starting with SECURITY:"
     )
 
 
@@ -1096,6 +1499,7 @@ def _ollama_loop(
     timeout: int = 300,
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
+    max_iterations: int = _MAX_ITERATIONS,
 ) -> tuple[str, int]:
     """Ollama tool-use agent loop. Returns (summary, 0) — Ollama doesn't expose token counts."""
     import requests as _req
@@ -1121,12 +1525,13 @@ def _ollama_loop(
         """Return anchor + the last _HISTORY_PAIRS*2 history messages."""
         return anchor + history[-(_HISTORY_PAIRS * 2):]
 
-    for iteration in range(_MAX_ITERATIONS):
+    for iteration in range(max_iterations):
         if cancel_fn and cancel_fn():
             if log_fn:
                 log_fn("warning", "Agent stopped by user.")
             return "Stopped by user.", 0
-        if iteration == _WARN_AT_ITERATION and log_fn:
+        warn_at = max(1, max_iterations - 10)
+        if iteration == warn_at and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
         try:
@@ -1374,6 +1779,53 @@ def _scan_workspace(workspace: Path, max_files: int = 300) -> str:
     return "\n".join(lines) if lines else "(empty workspace)"
 
 
+def _get_installed_packages(workspace: Path) -> str:
+    """Read pubspec.yaml or package.json and return the installed dependency names.
+
+    Injected into the executor prompt so the agent never imports a package
+    that isn't actually installed.
+    """
+    # Flutter
+    pubspec = workspace / "pubspec.yaml"
+    if pubspec.exists():
+        try:
+            text = pubspec.read_text(encoding="utf-8", errors="replace")
+            # Grab only the dependencies / dev_dependencies sections
+            lines: list[str] = []
+            in_deps = False
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped in ("dependencies:", "dev_dependencies:"):
+                    in_deps = True
+                    lines.append(stripped)
+                    continue
+                if in_deps:
+                    # Top-level key signals end of section
+                    if line and not line[0].isspace():
+                        in_deps = False
+                        continue
+                    if stripped and not stripped.startswith("#"):
+                        lines.append("  " + stripped)
+            return "pubspec.yaml dependencies:\n" + "\n".join(lines) if lines else ""
+        except Exception:
+            pass
+
+    # Next.js / React Native
+    pkg = workspace / "package.json"
+    if pkg.exists():
+        try:
+            import json as _json
+            data = _json.loads(pkg.read_text(encoding="utf-8", errors="replace"))
+            deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+            if deps:
+                names = "\n".join(f"  {k}: {v}" for k, v in sorted(deps.items()))
+                return f"package.json dependencies:\n{names}"
+        except Exception:
+            pass
+
+    return ""
+
+
 def _update_user_msg(
     app_name: str,
     template_key: str,
@@ -1400,6 +1852,7 @@ def _update_user_msg(
         scan = _scan_workspace(workspace)
         git_log = _get_git_log(workspace)
         recent_files = _get_recent_changed_files(workspace)
+        installed_pkgs = _get_installed_packages(workspace)
 
         git_section = ""
         if git_log:
@@ -1416,8 +1869,20 @@ def _update_user_msg(
                 git_section += f"\nFiles changed in recent commits:\n{recent_files}\n"
             git_section += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
 
+        pkg_section = (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "INSTALLED PACKAGES — ONLY import from these\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "These are the packages already in the manifest. "
+            "You MUST NOT import any package not in this list without first adding it to "
+            "pubspec.yaml / package.json.\n\n"
+            + installed_pkgs + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        ) if installed_pkgs else ""
+
         file_listing = (
             git_section
+            + pkg_section
             + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "EXISTING PROJECT FILES — read before creating anything\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1449,6 +1914,57 @@ def _update_user_msg(
     )
 
 
+def _update_user_msg_with_brief(
+    app_name: str,
+    template_key: str,
+    blueprint: dict[str, Any],
+    prompt: str,
+    plan: dict[str, Any] | None,
+    workspace: Path | None,
+    design_brief: str,
+) -> str:
+    """Like _update_user_msg but prepends the design agent's output so the executor knows
+    exactly which components and tokens were prepared."""
+    base = _update_user_msg(app_name, template_key, blueprint, prompt, plan, workspace)
+    if not design_brief:
+        return base
+    brief_block = (
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "DESIGN SYSTEM BRIEF — use these components and tokens\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + design_brief.strip() + "\n"
+        + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    return brief_block + base
+
+
+# Per-agent iteration budgets — focused agents get fewer iterations to save tokens
+_ITERS_DESIGN = 30
+_ITERS_EXEC = 50
+_ITERS_VALIDATE = 25
+_ITERS_SECURITY = 20
+_ITERS_FIX = 30
+
+
+def _should_skip_design(plan: dict[str, Any] | None) -> bool:
+    if not plan:
+        return False
+    if plan.get("skip_design_agent"):
+        return True
+    di = plan.get("design_impact") or {}
+    return (
+        not di.get("new_components_needed")
+        and not di.get("affects_theme")
+        and not di.get("signature_element_appears")
+    )
+
+
+def _should_skip_security(plan: dict[str, Any] | None) -> bool:
+    if not plan:
+        return False
+    return bool(plan.get("skip_security_agent"))
+
+
 def run_update_agent(
     workspace: Path,
     prompt: str,
@@ -1460,7 +1976,7 @@ def run_update_agent(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
-    """Plan → execute → validate using Claude/Anthropic."""
+    """Plan → design? → execute → validate → security? using Claude/Anthropic."""
     if log_fn:
         log_fn("thinking", "Planning changes…")
     plan = _call_planner(
@@ -1469,20 +1985,64 @@ def run_update_agent(
     )
     _log_plan(plan, log_fn)
     client = anthropic.Anthropic(api_key=api_key)
+    total_tokens = 0
+
+    if cancel_fn and cancel_fn():
+        return "Stopped by user.", 0
+
+    design_summary = ""
+    if not _should_skip_design(plan):
+        if log_fn:
+            log_fn("info", "━━━ Design system phase ━━━")
+            log_fn("thinking", "Preparing design system…")
+        design_summary, design_tokens = _loop(
+            client, model, _DESIGN_AGENT_SYSTEM, workspace,
+            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
+            log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+        )
+        total_tokens += design_tokens
+        if cancel_fn and cancel_fn():
+            return design_summary or "Stopped by user.", total_tokens
+    elif log_fn:
+        log_fn("info", "Design phase skipped — no new components or theme changes.")
+
+    if log_fn:
+        log_fn("info", "━━━ Execution phase ━━━")
     exec_summary, exec_tokens = _loop(
         client, model, _UPDATE_SYSTEM, workspace,
-        _update_user_msg(app_name, template_key, blueprint, prompt, plan, workspace), log_fn, cancel_fn,
+        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
+        log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
     )
+    total_tokens += exec_tokens
     if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", exec_tokens
+        return exec_summary or "Stopped by user.", total_tokens
+
     if log_fn:
         log_fn("info", "━━━ Validation phase ━━━")
         log_fn("thinking", "Validating implementation…")
     val_summary, val_tokens = _loop(
         client, model, _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace), log_fn, cancel_fn,
+        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
+        log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
     )
-    return val_summary or exec_summary, exec_tokens + val_tokens
+    total_tokens += val_tokens
+    if cancel_fn and cancel_fn():
+        return val_summary or exec_summary, total_tokens
+
+    if not _should_skip_security(plan):
+        if log_fn:
+            log_fn("info", "━━━ Security review phase ━━━")
+            log_fn("thinking", "Reviewing for security issues…")
+        sec_summary, sec_tokens = _loop(
+            client, model, _SECURITY_SYSTEM, workspace,
+            _security_user_msg(app_name, template_key, plan, prompt, workspace),
+            log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
+        )
+        total_tokens += sec_tokens
+    elif log_fn:
+        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
+
+    return val_summary or exec_summary, total_tokens
 
 
 def run_update_agent_ollama(
@@ -1497,7 +2057,7 @@ def run_update_agent_ollama(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
-    """Plan → execute → validate using Ollama/Qwen3."""
+    """Plan → design? → execute → validate → security? using Ollama/Qwen3."""
     if log_fn:
         log_fn("thinking", "Planning changes…")
     plan = _call_planner(
@@ -1505,20 +2065,64 @@ def run_update_agent_ollama(
         backend="Qwen3", base_url=base_url, ollama_model=model, ollama_timeout=timeout,
     )
     _log_plan(plan, log_fn)
+    total_tokens = 0
+
+    if cancel_fn and cancel_fn():
+        return "Stopped by user.", 0
+
+    design_summary = ""
+    if not _should_skip_design(plan):
+        if log_fn:
+            log_fn("info", "━━━ Design system phase ━━━")
+            log_fn("thinking", "Preparing design system…")
+        design_summary, design_tokens = _ollama_loop(
+            base_url, model, _DESIGN_AGENT_SYSTEM, workspace,
+            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
+            timeout, log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+        )
+        total_tokens += design_tokens
+        if cancel_fn and cancel_fn():
+            return design_summary or "Stopped by user.", total_tokens
+    elif log_fn:
+        log_fn("info", "Design phase skipped — no new components or theme changes.")
+
+    if log_fn:
+        log_fn("info", "━━━ Execution phase ━━━")
     exec_summary, exec_tokens = _ollama_loop(
         base_url, model, _UPDATE_SYSTEM, workspace,
-        _update_user_msg(app_name, template_key, blueprint, prompt, plan, workspace), timeout, log_fn, cancel_fn,
+        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
+        timeout, log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
     )
+    total_tokens += exec_tokens
     if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", exec_tokens
+        return exec_summary or "Stopped by user.", total_tokens
+
     if log_fn:
         log_fn("info", "━━━ Validation phase ━━━")
         log_fn("thinking", "Validating implementation…")
     val_summary, val_tokens = _ollama_loop(
         base_url, model, _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace), timeout, log_fn, cancel_fn,
+        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
+        timeout, log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
     )
-    return val_summary or exec_summary, exec_tokens + val_tokens
+    total_tokens += val_tokens
+    if cancel_fn and cancel_fn():
+        return val_summary or exec_summary, total_tokens
+
+    if not _should_skip_security(plan):
+        if log_fn:
+            log_fn("info", "━━━ Security review phase ━━━")
+            log_fn("thinking", "Reviewing for security issues…")
+        sec_summary, sec_tokens = _ollama_loop(
+            base_url, model, _SECURITY_SYSTEM, workspace,
+            _security_user_msg(app_name, template_key, plan, prompt, workspace),
+            timeout, log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
+        )
+        total_tokens += sec_tokens
+    elif log_fn:
+        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
+
+    return val_summary or exec_summary, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -1548,6 +2152,7 @@ def _gemini_loop(
     initial_user_msg: str,
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
+    max_iterations: int = _MAX_ITERATIONS,
 ) -> tuple[str, int]:
     """Gemini tool-use agent loop via REST API. Returns (summary, 0)."""
     import requests as _req
@@ -1559,12 +2164,13 @@ def _gemini_loop(
     write_calls = 0
     pushback_sent = False
 
-    for iteration in range(_MAX_ITERATIONS):
+    for iteration in range(max_iterations):
         if cancel_fn and cancel_fn():
             if log_fn:
                 log_fn("warning", "Agent stopped by user.")
             return "Stopped by user.", 0
-        if iteration == _WARN_AT_ITERATION and log_fn:
+        warn_at = max(1, max_iterations - 10)
+        if iteration == warn_at and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
         try:
@@ -1683,7 +2289,7 @@ def run_update_agent_gemini(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
-    """Plan then execute an update using Gemini."""
+    """Plan → design? → execute → validate → security? using Gemini."""
     if log_fn:
         log_fn("thinking", "Planning changes…")
     plan = _call_planner(
@@ -1691,20 +2297,64 @@ def run_update_agent_gemini(
         backend="gemini", api_key=api_key, model=model,
     )
     _log_plan(plan, log_fn)
+    total_tokens = 0
+
+    if cancel_fn and cancel_fn():
+        return "Stopped by user.", 0
+
+    design_summary = ""
+    if not _should_skip_design(plan):
+        if log_fn:
+            log_fn("info", "━━━ Design system phase ━━━")
+            log_fn("thinking", "Preparing design system…")
+        design_summary, design_tokens = _gemini_loop(
+            api_key, model, _DESIGN_AGENT_SYSTEM, workspace,
+            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
+            log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+        )
+        total_tokens += design_tokens
+        if cancel_fn and cancel_fn():
+            return design_summary or "Stopped by user.", total_tokens
+    elif log_fn:
+        log_fn("info", "Design phase skipped — no new components or theme changes.")
+
+    if log_fn:
+        log_fn("info", "━━━ Execution phase ━━━")
     exec_summary, exec_tokens = _gemini_loop(
         api_key, model, _UPDATE_SYSTEM, workspace,
-        _update_user_msg(app_name, template_key, blueprint, prompt, plan, workspace), log_fn, cancel_fn,
+        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
+        log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
     )
+    total_tokens += exec_tokens
     if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", exec_tokens
+        return exec_summary or "Stopped by user.", total_tokens
+
     if log_fn:
         log_fn("info", "━━━ Validation phase ━━━")
         log_fn("thinking", "Validating implementation…")
     val_summary, val_tokens = _gemini_loop(
         api_key, model, _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace), log_fn, cancel_fn,
+        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
+        log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
     )
-    return val_summary or exec_summary, exec_tokens + val_tokens
+    total_tokens += val_tokens
+    if cancel_fn and cancel_fn():
+        return val_summary or exec_summary, total_tokens
+
+    if not _should_skip_security(plan):
+        if log_fn:
+            log_fn("info", "━━━ Security review phase ━━━")
+            log_fn("thinking", "Reviewing for security issues…")
+        sec_summary, sec_tokens = _gemini_loop(
+            api_key, model, _SECURITY_SYSTEM, workspace,
+            _security_user_msg(app_name, template_key, plan, prompt, workspace),
+            log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
+        )
+        total_tokens += sec_tokens
+    elif log_fn:
+        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
+
+    return val_summary or exec_summary, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -1719,6 +2369,7 @@ def _openai_loop(
     initial_user_msg: str,
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
+    max_iterations: int = _MAX_ITERATIONS,
 ) -> tuple[str, int]:
     """OpenAI tool-use agent loop. Returns (summary, total_tokens)."""
     from openai import OpenAI
@@ -1734,12 +2385,13 @@ def _openai_loop(
     pushback_sent = False
     total_tokens = 0
 
-    for iteration in range(_MAX_ITERATIONS):
+    for iteration in range(max_iterations):
         if cancel_fn and cancel_fn():
             if log_fn:
                 log_fn("warning", "Agent stopped by user.")
             return "Stopped by user.", 0
-        if iteration == _WARN_AT_ITERATION and log_fn:
+        warn_at = max(1, max_iterations - 10)
+        if iteration == warn_at and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
         try:
@@ -1850,7 +2502,7 @@ def run_update_agent_openai(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
-    """Plan then execute an update using OpenAI/GPT."""
+    """Plan → design? → execute → validate → security? using OpenAI/GPT."""
     if log_fn:
         log_fn("thinking", "Planning changes…")
     plan = _call_planner(
@@ -1858,20 +2510,128 @@ def run_update_agent_openai(
         backend="gpt", api_key=api_key, model=model,
     )
     _log_plan(plan, log_fn)
+    total_tokens = 0
+
+    if cancel_fn and cancel_fn():
+        return "Stopped by user.", 0
+
+    design_summary = ""
+    if not _should_skip_design(plan):
+        if log_fn:
+            log_fn("info", "━━━ Design system phase ━━━")
+            log_fn("thinking", "Preparing design system…")
+        design_summary, design_tokens = _openai_loop(
+            api_key, model, _DESIGN_AGENT_SYSTEM, workspace,
+            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
+            log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+        )
+        total_tokens += design_tokens
+        if cancel_fn and cancel_fn():
+            return design_summary or "Stopped by user.", total_tokens
+    elif log_fn:
+        log_fn("info", "Design phase skipped — no new components or theme changes.")
+
+    if log_fn:
+        log_fn("info", "━━━ Execution phase ━━━")
     exec_summary, exec_tokens = _openai_loop(
         api_key, model, _UPDATE_SYSTEM, workspace,
-        _update_user_msg(app_name, template_key, blueprint, prompt, plan, workspace), log_fn, cancel_fn,
+        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
+        log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
     )
+    total_tokens += exec_tokens
     if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", exec_tokens
+        return exec_summary or "Stopped by user.", total_tokens
+
     if log_fn:
         log_fn("info", "━━━ Validation phase ━━━")
         log_fn("thinking", "Validating implementation…")
     val_summary, val_tokens = _openai_loop(
         api_key, model, _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace), log_fn, cancel_fn,
+        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
+        log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
     )
-    return val_summary or exec_summary, exec_tokens + val_tokens
+    total_tokens += val_tokens
+    if cancel_fn and cancel_fn():
+        return val_summary or exec_summary, total_tokens
+
+    if not _should_skip_security(plan):
+        if log_fn:
+            log_fn("info", "━━━ Security review phase ━━━")
+            log_fn("thinking", "Reviewing for security issues…")
+        sec_summary, sec_tokens = _openai_loop(
+            api_key, model, _SECURITY_SYSTEM, workspace,
+            _security_user_msg(app_name, template_key, plan, prompt, workspace),
+            log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
+        )
+        total_tokens += sec_tokens
+    elif log_fn:
+        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
+
+    return val_summary or exec_summary, total_tokens
+
+
+# ---------------------------------------------------------------------------
+# Fix agents — executor-only, no pipeline
+# Used by build_worker auto-fix loop to avoid running 5 agents per compile error.
+# ---------------------------------------------------------------------------
+
+def run_fix_agent(
+    workspace: Path,
+    prompt: str,
+    app_name: str,
+    template_key: str,
+    api_key: str,
+    model: str,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+) -> tuple[str, int]:
+    """Executor-only fix pass using Claude/Anthropic — no planner, design, validator, or security."""
+    import anthropic as _anthropic
+    client = _anthropic.Anthropic(api_key=api_key, timeout=180.0)
+    return _loop(client, model, _UPDATE_SYSTEM, workspace, prompt, log_fn, cancel_fn, max_iterations=_ITERS_FIX)
+
+
+def run_fix_agent_ollama(
+    workspace: Path,
+    prompt: str,
+    app_name: str,
+    template_key: str,
+    base_url: str,
+    model: str,
+    timeout: int = 300,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+) -> tuple[str, int]:
+    """Executor-only fix pass using Ollama/Qwen3."""
+    return _ollama_loop(base_url, model, _UPDATE_SYSTEM, workspace, prompt, timeout, log_fn, cancel_fn, max_iterations=_ITERS_FIX)
+
+
+def run_fix_agent_gemini(
+    workspace: Path,
+    prompt: str,
+    app_name: str,
+    template_key: str,
+    api_key: str,
+    model: str,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+) -> tuple[str, int]:
+    """Executor-only fix pass using Gemini."""
+    return _gemini_loop(api_key, model, _UPDATE_SYSTEM, workspace, prompt, log_fn, cancel_fn, max_iterations=_ITERS_FIX)
+
+
+def run_fix_agent_openai(
+    workspace: Path,
+    prompt: str,
+    app_name: str,
+    template_key: str,
+    api_key: str,
+    model: str,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+) -> tuple[str, int]:
+    """Executor-only fix pass using OpenAI/GPT."""
+    return _openai_loop(api_key, model, _UPDATE_SYSTEM, workspace, prompt, log_fn, cancel_fn, max_iterations=_ITERS_FIX)
 
 
 # ---------------------------------------------------------------------------
@@ -1886,6 +2646,7 @@ def _loop(
     initial_user_msg: str,
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
+    max_iterations: int = _MAX_ITERATIONS,
 ) -> tuple[str, int]:
     """Agent tool loop. Returns (summary, total_tokens_used)."""
     messages: list[dict[str, Any]] = [{"role": "user", "content": initial_user_msg}]
@@ -1893,12 +2654,13 @@ def _loop(
     write_calls = 0
     pushback_sent = False
 
-    for iteration in range(_MAX_ITERATIONS):
+    for iteration in range(max_iterations):
         if cancel_fn and cancel_fn():
             if log_fn:
                 log_fn("warning", "Agent stopped by user.")
             return "Stopped by user.", 0
-        if iteration == _WARN_AT_ITERATION and log_fn:
+        warn_at = max(1, max_iterations - 10)
+        if iteration == warn_at and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
         response = client.messages.create(

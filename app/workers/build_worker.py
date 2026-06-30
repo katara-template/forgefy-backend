@@ -114,16 +114,20 @@ def _run_agent_fix(
     settings,
     log_fn,
     retry_hint: bool = False,
-) -> None:
-    """Run the update agent to fix compilation errors (synchronous, safe for Celery)."""
+) -> str:
+    """Run the executor-only fix agent to repair compilation errors.
+
+    Returns the agent's summary string so callers can detect iteration-limit failures.
+    Deliberately bypasses the full Plan→Design→Execute→Validate→Security pipeline —
+    a compile error fix needs only the executor, not five agents.
+    """
     fix_prompt = _make_fix_prompt_with_hint(error_msg, template_key, retry_hint)
 
     if settings.BUILD_MODEL == "Qwen3":
-        from app.build.build_agent import run_update_agent_ollama
-        run_update_agent_ollama(
+        from app.build.build_agent import run_fix_agent_ollama
+        summary, _ = run_fix_agent_ollama(
             workspace=workspace_path,
             prompt=fix_prompt,
-            blueprint=blueprint,
             app_name=app_name,
             template_key=template_key,
             base_url=settings.OLLAMA_URL,
@@ -132,11 +136,10 @@ def _run_agent_fix(
             log_fn=log_fn,
         )
     elif settings.BUILD_MODEL == "gemini":
-        from app.build.build_agent import run_update_agent_gemini
-        run_update_agent_gemini(
+        from app.build.build_agent import run_fix_agent_gemini
+        summary, _ = run_fix_agent_gemini(
             workspace=workspace_path,
             prompt=fix_prompt,
-            blueprint=blueprint,
             app_name=app_name,
             template_key=template_key,
             api_key=settings.GEMINI_API_KEY,
@@ -144,11 +147,10 @@ def _run_agent_fix(
             log_fn=log_fn,
         )
     elif settings.BUILD_MODEL in ("gpt", "openai"):
-        from app.build.build_agent import run_update_agent_openai
-        run_update_agent_openai(
+        from app.build.build_agent import run_fix_agent_openai
+        summary, _ = run_fix_agent_openai(
             workspace=workspace_path,
             prompt=fix_prompt,
-            blueprint=blueprint,
             app_name=app_name,
             template_key=template_key,
             api_key=settings.OPENAI_API_KEY,
@@ -156,17 +158,17 @@ def _run_agent_fix(
             log_fn=log_fn,
         )
     else:
-        from app.build.build_agent import run_update_agent
-        run_update_agent(
+        from app.build.build_agent import run_fix_agent
+        summary, _ = run_fix_agent(
             workspace=workspace_path,
             prompt=fix_prompt,
-            blueprint=blueprint,
             app_name=app_name,
             template_key=template_key,
             api_key=settings.ANTHROPIC_API_KEY,
             model=settings.ANTHROPIC_MODEL,
             log_fn=log_fn,
         )
+    return summary or ""
 
 
 def _slugify(name: str) -> str:
@@ -179,7 +181,6 @@ def _cf_project_name(name: str) -> str:
     slug = re.sub(r"[^a-z0-9-]", "-", name.lower())
     slug = re.sub(r"-+", "-", slug).strip("-")
     return (slug or "forgefy-app")[:28].rstrip("-")
-
 
 def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
     import os
@@ -195,10 +196,25 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
     env["CLOUDFLARE_ACCOUNT_ID"] = settings.CLOUDFLARE_ACCOUNT_ID
     env["CLOUDFLARE_API_TOKEN"] = settings.CLOUDFLARE_API_TOKEN
     env["CI"] = "true"
-    # Stop wrangler from trying to open a browser for auth
     env["WRANGLER_SEND_METRICS"] = "false"
 
     try:
+        # Step 1: Ensure the project exists (create if missing)
+        create_result = subprocess.run(
+            [
+                "npx", "--yes", "wrangler@3", "pages", "project", "create", cf_name,
+                "--production-branch", "main",
+            ],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        create_output = create_result.stdout + create_result.stderr
+        if create_result.returncode == 0:
+            logger.info("Cloudflare Pages project '%s' created", cf_name)
+        else:
+            # Project likely already exists — this is fine
+            logger.info("Cloudflare Pages project '%s' may already exist: %s", cf_name, create_output[-300:])
+
+        # Step 2: Deploy
         result = subprocess.run(
             [
                 "npx", "--yes", "wrangler@3", "pages", "deploy", str(build_dir),
@@ -225,7 +241,6 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
             logger.warning("Wrangler succeeded but no pages.dev URL found in output")
         return None
     except subprocess.TimeoutExpired as exc:
-        # print exception error message and output for debugging
         print(f"Wrangler deploy timed out: {exc}")
         logger.warning("Cloudflare Pages deploy timed out after 180 s")
         return None
@@ -233,6 +248,60 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
         print(f"Wrangler deploy failed: {exc}")
         logger.warning("Cloudflare Pages deploy failed (non-fatal): %s", exc)
         return None
+
+
+# def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
+#     import os
+#     import subprocess
+
+#     settings = get_settings()
+#     if not settings.CLOUDFLARE_ACCOUNT_ID or not settings.CLOUDFLARE_API_TOKEN:
+#         logger.warning("Cloudflare Pages skipped — CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_API_TOKEN not set")
+#         return None
+
+#     cf_name = _cf_project_name(project_name)
+#     env = os.environ.copy()
+#     env["CLOUDFLARE_ACCOUNT_ID"] = settings.CLOUDFLARE_ACCOUNT_ID
+#     env["CLOUDFLARE_API_TOKEN"] = settings.CLOUDFLARE_API_TOKEN
+#     env["CI"] = "true"
+#     # Stop wrangler from trying to open a browser for auth
+#     env["WRANGLER_SEND_METRICS"] = "false"
+
+#     try:
+#         result = subprocess.run(
+#             [
+#                 "npx", "--yes", "wrangler@3", "pages", "deploy", str(build_dir),
+#                 "--project-name", cf_name,
+#                 "--branch", "main",
+#                 "--commit-dirty", "true",
+#             ],
+#             capture_output=True, text=True, env=env, timeout=180,
+#         )
+#         output = result.stdout + result.stderr
+#         logger.info("Wrangler output (rc=%d):\n%s", result.returncode, output[-1500:])
+
+#         match = re.search(r"https://[^\s]+\.pages\.dev[^\s]*", output)
+#         if match:
+#             url = match.group(0).rstrip(".")
+#             logger.info("Cloudflare Pages deployed → %s", url)
+#             return url
+
+#         if result.returncode != 0:
+#             print(f"Wrangler deploy failed with code {result.returncode}:\n{output}")
+#             logger.warning("Wrangler exited with code %d — deploy failed", result.returncode)
+#         else:
+#             print(f"Wrangler deploy succeeded but no pages.dev URL found:\n{output}")
+#             logger.warning("Wrangler succeeded but no pages.dev URL found in output")
+#         return None
+#     except subprocess.TimeoutExpired as exc:
+#         # print exception error message and output for debugging
+#         print(f"Wrangler deploy timed out: {exc}")
+#         logger.warning("Cloudflare Pages deploy timed out after 180 s")
+#         return None
+#     except Exception as exc:
+#         print(f"Wrangler deploy failed: {exc}")
+#         logger.warning("Cloudflare Pages deploy failed (non-fatal): %s", exc)
+#         return None
 
 
 def _deploy_appetize(apk_path: Path, api_token: str) -> str | None:
@@ -640,10 +709,15 @@ async def _run(session_id: str, project_id: str) -> dict:
                     retry_context = " (same error — trying a different approach)" if _same_err_streak > 0 else ""
                     log_fn("info", f"Compilation failed — running auto-fix (attempt {_fix_attempt}){retry_context}…")
                     logger.warning("Auto-fix triggered session=%s attempt=%d streak=%d: %s", session_id, _fix_attempt, _same_err_streak, _err[:200])
-                    _run_agent_fix(workspace.path, _err, template_key, app_name, json_output, settings, log_fn, retry_hint=_same_err_streak > 0)
+                    fix_summary = _run_agent_fix(workspace.path, _err, template_key, app_name, json_output, settings, log_fn, retry_hint=_same_err_streak > 0)
+                    hit_limit = "iteration limit" in fix_summary.lower()
                     workspace.commit_all("fix: auto-fix compilation errors")
                     workspace.push(push_url)
-                    log_fn("info", "Fixes applied — retrying compilation…")
+                    if hit_limit:
+                        log_fn("warning", "Fix agent hit its iteration limit — partial changes saved, retrying compilation…")
+                        _same_err_streak += 1  # treat limit as a stall
+                    else:
+                        log_fn("info", "Fixes applied — retrying compilation…")
 
             if artifact_path:
                 log_fn("info", "Compilation successful — deploying preview…")
@@ -850,12 +924,17 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
                 retry_context = " (same error — trying a different approach)" if _same_err_streak > 0 else ""
                 log_fn("info", f"Compilation failed — running auto-fix (attempt {_fix_attempt}){retry_context}…")
                 logger.warning("Auto-fix triggered project=%s attempt=%d streak=%d: %s", project_id, _fix_attempt, _same_err_streak, _err[:200])
-                _run_agent_fix(workspace.path, _err, template_key, app_name, blueprint, settings, log_fn, retry_hint=_same_err_streak > 0)
+                fix_summary = _run_agent_fix(workspace.path, _err, template_key, app_name, blueprint, settings, log_fn, retry_hint=_same_err_streak > 0)
+                hit_limit = "iteration limit" in fix_summary.lower()
                 workspace.sync_to_github(
                     commit_message="fix: auto-fix compilation errors",
                     push_url=push_url,
                 )
-                log_fn("info", "Fixes applied — retrying compilation…")
+                if hit_limit:
+                    log_fn("warning", "Fix agent hit its iteration limit — partial changes saved, retrying compilation…")
+                    _same_err_streak += 1  # treat limit as a stall
+                else:
+                    log_fn("info", "Fixes applied — retrying compilation…")
 
         preview_url: str | None = None
         artifact_url: str | None = None
