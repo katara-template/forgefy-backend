@@ -208,6 +208,11 @@ async def get_code_tree(
             continue
         files.append(path)
 
+    # .env.local is gitignored so it won't be in the GitHub tree.
+    # Inject it as a virtual file if the build saved its placeholder content.
+    if getattr(project, "env_local_template", None):
+        files.append(".env.local")
+
     return {"files": sorted(files)}
 
 
@@ -227,6 +232,13 @@ async def get_code_file(
     project = await _get_owned(project_id, user.id, db)
     if not project.repo_full_name:
         raise NotFoundError("No repository linked to this project")
+
+    # .env.local is gitignored — serve from the snapshot saved at build time
+    if path == ".env.local":
+        content = getattr(project, "env_local_template", None)
+        if not content:
+            raise NotFoundError(".env.local was not captured for this project")
+        return {"path": path, "content": content}
 
     settings = get_settings()
     token = await get_valid_github_token(str(user.id), settings.GITHUB_TOKEN)

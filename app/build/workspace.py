@@ -354,22 +354,48 @@ class EditWorkspace:
         ".flutter-plugins-dependencies",
         "__pycache__/",
         "*.pyc",
-        ".env",
+        "*.tsbuildinfo",
+        # .env is intentionally NOT gitignored — the agent only writes NEXT_PUBLIC_*,
+        # Supabase anon key, Firebase client config, and other public-safe placeholders.
+        # Truly secret keys go in .env.local which IS gitignored below.
         ".env.local",
         ".env*.local",
-        "*.tsbuildinfo",
     ]
 
+    # Bare .env patterns the template's .gitignore may ship that we strip so the
+    # agent's .env (placeholder values only) gets committed and pushed to GitHub.
+    _ENV_UNIGNORE = frozenset([".env", ".env.*", "*.env"])
+
     def _patch_gitignore(self) -> None:
-        """Ensure critical build-output patterns are always gitignored."""
+        """Patch .gitignore: add required ignores and remove bare .env rules.
+
+        Next.js (and most templates) ship with ".env" in their .gitignore, which
+        silently drops the agent's .env from every push. We strip those lines so
+        .env is committed (placeholder values only — safe to push), while keeping
+        .env.local / .env*.local ignored because those hold real user secrets.
+        """
         gitignore_path = self.path / ".gitignore"
         existing = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
+
+        cleaned, removed = [], 0
+        for line in existing.splitlines():
+            if line.strip() in self._ENV_UNIGNORE:
+                removed += 1
+            else:
+                cleaned.append(line)
+        existing = "\n".join(cleaned) + ("\n" if cleaned else "")
+
         missing = [p for p in self._REQUIRED_IGNORES if p not in existing]
-        if missing:
-            with gitignore_path.open("a", encoding="utf-8") as f:
-                f.write("\n# --- build outputs (auto-patched by Forgefy) ---\n")
-                f.write("\n".join(missing) + "\n")
-            logger.info("Patched .gitignore with %d missing entries", len(missing))
+        if removed or missing:
+            with gitignore_path.open("w", encoding="utf-8") as f:
+                f.write(existing)
+                if missing:
+                    f.write("\n# --- build outputs (auto-patched by Forgefy) ---\n")
+                    f.write("\n".join(missing) + "\n")
+            logger.info(
+                "Patched .gitignore: removed %d .env rule(s), added %d missing entries",
+                removed, len(missing),
+            )
 
     def sync_to_github(self, commit_message: str, push_url: str) -> bool:
         """Stage all changes, commit, rebase onto remote, then push.
@@ -379,8 +405,14 @@ class EditWorkspace:
         Agent changes always win on conflict — the agent's code is the canonical
         output for this update.
         """
-        # Always ensure node_modules and build outputs are ignored before staging.
+        # Patch .gitignore first (strips bare .env rules, adds required ignores).
         self._patch_gitignore()
+        # If .env was previously cached as ignored, untrack it so git add -A
+        # can now stage it as a regular file.
+        subprocess.run(
+            ["git", "rm", "--cached", "--ignore-unmatch", ".env"],
+            cwd=self.path, capture_output=True,
+        )
         _run(["git", "add", "-A"], cwd=self.path)
         nothing_staged = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],

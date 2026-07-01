@@ -183,6 +183,12 @@ def _cf_project_name(name: str) -> str:
     return (slug or "forgefy-app")[:28].rstrip("-")
 
 def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
+    """Deploy to Cloudflare Pages. Returns the preview URL on success.
+
+    Returns None (silently) only when credentials are not configured — that is a
+    soft skip, not a failure. Raises RuntimeError for all actual deploy failures
+    so the caller can surface the real error to the user.
+    """
     import os
     import subprocess
 
@@ -198,23 +204,25 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
     env["CI"] = "true"
     env["WRANGLER_SEND_METRICS"] = "false"
 
-    try:
-        # Step 1: Ensure the project exists (create if missing)
-        create_result = subprocess.run(
-            [
-                "npx", "--yes", "wrangler@3", "pages", "project", "create", cf_name,
-                "--production-branch", "main",
-            ],
-            capture_output=True, text=True, env=env, timeout=30,
+    # Step 1: Ensure the project exists (create if missing — ignore failure,
+    # project likely already exists)
+    create_result = subprocess.run(
+        [
+            "npx", "--yes", "wrangler@3", "pages", "project", "create", cf_name,
+            "--production-branch", "main",
+        ],
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+    if create_result.returncode == 0:
+        logger.info("Cloudflare Pages project '%s' created", cf_name)
+    else:
+        logger.info(
+            "Cloudflare Pages project '%s' may already exist: %s",
+            cf_name, (create_result.stdout + create_result.stderr)[-300:],
         )
-        create_output = create_result.stdout + create_result.stderr
-        if create_result.returncode == 0:
-            logger.info("Cloudflare Pages project '%s' created", cf_name)
-        else:
-            # Project likely already exists — this is fine
-            logger.info("Cloudflare Pages project '%s' may already exist: %s", cf_name, create_output[-300:])
 
-        # Step 2: Deploy
+    # Step 2: Deploy
+    try:
         result = subprocess.run(
             [
                 "npx", "--yes", "wrangler@3", "pages", "deploy", str(build_dir),
@@ -224,30 +232,27 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
             ],
             capture_output=True, text=True, env=env, timeout=180,
         )
-        output = result.stdout + result.stderr
-        logger.info("Wrangler output (rc=%d):\n%s", result.returncode, output[-1500:])
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Cloudflare Pages deploy timed out after 180 s — try again or check your Cloudflare dashboard.")
 
-        match = re.search(r"https://[^\s]+\.pages\.dev[^\s]*", output)
-        if match:
-            url = match.group(0).rstrip(".")
-            logger.info("Cloudflare Pages deployed → %s", url)
-            return url
+    output = (result.stdout + result.stderr).strip()
+    logger.info("Wrangler output (rc=%d):\n%s", result.returncode, output[-1500:])
 
-        if result.returncode != 0:
-            print(f"Wrangler deploy failed with code {result.returncode}:\n{output}")
-            logger.warning("Wrangler exited with code %d — deploy failed", result.returncode)
-        else:
-            print(f"Wrangler deploy succeeded but no pages.dev URL found:\n{output}")
-            logger.warning("Wrangler succeeded but no pages.dev URL found in output")
-        return None
-    except subprocess.TimeoutExpired as exc:
-        print(f"Wrangler deploy timed out: {exc}")
-        logger.warning("Cloudflare Pages deploy timed out after 180 s")
-        return None
-    except Exception as exc:
-        print(f"Wrangler deploy failed: {exc}")
-        logger.warning("Cloudflare Pages deploy failed (non-fatal): %s", exc)
-        return None
+    match = re.search(r"https://[^\s]+\.pages\.dev[^\s]*", output)
+    if match:
+        url = match.group(0).rstrip(".")
+        logger.info("Cloudflare Pages deployed → %s", url)
+        return url
+
+    # No URL found — surface the real wrangler output as the error
+    snippet = output[-800:] if len(output) > 800 else output
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Cloudflare Pages deploy failed (exit {result.returncode}):\n{snippet}"
+        )
+    raise RuntimeError(
+        f"Cloudflare Pages deploy succeeded but no pages.dev URL was returned:\n{snippet}"
+    )
 
 
 # def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
@@ -449,6 +454,10 @@ async def _run(session_id: str, project_id: str) -> dict:
 
     settings = get_settings()
     db = refresh_async_firestore_client()  # bind fresh gRPC channel to this event loop
+
+    # Wipe any stale cancel flag before starting fresh work.
+    from app.build.cancel import clear_cancel
+    clear_cancel(settings.REDIS_URL, session_id)
 
     # 1. Load approved blueprint
     bp = await _load_approved_blueprint(session_id)
@@ -681,8 +690,10 @@ async def _run(session_id: str, project_id: str) -> dict:
             _fix_attempt = 0
             _prev_err: str | None = None
             _same_err_streak = 0
+            _hit_limit_streak = 0
             _MAX_FIX = 10
-            _MAX_SAME_STREAK = 3  # only give up if identical error 3 times in a row
+            _MAX_SAME_STREAK = 3
+            _MAX_HIT_LIMIT_STREAK = 2  # stop immediately after 2 consecutive iteration-limit hits
             from app.build.cancel import is_cancelled, clear_cancel
             while True:
                 if is_cancelled(settings.REDIS_URL, session_id):
@@ -714,9 +725,19 @@ async def _run(session_id: str, project_id: str) -> dict:
                     workspace.commit_all("fix: auto-fix compilation errors")
                     workspace.push(push_url)
                     if hit_limit:
+                        _hit_limit_streak += 1
+                        if _hit_limit_streak >= _MAX_HIT_LIMIT_STREAK:
+                            log_fn("warning",
+                                "The fix agent hit its step limit multiple times — the errors are too "
+                                "complex to auto-fix. Send a chat message like 'Fix the build errors' "
+                                "and the agent will resolve them with full context.")
+                            raise _BuildFixExhausted(
+                                f"Fix agent hit iteration limit {_hit_limit_streak} times consecutively"
+                            ) from _compile_exc
                         log_fn("warning", "Fix agent hit its iteration limit — partial changes saved, retrying compilation…")
-                        _same_err_streak += 1  # treat limit as a stall
+                        _same_err_streak += 1
                     else:
+                        _hit_limit_streak = 0
                         log_fn("info", "Fixes applied — retrying compilation…")
 
             if artifact_path:
@@ -759,8 +780,13 @@ async def _run(session_id: str, project_id: str) -> dict:
         await _patch_blueprint(blueprint_id, bp_updates)
 
         # 13. Update project doc with final values
+        # Capture .env.local placeholder content before workspace is deleted so the
+        # code viewer can display it (the file is gitignored and won't be on GitHub).
+        env_local_path = workspace.path / ".env.local"
+        env_local_content = env_local_path.read_text(encoding="utf-8") if env_local_path.exists() else None
+
         now = datetime.now(timezone.utc)
-        await db.collection("projects").document(project_id).update({
+        proj_update: dict = {
             "repo_full_name": repo_full_name,
             "github_url": repo_url,
             "repo_owner": "platform" if using_platform_github else "user",
@@ -769,7 +795,10 @@ async def _run(session_id: str, project_id: str) -> dict:
             "is_updating": False,
             "build_error": None,
             "updated_at": now,
-        })
+        }
+        if env_local_content is not None:
+            proj_update["env_local_template"] = env_local_content
+        await db.collection("projects").document(project_id).update(proj_update)
 
         clean_summary = (summary or "").strip()
         if clean_summary.upper().startswith("DONE"):
@@ -862,6 +891,10 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
     settings = get_settings()
     db = refresh_async_firestore_client()
 
+    # Wipe any stale cancel flag before starting fresh work.
+    from app.build.cancel import clear_cancel as _clear_cancel
+    _clear_cancel(settings.REDIS_URL, project_id)
+
     doc = await db.collection("projects").document(project_id).get()
     if not doc.exists:
         raise ValueError(f"Project {project_id} not found")
@@ -896,8 +929,10 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         _fix_attempt = 0
         _prev_err: str | None = None
         _same_err_streak = 0
+        _hit_limit_streak = 0
         _MAX_FIX = 10
         _MAX_SAME_STREAK = 3
+        _MAX_HIT_LIMIT_STREAK = 2
         from app.build.cancel import is_cancelled, clear_cancel
         while True:
             if is_cancelled(settings.REDIS_URL, project_id):
@@ -931,9 +966,19 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
                     push_url=push_url,
                 )
                 if hit_limit:
+                    _hit_limit_streak += 1
+                    if _hit_limit_streak >= _MAX_HIT_LIMIT_STREAK:
+                        log_fn("warning",
+                            "The fix agent hit its step limit multiple times — the errors are too "
+                            "complex to auto-fix. Send a chat message like 'Fix the build errors' "
+                            "and the agent will resolve them with full context.")
+                        raise _BuildFixExhausted(
+                            f"Fix agent hit iteration limit {_hit_limit_streak} times consecutively"
+                        ) from _compile_exc
                     log_fn("warning", "Fix agent hit its iteration limit — partial changes saved, retrying compilation…")
-                    _same_err_streak += 1  # treat limit as a stall
+                    _same_err_streak += 1
                 else:
+                    _hit_limit_streak = 0
                     log_fn("info", "Fixes applied — retrying compilation…")
 
         preview_url: str | None = None
@@ -942,12 +987,14 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         if artifact_path:
             log_fn("info", "Compilation successful — deploying preview…")
 
-            if template_key == "flutter" and artifact_path.is_file() and settings.APPETIZE_API_TOKEN:
-                preview_url = _deploy_appetize(artifact_path, settings.APPETIZE_API_TOKEN)
-            elif template_key == "next" and artifact_path.is_dir():
-                preview_url = _deploy_cloudflare_pages(artifact_path, app_name)
-            elif template_key == "react_native" and artifact_path.is_dir():
-                preview_url = _deploy_cloudflare_pages(artifact_path, app_name)
+            try:
+                if template_key == "flutter" and artifact_path.is_file() and settings.APPETIZE_API_TOKEN:
+                    preview_url = _deploy_appetize(artifact_path, settings.APPETIZE_API_TOKEN)
+                elif template_key in ("next", "react_native") and artifact_path.is_dir():
+                    preview_url = _deploy_cloudflare_pages(artifact_path, app_name)
+            except Exception as deploy_exc:
+                logger.warning("Cloudflare deploy failed project=%s: %s", project_id, deploy_exc)
+                log_fn("warning", f"Preview deployment failed:\n{deploy_exc}")
 
             if settings.CLOUDINARY_CLOUD_NAME:
                 artifact_url = _upload_artifact(artifact_path, session_id)
@@ -959,8 +1006,9 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         if preview_url:
             updates["preview_url"] = preview_url
             log_fn("done", f"Preview deployed → {preview_url}")
-        else:
-            log_fn("warning", "Preview deployment skipped — no artifact or missing deploy credentials.", )
+        elif artifact_path and not preview_url:
+            # Artifact compiled fine but deploy returned None — credentials not configured
+            log_fn("info", "Preview not deployed — Cloudflare credentials not configured on this server.")
         if artifact_url:
             updates["artifact_url"] = artifact_url
 
