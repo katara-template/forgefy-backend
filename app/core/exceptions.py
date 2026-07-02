@@ -49,6 +49,11 @@ class ValidationError(ForgefyError):
     title = "Unprocessable Entity"
 
 
+class RateLimitedError(ForgefyError):
+    status_code = 429
+    title = "Too Many Requests"
+
+
 class InvalidStateTransition(ForgefyError):
     """Raised when a state machine transition is not permitted."""
 

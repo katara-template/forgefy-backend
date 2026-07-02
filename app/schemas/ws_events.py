@@ -6,10 +6,9 @@ Server→Client messages are serialized the same way.
 from __future__ import annotations
 
 import uuid
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
-
 
 # ── Client → Server ───────────────────────────────────────────────────────────
 
@@ -35,7 +34,7 @@ class PingEvent(BaseModel):
 
 
 ClientEvent = Annotated[
-    Union[JoinSessionEvent, StreamAudioEvent, EndMeetingEvent, PingEvent],
+    JoinSessionEvent | StreamAudioEvent | EndMeetingEvent | PingEvent,
     Field(discriminator="type"),
 ]
 

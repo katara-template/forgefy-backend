@@ -18,8 +18,8 @@ _CHANNEL_PREFIX = "voxa:session:"
 
 async def _run_aggregation(session_id: str) -> str:
     """Run BlueprintAggregator in an async context; return blueprint_id string."""
-    from app.db.firebase import refresh_async_firestore_client
     from app.build.blueprint_generator import BlueprintAggregator
+    from app.db.firebase import refresh_async_firestore_client
 
     db = refresh_async_firestore_client()
     aggregator = BlueprintAggregator(db)
@@ -43,6 +43,8 @@ async def _mark_session_failed(session_id: str) -> None:
     max_retries=2,
     time_limit=360,       # hard kill after 6 min
     soft_time_limit=300,  # SoftTimeLimitExceeded raised at 5 min
+    acks_late=True,
+    reject_on_worker_lost=True,
 )
 def generate_blueprint(self, session_id: str) -> None:
     """Aggregate requirements, create Blueprint document, notify via Redis."""

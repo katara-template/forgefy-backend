@@ -16,7 +16,7 @@ no live Firebase or Anthropic credentials are needed.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -53,7 +53,7 @@ def _session_doc(status: str = "PROCESSING", platform: str = "physical") -> Magi
         "meeting_url": None,
         "start_time": None,
         "end_time": None,
-        "created_at": datetime.now(timezone.utc),
+        "created_at": datetime.now(UTC),
     }
     return doc
 
@@ -63,7 +63,7 @@ def _event_doc(event_type: str, payload: dict) -> MagicMock:
     doc.to_dict.return_value = {
         "event_type": event_type,
         "payload": payload,
-        "timestamp": datetime.now(timezone.utc),
+        "timestamp": datetime.now(UTC),
     }
     return doc
 
@@ -108,7 +108,7 @@ def _session_obj(status: SessionStatus = SessionStatus.BLUEPRINT_READY) -> Meeti
         meeting_url=None,
         start_time=None,
         end_time=None,
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
     )
 
 

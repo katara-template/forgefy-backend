@@ -5,7 +5,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app.core.exceptions import ValidationError
-from app.deps import CurrentUser, DBSession
+from app.deps import AdminUser, DBSession
 
 router = APIRouter()
 
@@ -21,7 +21,7 @@ class SetBuildModelRequest(BaseModel):
 
 
 @router.get("/build-model", response_model=BuildModelResponse)
-async def get_build_model_setting(db: DBSession, user: CurrentUser) -> BuildModelResponse:
+async def get_build_model_setting(db: DBSession, user: AdminUser) -> BuildModelResponse:
     """Return the active build model (Firestore override takes precedence over .env)."""
     from app.config import get_settings
 
@@ -35,7 +35,7 @@ async def get_build_model_setting(db: DBSession, user: CurrentUser) -> BuildMode
 async def set_build_model_setting(
     body: SetBuildModelRequest,
     db: DBSession,
-    user: CurrentUser,
+    user: AdminUser,
 ) -> BuildModelResponse:
     """Persist a new build model to Firestore (takes effect on the next build/update)."""
     if body.model not in VALID_BUILD_MODELS:

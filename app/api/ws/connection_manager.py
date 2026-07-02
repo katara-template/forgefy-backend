@@ -5,7 +5,6 @@ Redis pub/sub message to every local subscriber of that session.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid

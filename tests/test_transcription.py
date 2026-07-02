@@ -6,10 +6,8 @@ from __future__ import annotations
 
 import base64
 import json
-import threading
 import uuid
-from unittest.mock import MagicMock, call, patch
-
+from unittest.mock import MagicMock, patch
 
 # ── TranscriptionSession unit tests ──────────────────────────────────────────
 
@@ -46,6 +44,8 @@ class TestTranscriptionSession:
         return s, session_id, mock_redis_instance
 
     def test_connect_registers_message_callback(self):
+        from deepgram.listen.v1.socket_client import EventType
+
         conn = MagicMock()
         conn.start_listening = MagicMock()
 
@@ -55,7 +55,10 @@ class TestTranscriptionSession:
 
             session, sid, _ = self._make_session(conn, MagicMock())
 
-        conn.on.assert_called_once()
+        # Connect registers both a message callback and an error callback.
+        assert conn.on.call_count == 2
+        registered_events = {call.args[0] for call in conn.on.call_args_list}
+        assert registered_events == {EventType.MESSAGE, EventType.ERROR}
         mock_thread.start.assert_called_once()
 
     def test_send_chunk_forwards_bytes(self):

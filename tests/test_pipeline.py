@@ -6,8 +6,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from unittest.mock import MagicMock, call, patch
-
+from unittest.mock import MagicMock, patch
 
 # ── Agent base tests ──────────────────────────────────────────────────────────
 
@@ -184,7 +183,7 @@ class TestExtractionWorker:
         mock_redis = MagicMock()
 
         with (
-            patch("app.workers.extraction_worker.run_pipeline", return_value=events),
+            patch("app.workers.extraction_worker._run_extraction", return_value=events),
             patch("app.workers.extraction_worker.sync_redis.from_url", return_value=mock_redis),
         ):
             extract_requirements(session_id, "some transcript")
@@ -204,7 +203,7 @@ class TestExtractionWorker:
         mock_redis = MagicMock()
 
         with (
-            patch("app.workers.extraction_worker.run_pipeline", return_value=[]),
+            patch("app.workers.extraction_worker._run_extraction", return_value=[]),
             patch("app.workers.extraction_worker.sync_redis.from_url", return_value=mock_redis),
         ):
             extract_requirements(session_id, "silent meeting")

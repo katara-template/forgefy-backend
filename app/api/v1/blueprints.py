@@ -7,11 +7,10 @@ Firestore collections used:
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter
 from google.cloud.firestore import AsyncClient
-
 from pydantic import BaseModel
 
 from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
@@ -193,7 +192,7 @@ async def approve_blueprint(
     raw_name = json_out.get("app_name") or (json_out.get("app_description") or "")[:40] or f"app-{str(blueprint.session_id)[:8]}"
     stub_app_name = re.sub(r"[^a-zA-Z0-9._-]", "-", raw_name).strip("-").lower()[:100] or "forgefy-app"
     stub_template = json_out.get("template", "next")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     await db.collection("projects").document(project_id).set({
         "owner_id": str(user.id),
         "session_id": str(blueprint.session_id),

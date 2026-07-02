@@ -17,13 +17,13 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from google.cloud.firestore import AsyncClient
 
 from app.db.models.blueprint import Blueprint
-from app.db.models.enums import SessionStatus, Platform
+from app.db.models.enums import Platform, SessionStatus
 from app.db.models.meeting_session import MeetingSession
 from app.modules.voxa.state_machine import MeetingStateMachine
 
@@ -183,7 +183,7 @@ class BlueprintAggregator:
             json_output["design_system"] = await self._generate_design_system(json_output)
 
         platform = _detect_platform(json_output)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         feature_count = len(json_output.get("features", []))
 
         if platform == "both":
@@ -253,8 +253,9 @@ class BlueprintAggregator:
 
     async def _derive_features(self, description: str) -> list[dict]:
         """Ask the AI to infer likely features from the app description when none were extracted."""
-        from app.config import get_settings
         import json as _json
+
+        from app.config import get_settings
 
         settings = get_settings()
         try:
@@ -357,8 +358,9 @@ class BlueprintAggregator:
                 )
                 raw = result.get("app_name", "").strip().strip('"').strip("'")
             else:
-                import anthropic
                 import json as _json
+
+                import anthropic
                 client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=120.0)
                 msg = client.messages.create(
                     model=settings.ANTHROPIC_MODEL,
@@ -382,8 +384,9 @@ class BlueprintAggregator:
 
     async def _generate_design_system(self, blueprint: dict[str, Any]) -> dict:
         """Ask the AI to generate a design_system block tailored to this app's domain."""
-        from app.config import get_settings
         import json as _json
+
+        from app.config import get_settings
 
         settings = get_settings()
 
@@ -525,7 +528,7 @@ class BlueprintAggregator:
             "version": "1.0",
             "session_id": str(session_id),
             "session_platform": session.platform.value,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": datetime.now(UTC).isoformat(),
             "app_name": app_name,
             "app_description": app_description,
             "features": features,
@@ -556,7 +559,7 @@ def _build_blueprint_json(
         "version": "1.0",
         "session_id": str(session.id),
         "session_platform": session.platform.value,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "app_name": app_name,
         "app_description": app_description,
         "features": features,

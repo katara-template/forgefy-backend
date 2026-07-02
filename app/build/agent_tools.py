@@ -187,7 +187,8 @@ def _ensure_extension(filename: str, default_ext: str) -> str:
 
 def _placeholder_png() -> bytes:
     """Return a minimal valid 1×1 transparent PNG (no external deps)."""
-    import struct, zlib
+    import struct
+    import zlib
     def chunk(tag: bytes, data: bytes) -> bytes:
         c = struct.pack(">I", len(data)) + tag + data
         return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
@@ -274,6 +275,7 @@ def _generate_image(
     try:
         import fal_client
         import httpx
+
         from app.config import get_settings
 
         settings = get_settings()
@@ -342,6 +344,7 @@ def _generate_video(
     try:
         import fal_client
         import httpx
+
         from app.config import get_settings
 
         settings = get_settings()

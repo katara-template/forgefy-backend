@@ -10,7 +10,7 @@ LISTENING sub-states (FEATURE_FOUND, QUESTION_FOUND, CONFLICT_FOUND,
 ACTION_ITEM_FOUND) are logged as events but do not change session.status.
 """
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from google.cloud.firestore import AsyncClient
 
@@ -72,7 +72,7 @@ class MeetingStateMachine:
         if extra_payload:
             payload.update(extra_payload)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         event_id = str(uuid.uuid4())
         await (
             self._db.collection("sessions")
@@ -119,6 +119,6 @@ class MeetingStateMachine:
                 "session_id": str(session_id),
                 "event_type": f"segment.{sub_state.lower()}",
                 "payload": payload or {},
-                "timestamp": datetime.now(timezone.utc),
+                "timestamp": datetime.now(UTC),
             })
         )

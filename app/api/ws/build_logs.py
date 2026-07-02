@@ -72,7 +72,7 @@ async def ws_build_logs(
             while True:
                 try:
                     await asyncio.wait_for(ws.receive_text(), timeout=25.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Heartbeat so the connection stays alive
                     await ws.send_json({"type": "ping"})
                 except WebSocketDisconnect:

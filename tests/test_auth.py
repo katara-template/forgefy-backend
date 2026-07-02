@@ -1,13 +1,13 @@
 """Auth endpoint tests: register / login / refresh."""
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 from httpx import AsyncClient
 
 from app.config import get_settings
 from app.core.security import create_access_token, create_refresh_token, hash_password
-from app.db.models.user import User
+from tests.conftest import make_doc_snapshot
 
 settings = get_settings()
 
@@ -15,23 +15,28 @@ settings = get_settings()
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _make_user(
+def _user_doc(
     email: str = "test@example.com",
     password: str = "password123",
-) -> User:
-    """Return an unsaved User ORM object with a hashed password."""
-    return User(
-        id=uuid.uuid4(),
-        email=email,
-        hashed_password=hash_password(password),
+    doc_id: str | None = None,
+) -> MagicMock:
+    """A Firestore user document snapshot with a hashed password."""
+    return make_doc_snapshot(
+        {
+            "email": email,
+            "hashed_password": hash_password(password),
+            "tier": "free",
+            "is_admin": False,
+            "created_at": datetime.now(UTC),
+            "updated_at": datetime.now(UTC),
+        },
+        doc_id=doc_id or str(uuid.uuid4()),
     )
 
 
-def _mock_result(value: object) -> MagicMock:
-    """Return a mock SQLAlchemy result whose scalar_one_or_none() returns value."""
-    result = MagicMock()
-    result.scalar_one_or_none.return_value = value
-    return result
+def _set_email_query_result(mock_db: MagicMock, docs: list) -> None:
+    """Configure db.collection("users").where("email", ...).limit(1).get()."""
+    mock_db.collection.return_value.where.return_value.limit.return_value.get.return_value = docs
 
 
 # ── Register ──────────────────────────────────────────────────────────────────
@@ -39,9 +44,9 @@ def _mock_result(value: object) -> MagicMock:
 
 class TestRegister:
     async def test_success_returns_tokens(
-        self, client: AsyncClient, mock_session: AsyncMock
+        self, client: AsyncClient, mock_db: MagicMock
     ) -> None:
-        mock_session.execute.return_value = _mock_result(None)
+        _set_email_query_result(mock_db, [])
 
         resp = await client.post(
             "/api/v1/auth/register",
@@ -55,9 +60,9 @@ class TestRegister:
         assert "refresh_token" in body
 
     async def test_duplicate_email_returns_409(
-        self, client: AsyncClient, mock_session: AsyncMock
+        self, client: AsyncClient, mock_db: MagicMock
     ) -> None:
-        mock_session.execute.return_value = _mock_result(_make_user())
+        _set_email_query_result(mock_db, [_user_doc(email="taken@example.com")])
 
         resp = await client.post(
             "/api/v1/auth/register",
@@ -67,9 +72,7 @@ class TestRegister:
         assert resp.status_code == 409
         assert resp.headers["content-type"] == "application/problem+json"
 
-    async def test_short_password_returns_422(
-        self, client: AsyncClient, mock_session: AsyncMock
-    ) -> None:
+    async def test_short_password_returns_422(self, client: AsyncClient) -> None:
         resp = await client.post(
             "/api/v1/auth/register",
             json={"email": "new@example.com", "password": "short"},
@@ -77,9 +80,7 @@ class TestRegister:
 
         assert resp.status_code == 422
 
-    async def test_invalid_email_returns_422(
-        self, client: AsyncClient, mock_session: AsyncMock
-    ) -> None:
+    async def test_invalid_email_returns_422(self, client: AsyncClient) -> None:
         resp = await client.post(
             "/api/v1/auth/register",
             json={"email": "not-an-email", "password": "password123"},
@@ -93,10 +94,10 @@ class TestRegister:
 
 class TestLogin:
     async def test_success_returns_tokens(
-        self, client: AsyncClient, mock_session: AsyncMock
+        self, client: AsyncClient, mock_db: MagicMock
     ) -> None:
-        user = _make_user(password="correct_password")
-        mock_session.execute.return_value = _mock_result(user)
+        doc = _user_doc(email="test@example.com", password="correct_password")
+        _set_email_query_result(mock_db, [doc])
 
         resp = await client.post(
             "/api/v1/auth/login",
@@ -109,10 +110,10 @@ class TestLogin:
         assert "access_token" in body
 
     async def test_wrong_password_returns_401(
-        self, client: AsyncClient, mock_session: AsyncMock
+        self, client: AsyncClient, mock_db: MagicMock
     ) -> None:
-        user = _make_user(password="correct_password")
-        mock_session.execute.return_value = _mock_result(user)
+        doc = _user_doc(email="test@example.com", password="correct_password")
+        _set_email_query_result(mock_db, [doc])
 
         resp = await client.post(
             "/api/v1/auth/login",
@@ -122,9 +123,9 @@ class TestLogin:
         assert resp.status_code == 401
 
     async def test_unknown_email_returns_401(
-        self, client: AsyncClient, mock_session: AsyncMock
+        self, client: AsyncClient, mock_db: MagicMock
     ) -> None:
-        mock_session.execute.return_value = _mock_result(None)
+        _set_email_query_result(mock_db, [])
 
         resp = await client.post(
             "/api/v1/auth/login",
@@ -132,6 +133,20 @@ class TestLogin:
         )
 
         assert resp.status_code == 401
+
+    async def test_locked_out_account_returns_429(
+        self, client: AsyncClient, mock_db: MagicMock, mock_redis: AsyncMock
+    ) -> None:
+        doc = _user_doc(email="test@example.com", password="correct_password")
+        _set_email_query_result(mock_db, [doc])
+        mock_redis.get.return_value = "5"  # at the lockout threshold
+
+        resp = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "test@example.com", "password": "correct_password"},
+        )
+
+        assert resp.status_code == 429
 
 
 # ── Refresh ───────────────────────────────────────────────────────────────────

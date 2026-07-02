@@ -32,8 +32,8 @@ Deepgram WS     LangGraph pipeline    BlueprintAggregator
 
 ## Requirements
 
-- Python 3.11+
-- PostgreSQL 15 with pgvector extension
+- Python 3.12+
+- A Firebase project with Firestore enabled, plus a service-account key
 - Redis 7
 - Deepgram API key (live transcription)
 - Anthropic API key (Claude claude-sonnet-4-5 for agent pipeline)
@@ -42,13 +42,14 @@ Deepgram WS     LangGraph pipeline    BlueprintAggregator
 
 ## Environment Variables
 
-Copy `.env.example` to `.env` and fill in your values:
+Copy `.env.example` to `.env` and fill in your values. Below are the variables most relevant to getting a local instance running — see `.env.example` for the full list (Cloudinary, Cloudflare, GitHub OAuth, Recall.ai, NotchPay, Sentry, etc. are optional integrations, not required to boot the app).
 
 | Variable | Default | Description |
 |---|---|---|
 | `APP_ENV` | `development` | `development` / `production` |
 | `SECRET_KEY` | `changeme` | JWT signing secret — **change in production** |
-| `DATABASE_URL` | `postgresql+asyncpg://voxa:voxa@localhost:5432/voxa` | Async PostgreSQL URL |
+| `FIREBASE_CREDENTIALS_JSON` | *(empty)* | Base64-encoded Firebase service-account JSON (preferred for prod/Docker) |
+| `FIREBASE_CREDENTIALS_PATH` | `firebase-credentials.json` | Path to the service-account JSON file (used if the JSON var above is unset — convenient for local dev) |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis for pub/sub and app state |
 | `CELERY_BROKER_URL` | `redis://localhost:6379/1` | Celery broker |
 | `CELERY_RESULT_BACKEND` | `redis://localhost:6379/2` | Celery result store |
@@ -72,20 +73,20 @@ Copy `.env.example` to `.env` and fill in your values:
 ```bash
 python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
-pip install -e ".[dev]"
+pip install -r requirements.txt
 ```
 
-### 2. Start infrastructure (PostgreSQL + Redis)
+`requirements.txt` is the source of truth for dependencies (it's what the Docker image installs too) and already includes the dev/test tooling (pytest, ruff, mypy, black).
+
+### 2. Start infrastructure (Redis)
 
 ```bash
-docker compose up postgres redis -d
+docker compose up redis -d
 ```
 
-### 3. Run database migrations
+### 3. Set up Firestore credentials
 
-```bash
-alembic upgrade head
-```
+Download a service-account key from Firebase Console → Project settings → Service accounts, save it as `firebase-credentials.json` in the repo root (already gitignored), and leave `FIREBASE_CREDENTIALS_JSON` unset in `.env` — the app will fall back to `FIREBASE_CREDENTIALS_PATH`.
 
 ### 4. Start the API server
 
@@ -93,7 +94,7 @@ alembic upgrade head
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-API docs at [http://localhost:5000/docs](http://localhost:5000/docs)
+API docs at [http://localhost:8000/docs](http://localhost:8000/docs) in development (disabled in production).
 
 ### 5. Start Celery workers (separate terminals)
 
@@ -107,6 +108,18 @@ celery -A app.workers.celery_app worker -Q meeting.transcribe -c 2 --loglevel=in
 # Blueprint worker (meeting.extract queue)
 celery -A app.workers.celery_app worker -Q meeting.extract -c 2 --loglevel=info
 ```
+
+### Firestore indexes
+
+Firestore auto-indexes every field individually, which covers almost every query in this codebase (`.where("x", "==", y)` on a single field). One query combines two equality filters on different fields and needs a manually-declared composite index: `blueprints` filtered by `session_id` + `approved` (`app/workers/build_worker.py`).
+
+That index is declared in `firestore.indexes.json` at the repo root. Deploy it with the Firebase CLI:
+
+```bash
+firebase deploy --only firestore:indexes
+```
+
+On a fresh Firestore project without it, that one query fails with a `FailedPrecondition` error (Firestore's error message includes a console link to create the index on the fly — but declaring it here means `firebase deploy` handles it instead of a runtime surprise).
 
 ## Blueprint Generation Backends
 
@@ -137,7 +150,7 @@ docker compose up --build
 Or start only Ollama alongside the infrastructure:
 
 ```bash
-docker compose up postgres redis ollama -d
+docker compose up redis ollama -d
 ```
 
 ### Pulling the model (first run only)
@@ -276,11 +289,13 @@ If your server has no GPU and quality matters, set `BP_MODEL=gemini` or `BP_MODE
 
 ## Docker
 
-Run everything — API, workers, beat scheduler, PostgreSQL, Redis, and Ollama:
+Run everything — API, workers, beat scheduler, Redis, and Ollama:
 
 ```bash
 docker compose up --build
 ```
+
+Data is stored in Firestore (a managed Google Cloud service, not a container in this stack) — see [Environment Variables](#environment-variables) for credential setup.
 
 Services:
 
@@ -289,7 +304,6 @@ Services:
 | `api` | 8000 | FastAPI + Uvicorn |
 | `worker` | — | Celery worker (all 3 queues) |
 | `beat` | — | Celery beat scheduler |
-| `postgres` | 5432 | PostgreSQL 15 + pgvector |
 | `redis` | 6379 | Redis 7 |
 | `ollama` | 11434 | Ollama local model server (Qwen3) |
 
@@ -363,7 +377,7 @@ LISTENING sub-states (emitted as `featureDetected` WS events):
 ## Running Tests
 
 ```bash
-# All 91 tests
+# All 105 tests
 pytest tests/ -q
 
 # Specific suite
@@ -385,6 +399,7 @@ Test suites:
 | `test_pipeline.py` | 12 | LangGraph pipeline, 4 agents, extraction worker |
 | `test_blueprints.py` | 10 | Blueprint endpoints, aggregator, worker |
 | `test_connectors.py` | 14 | Meet/Zoom/Teams connectors, factory, worker |
+| `workers/test_blueprint_worker.py` | 14 | Blueprint worker task logic |
 
 ## Project Structure
 
@@ -400,11 +415,11 @@ app/
 ├── connectors/          # Playwright Meet bot + Zoom/Teams stubs
 ├── core/                # Exceptions, rate limiting, security, logging
 ├── db/
-│   └── models/          # SQLAlchemy ORM models (6 tables)
+│   ├── firebase.py      # Firebase Admin SDK / Firestore client init
+│   └── models/          # Firestore document dataclasses (users, sessions, blueprints, etc.)
 ├── modules/voxa/        # VoxaService + MeetingStateMachine
 ├── schemas/             # Pydantic request/response models
 ├── transcription/       # DeepgramClient streaming wrapper
 └── workers/             # Celery tasks (connector, transcription, extraction, blueprint)
-alembic/                 # Database migrations
-tests/                   # 91 pytest tests
+tests/                   # 105 pytest tests
 ```

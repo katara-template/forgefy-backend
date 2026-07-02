@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.config import get_settings
@@ -106,7 +105,7 @@ def _make_fix_prompt_with_hint(error_msg: str, template_key: str, retry_hint: bo
 
 
 def _run_agent_fix(
-    workspace_path: "Path",
+    workspace_path: Path,
     error_msg: str,
     template_key: str,
     app_name: str,
@@ -336,6 +335,7 @@ def _deploy_appetize(apk_path: Path, api_token: str) -> str | None:
 def _deploy_expo_snack(workspace: Path, app_name: str) -> str | None:
     try:
         import json as _json
+
         import httpx
 
         _SKIP_DIRS = {"node_modules", "android", "ios", ".expo", ".git", ".next", "dist", "out"}
@@ -389,6 +389,7 @@ def _upload_artifact(artifact: Path, session_id: str) -> str | None:
     try:
         import io
         import zipfile
+
         import cloudinary
         import cloudinary.uploader
 
@@ -444,10 +445,10 @@ async def _patch_blueprint(blueprint_id: str, updates: dict) -> None:
 
 
 async def _run(session_id: str, project_id: str) -> dict:
-    from app.build.workspace import Workspace
-    from app.build.github_client import GitHubClient
     from app.build.build_agent import run_build_agent
     from app.build.build_logger import make_log_publisher
+    from app.build.github_client import GitHubClient
+    from app.build.workspace import Workspace
     from app.db.firebase import refresh_async_firestore_client
     from app.db.models.enums import SessionStatus
     from app.modules.voxa.state_machine import MeetingStateMachine
@@ -498,14 +499,14 @@ async def _run(session_id: str, project_id: str) -> dict:
     from app.core.usage import get_user_tier, is_over_limit
     user_tier = await get_user_tier(db, owner_id)
     if await is_over_limit(db, owner_id, user_tier):
-        from app.core.tiers import get_tier
         from app.build.build_logger import publish_user_event
+        from app.core.tiers import get_tier
         tier = get_tier(user_tier)
         error_msg = (
             f"You've used all {tier.monthly_tokens:,} tokens in your {tier.name} plan this month. "
             "Upgrade to continue building."
         )
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         await db.collection("projects").document(project_id).set({
             "owner_id": owner_id,
             "session_id": session_id,
@@ -537,7 +538,7 @@ async def _run(session_id: str, project_id: str) -> dict:
     await _patch_blueprint(blueprint_id, {"build_status": "IN_PROGRESS"})
 
     # 6. Create project doc early so frontend shows build in progress
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     await db.collection("projects").document(project_id).set({
         "owner_id": owner_id,
         "session_id": session_id,
@@ -596,7 +597,7 @@ async def _run(session_id: str, project_id: str) -> dict:
         workspace.push(push_url)
 
         # Save repo info immediately — update prompts can now work even while the agent runs
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         await db.collection("projects").document(project_id).update({
             "repo_full_name": repo_full_name,
             "github_url": repo_url,
@@ -694,7 +695,7 @@ async def _run(session_id: str, project_id: str) -> dict:
             _MAX_FIX = 10
             _MAX_SAME_STREAK = 3
             _MAX_HIT_LIMIT_STREAK = 2  # stop immediately after 2 consecutive iteration-limit hits
-            from app.build.cancel import is_cancelled, clear_cancel
+            from app.build.cancel import clear_cancel, is_cancelled
             while True:
                 if is_cancelled(settings.REDIS_URL, session_id):
                     clear_cancel(settings.REDIS_URL, session_id)
@@ -785,7 +786,7 @@ async def _run(session_id: str, project_id: str) -> dict:
         env_local_path = workspace.path / ".env.local"
         env_local_content = env_local_path.read_text(encoding="utf-8") if env_local_path.exists() else None
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         proj_update: dict = {
             "repo_full_name": repo_full_name,
             "github_url": repo_url,
@@ -824,7 +825,7 @@ async def _run(session_id: str, project_id: str) -> dict:
         )
         logger.error("Build auto-fix exhausted session=%s: %s", session_id, exc)
         await _patch_blueprint(blueprint_id, {"build_status": "FAILED", "build_error": user_msg})
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         proj_err: dict = {
             "is_updating": False,
             "build_error": user_msg,
@@ -849,7 +850,7 @@ async def _run(session_id: str, project_id: str) -> dict:
             "build_error": build_err.message,
         })
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         proj_err: dict = {
             "is_updating": False,
             "build_error": build_err.message,
@@ -883,9 +884,9 @@ def run_build(self, session_id: str, project_id: str) -> dict:
 
 async def _run_preview(project_id: str, user_id: str) -> dict:
     """Clone the project repo, compile, deploy preview, update Firestore."""
-    from app.build.workspace import EditWorkspace
     from app.build.build_logger import make_log_publisher
     from app.build.github_token import get_valid_github_token
+    from app.build.workspace import EditWorkspace
     from app.db.firebase import refresh_async_firestore_client
 
     settings = get_settings()
@@ -914,7 +915,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
     await db.collection("projects").document(project_id).update({
         "is_updating": True,
         "build_error": None,
-        "updated_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(UTC),
     })
     log_fn("started", f"Building preview for {app_name}…")
 
@@ -933,7 +934,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         _MAX_FIX = 10
         _MAX_SAME_STREAK = 3
         _MAX_HIT_LIMIT_STREAK = 2
-        from app.build.cancel import is_cancelled, clear_cancel
+        from app.build.cancel import clear_cancel, is_cancelled
         while True:
             if is_cancelled(settings.REDIS_URL, project_id):
                 clear_cancel(settings.REDIS_URL, project_id)
@@ -1001,7 +1002,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         else:
             log_fn("warning", "Compilation produced no output — check the GitHub repo for errors.")
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         updates: dict = {"is_updating": False, "updated_at": now}
         if preview_url:
             updates["preview_url"] = preview_url
@@ -1026,7 +1027,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
             "is_updating": False,
             "build_error": user_msg,
             "build_error_action": "user_fix",
-            "updated_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(UTC),
         })
         return {}
 
@@ -1039,7 +1040,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
             "is_updating": False,
             "build_error": build_err.message,
             "build_error_action": build_err.action,
-            "updated_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(UTC),
         })
         raise
     finally:

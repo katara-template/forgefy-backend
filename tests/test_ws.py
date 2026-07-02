@@ -3,18 +3,14 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import AsyncGenerator
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 
 from app.config import get_settings
 from app.core.security import create_access_token
-from app.db.models.user import User
-from app.deps import get_current_user, get_db
 from app.main import app
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -22,21 +18,6 @@ from app.main import app
 def _valid_token(user_id: uuid.UUID | None = None) -> str:
     settings = get_settings()
     return create_access_token(str(user_id or uuid.uuid4()), settings)
-
-
-def _mock_app():
-    """Context manager that patches lifespan DB/Redis init for WS tests."""
-    mock_db = AsyncMock()
-    mock_db.add = MagicMock()
-
-    async def override_get_db() -> AsyncGenerator:
-        yield mock_db
-
-    app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_current_user] = lambda: User(
-        id=uuid.uuid4(), email="t@t.com", hashed_password="x"
-    )
-    return mock_db
 
 
 # ── Auth tests ────────────────────────────────────────────────────────────────
@@ -65,24 +46,14 @@ class TestWsAuth:
         with pytest.raises(UnauthorizedError):
             decode_access_token("not-a-real-jwt", get_settings())
 
-    async def test_ws_plain_http_get_returns_404(self) -> None:
+    async def test_ws_plain_http_get_returns_404(self, client: AsyncClient) -> None:
         """Plain HTTP GET to a WebSocket-only path returns 404.
 
         Starlette WebSocket routes only match scope["type"] == "websocket";
         HTTP requests to the same path are not routed and return 404.
         """
-        _mock_app()
-        with (
-            patch("app.main.build_engine", return_value=AsyncMock()),
-            patch("app.main.build_session_factory", return_value=MagicMock()),
-            patch("app.main.aioredis.from_url", return_value=AsyncMock()),
-        ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                resp = await client.get("/ws/voxa?token=anything")
-                assert resp.status_code == 404
-        app.dependency_overrides.clear()
+        resp = await client.get("/ws/voxa?token=anything")
+        assert resp.status_code == 404
 
 
 # ── Connection manager unit tests ─────────────────────────────────────────────

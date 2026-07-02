@@ -13,7 +13,7 @@ import json
 import logging
 import uuid
 import wave
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import redis.asyncio as aioredis
 from deepgram import AsyncDeepgramClient
@@ -123,7 +123,7 @@ class DeepgramLiveSession:
                     "session_id": self._session_id,
                     "event_type": "transcript.segment",
                     "payload": {"text": text},
-                    "timestamp": datetime.now(timezone.utc),
+                    "timestamp": datetime.now(UTC),
                 })
             )
         except Exception as exc:

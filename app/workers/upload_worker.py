@@ -13,7 +13,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import redis as sync_redis
@@ -151,12 +151,12 @@ async def _persist_and_generate(
     session_id: str, events: list[dict], transcript: str, settings
 ) -> str:
     """Persist extraction events to Firestore (batched) and generate blueprint."""
-    from app.db.firebase import refresh_async_firestore_client
     from app.build.blueprint_generator import BlueprintAggregator
+    from app.db.firebase import refresh_async_firestore_client
 
     db = refresh_async_firestore_client()
     events_ref = db.collection("sessions").document(session_id).collection("events")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     # Batch all Firestore writes into a single round-trip.
     batch = db.batch()

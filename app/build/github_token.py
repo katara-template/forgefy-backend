@@ -12,8 +12,8 @@ async def get_valid_github_token(user_id: str, system_token: str) -> str:
     If the stored personal token is invalid (revoked / expired), it is cleared
     from Firestore so the dashboard GitHub-connect banner reappears.
     """
-    from app.db.firebase import get_firestore_client
     from app.build.github_client import GitHubClient
+    from app.db.firebase import get_firestore_client
 
     db = get_firestore_client()
     doc = await db.collection("users").document(user_id).get()
