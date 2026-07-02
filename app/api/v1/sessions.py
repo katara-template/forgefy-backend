@@ -4,15 +4,14 @@ import shutil
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, UploadFile, File
+from fastapi import APIRouter, File, UploadFile
+from pydantic import BaseModel
 
 from app.core.exceptions import ValidationError
 from app.db.models.enums import Platform, SessionStatus
 from app.deps import CurrentUser, DBSession
 from app.modules.voxa.service import VoxaService
 from app.modules.voxa.state_machine import MeetingStateMachine
-from pydantic import BaseModel
-
 from app.schemas.session import (
     CreateSessionRequest,
     EndSessionRequest,

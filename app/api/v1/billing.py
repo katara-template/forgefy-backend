@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -38,31 +38,32 @@ async def create_checkout(
     tier = get_tier(body.tier)
 
     # Unique reference encodes user + plan so the webhook can parse it
-    reference = f"forgefy-{user.id}-{body.tier}-{int(datetime.now(timezone.utc).timestamp())}"
+    reference = f"forgefy-{user.id}-{body.tier}-{int(datetime.now(UTC).timestamp())}"
 
     try:
-        resp = httpx.post(
-            f"{NOTCHPAY_API}/payments/initialize",
-            headers={
-                "Authorization": settings.NOTCHPAY_PUBLIC_KEY,
-                "Content-Type": "application/json",
-            },
-            json={
-                "amount": tier.price_usd,
-                "currency": "USD",
-                "email": user.email,
-                "reference": reference,
-                "callback": f"{settings.FRONTEND_URL}/billing/success",
-                "description": f"Forgefy {tier.name} Plan — monthly",
-                "meta": {
-                    "user_id": str(user.id),
-                    "tier": body.tier,
+        async with httpx.AsyncClient() as http_client:
+            resp = await http_client.post(
+                f"{NOTCHPAY_API}/payments/initialize",
+                headers={
+                    "Authorization": settings.NOTCHPAY_PUBLIC_KEY,
+                    "Content-Type": "application/json",
                 },
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+                json={
+                    "amount": tier.price_usd,
+                    "currency": "USD",
+                    "email": user.email,
+                    "reference": reference,
+                    "callback": f"{settings.FRONTEND_URL}/billing/success",
+                    "description": f"Forgefy {tier.name} Plan — monthly",
+                    "meta": {
+                        "user_id": str(user.id),
+                        "tier": body.tier,
+                    },
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
     except httpx.HTTPStatusError as e:
         logger.error("Notchpay checkout error: %s", e.response.text)
         raise HTTPException(status_code=502, detail="Payment provider error")

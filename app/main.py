@@ -1,12 +1,13 @@
 """FastAPI application factory."""
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import redis.asyncio as aioredis
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -22,6 +23,7 @@ from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
 from app.core.rate_limit import limiter
 from app.db.firebase import init_firebase
+from app.deps import DBSession, RedisDep
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -121,10 +123,33 @@ def create_app() -> FastAPI:
         return {"message": "Forgefy backend is up and running!"}
     
     # ── Ops endpoints ─────────────────────────────────────────────────────────
-    @app.get("/health", tags=["ops"], summary="Liveness probe")
-    async def health(request: Request) -> dict[str, str]:
-        """Return service liveness status."""
-        return {"status": "ok", "env": settings.APP_ENV}
+    @app.get("/health", tags=["ops"], summary="Liveness + dependency readiness probe")
+    async def health(db: DBSession, redis: RedisDep) -> Response:
+        """Return service status, including Redis and Firestore reachability.
+
+        Returns 503 if either dependency is unreachable, so an orchestrator
+        (Docker/Render health checks) can detect and recycle a container that's
+        running but can't actually serve requests.
+        """
+        checks: dict[str, str] = {}
+
+        try:
+            await redis.ping()
+            checks["redis"] = "ok"
+        except Exception as exc:
+            checks["redis"] = f"error: {exc}"
+
+        try:
+            await db.collection("system").document("healthcheck").get()
+            checks["firestore"] = "ok"
+        except Exception as exc:
+            checks["firestore"] = f"error: {exc}"
+
+        healthy = all(v == "ok" for v in checks.values())
+        return JSONResponse(
+            status_code=200 if healthy else 503,
+            content={"status": "ok" if healthy else "degraded", "env": settings.APP_ENV, "checks": checks},
+        )
 
     return app
 

@@ -188,7 +188,8 @@ def _ensure_wrangler_toml(path: Path, project_name: str) -> None:
 
 def _patch_tsconfig(path: Path) -> None:
     """Relax tsconfig strictness so minor AI-generated type errors don't block builds."""
-    import json, re
+    import json
+    import re
 
     tsconfig_path = path / "tsconfig.json"
     if not tsconfig_path.exists():

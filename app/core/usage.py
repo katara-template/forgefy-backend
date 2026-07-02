@@ -12,14 +12,14 @@ User doc fields managed here:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from google.cloud.firestore import AsyncClient, Increment
 
 
 def _period() -> str:
     """Current billing period key, e.g. '2026-06'."""
-    return datetime.now(timezone.utc).strftime("%Y-%m")
+    return datetime.now(UTC).strftime("%Y-%m")
 
 
 async def get_monthly_tokens(db: AsyncClient, user_id: str) -> int:
@@ -84,7 +84,7 @@ async def get_user_tier(db: AsyncClient, user_id: str) -> str:
 
     # Check subscription expiry — paid tiers have a tier_expires_at timestamp
     expires_at = data.get("tier_expires_at")
-    if expires_at and expires_at < datetime.now(timezone.utc):
+    if expires_at and expires_at < datetime.now(UTC):
         # Subscription lapsed — silently downgrade
         await db.collection("users").document(user_id).update({
             "tier": DEFAULT_TIER,

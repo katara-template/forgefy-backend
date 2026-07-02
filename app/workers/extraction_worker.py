@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import redis as sync_redis
 
@@ -27,7 +27,7 @@ async def _persist_transcript(session_id: str, transcript_segment: str) -> None:
         "session_id": session_id,
         "event_type": "transcript.segment",
         "payload": {"text": transcript_segment},
-        "timestamp": datetime.now(timezone.utc),
+        "timestamp": datetime.now(UTC),
     })
 
 
@@ -40,7 +40,7 @@ async def _persist_events(
 
     db = refresh_async_firestore_client()
     events_ref = db.collection("sessions").document(session_id).collection("events")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     for event in events:
         await events_ref.document(str(uuid.uuid4())).set({
@@ -80,6 +80,8 @@ def _run_extraction(transcript: str, settings) -> list[dict]:
     retry_backoff=True,        # 1s, 2s, 4s between Celery retries
     retry_backoff_max=30,
     retry_jitter=True,
+    acks_late=True,
+    reject_on_worker_lost=True,
 )
 def extract_requirements(session_id: str, transcript_segment: str) -> None:
     """Run the LangGraph pipeline on a finalized transcript segment."""

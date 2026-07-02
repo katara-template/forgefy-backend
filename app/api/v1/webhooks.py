@@ -10,12 +10,11 @@ we reject anything that doesn't match.
 """
 from __future__ import annotations
 
-import hashlib
 import hmac
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -137,10 +136,10 @@ async def _try_transition_session(
     settings,
 ) -> None:
     """Attempt a session status transition; ignore invalid-transition errors."""
+    from app.core.exceptions import InvalidStateTransition
     from app.db.firebase import get_firestore_client
     from app.db.models.enums import SessionStatus
     from app.modules.voxa.state_machine import MeetingStateMachine
-    from app.core.exceptions import InvalidStateTransition
 
     db = get_firestore_client()
     target = SessionStatus(target_status_value)
@@ -153,10 +152,10 @@ async def _try_transition_session(
 
 async def _end_session_from_bot(session_id: str, settings) -> None:
     """Transition session to PROCESSING and dispatch blueprint generation."""
+    from app.core.exceptions import InvalidStateTransition
     from app.db.firebase import get_firestore_client
     from app.db.models.enums import SessionStatus
     from app.modules.voxa.state_machine import MeetingStateMachine
-    from app.core.exceptions import InvalidStateTransition
 
     db = get_firestore_client()
 
@@ -173,7 +172,7 @@ async def _end_session_from_bot(session_id: str, settings) -> None:
     try:
         await sm.transition(uuid.UUID(session_id), SessionStatus.PROCESSING)
         await db.collection("sessions").document(session_id).update(
-            {"end_time": datetime.now(timezone.utc)}
+            {"end_time": datetime.now(UTC)}
         )
     except InvalidStateTransition:
         return
@@ -273,7 +272,7 @@ async def _handle_payment_complete(data: dict, settings) -> None:
         return
 
     db = get_firestore_client()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     # Extend existing subscription if user already has one active; otherwise start fresh
     user_doc = await db.collection("users").document(user_id).get()

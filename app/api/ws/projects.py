@@ -54,7 +54,7 @@ async def ws_projects(
         while True:
             try:
                 await asyncio.wait_for(ws.receive_text(), timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             await push()
     except WebSocketDisconnect:

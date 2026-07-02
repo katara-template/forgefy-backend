@@ -9,8 +9,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -1056,7 +1057,7 @@ def _write_flutter_design_system(
     w("lib/core/theme/app_theme.dart", _flutter_theme())
 
     if log_fn:
-        log_fn("tool", f"Writing core UI components (11 files)")
+        log_fn("tool", "Writing core UI components (11 files)")
 
     w("lib/core/widgets/app_button.dart", _flutter_app_button())
     w("lib/core/widgets/app_card.dart", _flutter_app_card())

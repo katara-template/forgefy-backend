@@ -14,3 +14,4 @@ class User:
     created_at: datetime
     updated_at: datetime
     tier: str = "free"  # "free" | "starter" | "pro" | "team"
+    is_admin: bool = False

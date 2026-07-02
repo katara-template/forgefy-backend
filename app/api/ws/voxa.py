@@ -30,7 +30,6 @@ from pydantic import TypeAdapter, ValidationError
 from app.api.ws.connection_manager import manager
 from app.config import get_settings
 from app.core.security import decode_access_token
-from app.transcription.deepgram_live import DeepgramLiveSession
 from app.schemas.ws_events import (
     ClientEvent,
     EndMeetingEvent,
@@ -39,6 +38,7 @@ from app.schemas.ws_events import (
     PongEvent,
     StreamAudioEvent,
 )
+from app.transcription.deepgram_live import DeepgramLiveSession
 
 logger = logging.getLogger(__name__)
 router = APIRouter()

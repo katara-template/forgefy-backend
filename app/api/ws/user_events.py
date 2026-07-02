@@ -55,7 +55,7 @@ async def ws_user_events(
             while True:
                 try:
                     await asyncio.wait_for(ws.receive_text(), timeout=25.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     await ws.send_json({"type": "ping"})
                 except WebSocketDisconnect:
                     break

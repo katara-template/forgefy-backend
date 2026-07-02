@@ -4,12 +4,19 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import UTC
 
 from fastapi import APIRouter
 
 from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
 from app.deps import CurrentUser, DBSession
-from app.schemas.project import ChatHistoryRequest, ChatRequest, ChatResponse, ProjectOut, UpdateProjectRequest
+from app.schemas.project import (
+    ChatHistoryRequest,
+    ChatRequest,
+    ChatResponse,
+    ProjectOut,
+    UpdateProjectRequest,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -82,16 +89,16 @@ async def stop_project(
     """Signal any running agent or build task for this project to stop."""
     await _get_owned(project_id, user.id, db)  # ownership check
 
-    from app.config import get_settings
     from app.build.cancel import request_cancel
+    from app.config import get_settings
     settings = get_settings()
     request_cancel(settings.REDIS_URL, str(project_id))
 
     # Immediately mark as not-updating so the UI unblocks
-    from datetime import datetime, timezone
+    from datetime import datetime
     await db.collection("projects").document(str(project_id)).update({
         "is_updating": False,
-        "updated_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(UTC),
     })
     return {"stopped": True}
 
@@ -103,7 +110,6 @@ async def delete_project(
     user: CurrentUser,
 ) -> dict:
     """Permanently delete a project and its associated resources."""
-    from datetime import datetime, timezone
 
     project = await _get_owned(project_id, user.id, db)
 
@@ -122,9 +128,10 @@ async def delete_project(
     # 2. Try to delete the GitHub repo (needs delete_repo scope — may fail gracefully)
     if project.repo_full_name:
         try:
-            from app.config import get_settings
-            from app.build.github_token import get_valid_github_token
             import httpx
+
+            from app.build.github_token import get_valid_github_token
+            from app.config import get_settings
             settings = get_settings()
             token = await get_valid_github_token(str(user.id), settings.GITHUB_TOKEN)
             async with httpx.AsyncClient(timeout=10) as client:
@@ -137,8 +144,8 @@ async def delete_project(
 
     # 3. Clear any Redis cancel flag left over
     try:
-        from app.config import get_settings
         from app.build.cancel import clear_cancel
+        from app.config import get_settings
         settings = get_settings()
         clear_cancel(settings.REDIS_URL, pid)
     except Exception:
@@ -168,8 +175,9 @@ async def get_code_tree(
 ) -> dict:
     """Return a flat list of source file paths from the project's GitHub repo."""
     import httpx
-    from app.config import get_settings
+
     from app.build.github_token import get_valid_github_token
+    from app.config import get_settings
 
     project = await _get_owned(project_id, user.id, db)
     if not project.repo_full_name:
@@ -225,9 +233,11 @@ async def get_code_file(
 ) -> dict:
     """Return the text content of a single file from the project's GitHub repo."""
     import base64
+
     import httpx
-    from app.config import get_settings
+
     from app.build.github_token import get_valid_github_token
+    from app.config import get_settings
 
     project = await _get_owned(project_id, user.id, db)
     if not project.repo_full_name:
@@ -442,6 +452,7 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
     try:
         if settings.BUILD_MODEL == "Qwen3":
             import asyncio
+
             import requests as _req
 
             def _ollama_classify():
@@ -464,6 +475,7 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
 
         elif settings.BUILD_MODEL == "gemini":
             import asyncio
+
             import requests as _req
 
             def _gemini_classify():
@@ -599,10 +611,10 @@ async def save_chat_history(
 ) -> dict:
     """Persist the chat history for a project (last 100 messages)."""
     await _get_owned(project_id, user.id, db)
-    from datetime import datetime, timezone
+    from datetime import datetime
     messages = body.messages[-100:]
     await db.collection("project_chats").document(str(project_id)).set(
-        {"messages": messages, "updated_at": datetime.now(timezone.utc)},
+        {"messages": messages, "updated_at": datetime.now(UTC)},
     )
     return {"saved": len(messages)}
 

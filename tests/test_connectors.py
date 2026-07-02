@@ -2,43 +2,79 @@
 from __future__ import annotations
 
 import uuid
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from app.db.models.enums import Platform
 
-
 # ── Factory tests ─────────────────────────────────────────────────────────────
 
 
+def _recall_settings(**overrides) -> MagicMock:
+    """Mock Settings with valid Recall.ai config, unless overridden."""
+    defaults = dict(
+        RECALL_API_KEY="fake-recall-key",
+        RECALL_REGION="us-east-1",
+        REDIS_URL="redis://localhost:6379/0",
+        PUBLIC_API_BASE_URL="https://api.example.com",
+    )
+    defaults.update(overrides)
+    return MagicMock(**defaults)
+
+
 class TestConnectorFactory:
-    def test_meet_returns_meet_connector(self):
+    """MEET/ZOOM/TEAMS all route through Recall.ai's cloud bot service —
+    the per-platform MeetConnector/ZoomConnector/TeamsConnector classes are
+    legacy, no longer wired into get_connector() (see app/connectors/factory.py).
+    """
+
+    def test_meet_returns_recall_connector(self):
         from app.connectors.factory import get_connector
-        from app.connectors.meet import MeetConnector
+        from app.connectors.recall import RecallConnector
 
-        c = get_connector(Platform.MEET)
-        assert isinstance(c, MeetConnector)
+        with patch("app.config.get_settings", return_value=_recall_settings()):
+            c = get_connector(Platform.MEET)
+        assert isinstance(c, RecallConnector)
 
-    def test_zoom_returns_zoom_connector(self):
+    def test_zoom_returns_recall_connector(self):
         from app.connectors.factory import get_connector
-        from app.connectors.zoom import ZoomConnector
+        from app.connectors.recall import RecallConnector
 
-        c = get_connector(Platform.ZOOM)
-        assert isinstance(c, ZoomConnector)
+        with patch("app.config.get_settings", return_value=_recall_settings()):
+            c = get_connector(Platform.ZOOM)
+        assert isinstance(c, RecallConnector)
 
-    def test_teams_returns_teams_connector(self):
+    def test_teams_returns_recall_connector(self):
         from app.connectors.factory import get_connector
-        from app.connectors.teams import TeamsConnector
+        from app.connectors.recall import RecallConnector
 
-        c = get_connector(Platform.TEAMS)
-        assert isinstance(c, TeamsConnector)
+        with patch("app.config.get_settings", return_value=_recall_settings()):
+            c = get_connector(Platform.TEAMS)
+        assert isinstance(c, RecallConnector)
 
     def test_physical_raises_not_implemented(self):
         from app.connectors.factory import get_connector
 
         with pytest.raises(NotImplementedError):
             get_connector(Platform.PHYSICAL)
+
+    def test_missing_recall_api_key_raises(self):
+        from app.connectors.factory import get_connector
+
+        with patch(
+            "app.config.get_settings", return_value=_recall_settings(RECALL_API_KEY="")
+        ), pytest.raises(RuntimeError, match="RECALL_API_KEY"):
+            get_connector(Platform.MEET)
+
+    def test_missing_public_api_base_url_raises(self):
+        from app.connectors.factory import get_connector
+
+        with patch(
+            "app.config.get_settings",
+            return_value=_recall_settings(PUBLIC_API_BASE_URL=""),
+        ), pytest.raises(RuntimeError, match="PUBLIC_API_BASE_URL"):
+            get_connector(Platform.MEET)
 
 
 # ── Stub connector tests ──────────────────────────────────────────────────────

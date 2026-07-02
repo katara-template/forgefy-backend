@@ -58,7 +58,7 @@ async def ws_sessions(
             try:
                 # Wait for any client message or the 5 s poll interval
                 await asyncio.wait_for(ws.receive_text(), timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             await push()
     except WebSocketDisconnect:

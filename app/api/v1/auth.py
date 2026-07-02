@@ -12,7 +12,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlencode
 
 import firebase_admin.auth
@@ -21,6 +21,11 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import RedirectResponse
 
 from app.core.exceptions import ConflictError, UnauthorizedError
+from app.core.login_guard import (
+    check_not_locked_out,
+    clear_failed_attempts,
+    record_failed_attempt,
+)
 from app.core.rate_limit import limiter
 from app.core.security import (
     create_access_token,
@@ -29,7 +34,7 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
-from app.deps import DBSession, SettingsDep
+from app.deps import DBSession, RedisDep, SettingsDep
 from app.schemas.auth import (
     GoogleAuthRequest,
     LoginRequest,
@@ -68,7 +73,7 @@ async def register(
 
         # Generate user ID and timestamp
         user_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         
         # Hash password
         try:
@@ -117,9 +122,12 @@ async def login(
     request: Request,
     body: LoginRequest,
     db: DBSession,
+    redis: RedisDep,
     settings: SettingsDep,
 ) -> TokenResponse:
     """Authenticate with email + password; return access + refresh tokens."""
+    await check_not_locked_out(redis, body.email)
+
     docs = await db.collection("users").where("email", "==", body.email).limit(1).get()
 
     user_doc = docs[0] if docs else None
@@ -127,8 +135,10 @@ async def login(
 
     # Always verify to avoid timing-based user enumeration
     if not user_data or not verify_password(body.password, user_data["hashed_password"]):
+        await record_failed_attempt(redis, body.email)
         raise UnauthorizedError("Invalid email or password")
 
+    await clear_failed_attempts(redis, body.email)
     logger.info("User logged in: id=%s", user_doc.id)
     return TokenResponse(
         access_token=create_access_token(user_doc.id, settings),
@@ -175,7 +185,7 @@ async def google_auth(
         user_id = docs[0].id
     else:
         user_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         await db.collection("users").document(user_id).set({
             "email": email,
             "hashed_password": "",
@@ -256,27 +266,28 @@ async def github_callback(
         return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?github_error=invalid_state")
 
     try:
-        resp = httpx.post(
-            "https://github.com/login/oauth/access_token",
-            headers={"Accept": "application/json"},
-            data={
-                "client_id": settings.GITHUB_CLIENT_ID,
-                "client_secret": settings.GITHUB_CLIENT_SECRET,
-                "code": code,
-            },
-            timeout=30,
-        )
-        token_data = resp.json()
-        github_token = token_data.get("access_token")
-        if not github_token:
-            return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?github_error=exchange_failed")
+        async with httpx.AsyncClient() as http_client:
+            resp = await http_client.post(
+                "https://github.com/login/oauth/access_token",
+                headers={"Accept": "application/json"},
+                data={
+                    "client_id": settings.GITHUB_CLIENT_ID,
+                    "client_secret": settings.GITHUB_CLIENT_SECRET,
+                    "code": code,
+                },
+                timeout=30,
+            )
+            token_data = resp.json()
+            github_token = token_data.get("access_token")
+            if not github_token:
+                return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?github_error=exchange_failed")
 
-        user_resp = httpx.get(
-            "https://api.github.com/user",
-            headers={"Authorization": f"Bearer {github_token}", "Accept": "application/json"},
-            timeout=15,
-        )
-        github_username: str = user_resp.json().get("login", "")
+            user_resp = await http_client.get(
+                "https://api.github.com/user",
+                headers={"Authorization": f"Bearer {github_token}", "Accept": "application/json"},
+                timeout=15,
+            )
+            github_username: str = user_resp.json().get("login", "")
 
         await db.collection("users").document(user_id).update({
             "github_access_token": github_token,
