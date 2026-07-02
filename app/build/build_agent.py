@@ -543,6 +543,62 @@ ADDITIONAL REQUIREMENTS
 • Add input validation where the app collects user data
 • Style the app consistently using the color/theme constants you define
 • Do not leave any generated image/video slot with a placeholder URL
+• ALWAYS create THREE environment files:
+
+  1. .env  ← committed to GitHub
+     Contains ONLY public-safe variables with placeholder values. Public-safe means:
+       — NEXT_PUBLIC_* (bundled into browser JS — cannot be secret by design)
+       — Supabase URL + anon key (security enforced by Row Level Security, not the key)
+       — Firebase client config: apiKey, authDomain, projectId, storageBucket,
+         messagingSenderId, appId (security enforced by Firebase Security Rules)
+       — Any other client-side SDK init value
+
+  2. .env.local  ← gitignored (add to .gitignore if not already present)
+     Contains ONLY truly secret server-side keys with placeholder values.
+     Top of file must have this comment:
+       # DO NOT commit this file. Add these values to your deployment platform
+       # (Vercel → Project Settings → Environment Variables, or Netlify → Site Settings).
+     Secret keys go here: STRIPE_SECRET_KEY, OPENAI_API_KEY, database passwords,
+     webhook secrets, any key that starts without NEXT_PUBLIC_.
+
+  3. .env.example  ← committed to GitHub
+     A copy of ALL variables from both .env AND .env.local, with placeholder values.
+     This is the reference file users copy when setting up locally or deploying.
+     Top of file: # Copy this file to .env and .env.local and fill in your values.
+     Group public vars first, then secret vars, each section with a comment header.
+
+  When writing .gitignore: ensure .env.local and .env*.local are listed.
+  Never write real credentials in any file — always placeholder values only.
+
+  Example structure for a Next.js + Firebase + Stripe app:
+
+  .env:
+    # Firebase (safe to commit — access controlled by Firebase Security Rules)
+    NEXT_PUBLIC_FIREBASE_API_KEY=your-firebase-api-key
+    NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=your-project-id.firebaseapp.com
+    NEXT_PUBLIC_FIREBASE_PROJECT_ID=your-project-id
+    NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=your-project-id.appspot.com
+    NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=your-sender-id
+    NEXT_PUBLIC_FIREBASE_APP_ID=your-app-id
+    # Stripe publishable key (safe to commit — public by design)
+    NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=pk_test_your-stripe-publishable-key
+
+  .env.local:
+    # DO NOT commit this file. Add these to Vercel/Netlify environment variables.
+    STRIPE_SECRET_KEY=sk_test_your-stripe-secret-key
+
+  .env.example:
+    # Copy this file to .env and .env.local and fill in your values.
+    # PUBLIC — safe to commit (put in .env)
+    NEXT_PUBLIC_FIREBASE_API_KEY=your-firebase-api-key
+    NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=your-project-id.firebaseapp.com
+    NEXT_PUBLIC_FIREBASE_PROJECT_ID=your-project-id
+    NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=your-project-id.appspot.com
+    NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=your-sender-id
+    NEXT_PUBLIC_FIREBASE_APP_ID=your-app-id
+    NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=pk_test_your-stripe-publishable-key
+    # SECRET — DO NOT commit (put in .env.local or deployment platform)
+    STRIPE_SECRET_KEY=sk_test_your-stripe-secret-key
 """
 
 
@@ -611,6 +667,11 @@ CRITICAL RULES
 - Narrate briefly before each tool call: "Reading AppNavigator…", "Writing OnboardingPage…"
 - If you see a file in the git history that was already correctly implemented,
   skip it and move on to what is still missing.
+- If your change adds a new third-party service, update all three env files:
+  • .env          → add NEXT_PUBLIC_* / Supabase / Firebase client config (pushed)
+  • .env.local    → add server-side secrets like STRIPE_SECRET_KEY (gitignored)
+  • .env.example  → add ALL new variables from both files so the reference stays complete
+  Always use placeholder values — never real credentials.
 
 ══════════════════════════════════════════
 NO DUPLICATE FILES — CHECK BEFORE CREATING
@@ -957,8 +1018,12 @@ def _call_planner(
         return None
 
 
-_VALIDATOR_SYSTEM = """You are the Forgefy Validation Agent. You run AFTER the executor to verify
-the implementation is complete, correct, and follows the required folder structure.
+_VALIDATOR_SYSTEM = """You are the Forgefy Validation and Fix Agent. You run AFTER the executor to
+CHECK AND FIX any remaining issues in the implementation. You have FULL tool access:
+read_file, write_file, delete_file, list_files, analyze_code. Use write_file liberally —
+your job is not just to report problems but to FIX every single one you find.
+NEVER explain your role. NEVER ask questions. NEVER say you cannot make changes.
+Your final output MUST always end with a line starting with "VALIDATED:".
 
 ══════════════════════════════════════════
 DESIGN AUDIT (run BEFORE structural checks)
@@ -1038,7 +1103,13 @@ MANDATORY WORKFLOW
                  Cannot find module → add the package or fix the import path;
                  Type '...' is not assignable → fix the type or add a cast.
    b. After fixing, call analyze_code() again to confirm zero errors remain.
-   c. Only proceed to step 9 when analyze_code() returns "no issues found" or "no errors found".
+   c. If analyze_code() returns an environment/tool error (e.g. "command not found",
+      "not the tsc command you are looking for", "No such file", "not recognized"):
+      DO NOT give up. Instead: manually read every file listed in the plan, scan for
+      obvious syntax errors, wrong imports, missing semicolons, type mismatches, and
+      fix each one with write_file. Then proceed to step 9 noting the environment issue.
+   d. Only proceed to step 9 when analyze_code() returns "no issues found", "no errors
+      found", or when step (c) forced a manual review pass.
 9. After all checks, fixes, and a clean analyze_code(), output a report starting with VALIDATED:
    Use markdown: list what was checked, what was fixed/moved, and confirm the build should succeed.
 
@@ -1679,7 +1750,7 @@ def _ollama_loop(
             history.append({"role": "tool", "content": result})
 
     if log_fn:
-        log_fn("error", "Agent reached iteration limit.")
+        log_fn("warning", "Agent reached iteration limit.")
     return "Agent reached iteration limit.", 0
 
 
@@ -1943,7 +2014,7 @@ _ITERS_DESIGN = 30
 _ITERS_EXEC = 50
 _ITERS_VALIDATE = 25
 _ITERS_SECURITY = 20
-_ITERS_FIX = 30
+_ITERS_FIX = 100
 
 
 def _should_skip_design(plan: dict[str, Any] | None) -> bool:
@@ -1963,6 +2034,30 @@ def _should_skip_security(plan: dict[str, Any] | None) -> bool:
     if not plan:
         return False
     return bool(plan.get("skip_security_agent"))
+
+
+def _validation_needs_fix_pass(val_summary: str) -> bool:
+    """Return True when the validator did not emit a clean VALIDATED: report.
+
+    A clean report means the validator finished its workflow and signed off with
+    a VALIDATED: line. Anything else (role explanation, timeout, error dump) means
+    the executor should get a targeted fix pass with the validator's findings.
+    """
+    vs = val_summary.lower().strip()
+    if "all checks passed" in vs:
+        return False
+    if vs.startswith("validated:") or "\nvalidated:" in vs:
+        return False
+    return True
+
+
+def _make_fix_prompt(val_summary: str) -> str:
+    return (
+        "The validator reviewed the implementation and found unresolved issues.\n\n"
+        f"Validator findings:\n{val_summary}\n\n"
+        "Fix every problem described above. Read each affected file first, then apply "
+        "the minimum change needed. Do not re-explain issues — just fix them."
+    )
 
 
 def run_update_agent(
@@ -2028,6 +2123,19 @@ def run_update_agent(
     total_tokens += val_tokens
     if cancel_fn and cancel_fn():
         return val_summary or exec_summary, total_tokens
+
+    if _validation_needs_fix_pass(val_summary):
+        if log_fn:
+            log_fn("info", "━━━ Post-validation fix pass ━━━")
+            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
+        fix_summary, fix_tokens = _loop(
+            client, model, _UPDATE_SYSTEM, workspace,
+            _make_fix_prompt(val_summary), log_fn, cancel_fn, max_iterations=_ITERS_FIX,
+        )
+        total_tokens += fix_tokens
+        val_summary = fix_summary
+        if cancel_fn and cancel_fn():
+            return val_summary or exec_summary, total_tokens
 
     if not _should_skip_security(plan):
         if log_fn:
@@ -2108,6 +2216,19 @@ def run_update_agent_ollama(
     total_tokens += val_tokens
     if cancel_fn and cancel_fn():
         return val_summary or exec_summary, total_tokens
+
+    if _validation_needs_fix_pass(val_summary):
+        if log_fn:
+            log_fn("info", "━━━ Post-validation fix pass ━━━")
+            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
+        fix_summary, fix_tokens = _ollama_loop(
+            base_url, model, _UPDATE_SYSTEM, workspace,
+            _make_fix_prompt(val_summary), timeout, log_fn, cancel_fn, max_iterations=_ITERS_FIX,
+        )
+        total_tokens += fix_tokens
+        val_summary = fix_summary
+        if cancel_fn and cancel_fn():
+            return val_summary or exec_summary, total_tokens
 
     if not _should_skip_security(plan):
         if log_fn:
@@ -2255,7 +2376,7 @@ def _gemini_loop(
             contents.append({"role": "user", "parts": tool_responses})
 
     if log_fn:
-        log_fn("error", "Agent reached iteration limit.")
+        log_fn("warning", "Agent reached iteration limit.")
     return "Agent reached iteration limit.", 0
 
 
@@ -2340,6 +2461,19 @@ def run_update_agent_gemini(
     total_tokens += val_tokens
     if cancel_fn and cancel_fn():
         return val_summary or exec_summary, total_tokens
+
+    if _validation_needs_fix_pass(val_summary):
+        if log_fn:
+            log_fn("info", "━━━ Post-validation fix pass ━━━")
+            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
+        fix_summary, fix_tokens = _gemini_loop(
+            api_key, model, _UPDATE_SYSTEM, workspace,
+            _make_fix_prompt(val_summary), log_fn, cancel_fn, max_iterations=_ITERS_FIX,
+        )
+        total_tokens += fix_tokens
+        val_summary = fix_summary
+        if cancel_fn and cancel_fn():
+            return val_summary or exec_summary, total_tokens
 
     if not _should_skip_security(plan):
         if log_fn:
@@ -2468,7 +2602,7 @@ def _openai_loop(
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     if log_fn:
-        log_fn("error", "Agent reached iteration limit.")
+        log_fn("warning", "Agent reached iteration limit.")
     return "Agent reached iteration limit.", total_tokens
 
 
@@ -2553,6 +2687,19 @@ def run_update_agent_openai(
     total_tokens += val_tokens
     if cancel_fn and cancel_fn():
         return val_summary or exec_summary, total_tokens
+
+    if _validation_needs_fix_pass(val_summary):
+        if log_fn:
+            log_fn("info", "━━━ Post-validation fix pass ━━━")
+            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
+        fix_summary, fix_tokens = _openai_loop(
+            api_key, model, _UPDATE_SYSTEM, workspace,
+            _make_fix_prompt(val_summary), log_fn, cancel_fn, max_iterations=_ITERS_FIX,
+        )
+        total_tokens += fix_tokens
+        val_summary = fix_summary
+        if cancel_fn and cancel_fn():
+            return val_summary or exec_summary, total_tokens
 
     if not _should_skip_security(plan):
         if log_fn:
@@ -2743,5 +2890,5 @@ def _loop(
             messages.append({"role": "user", "content": tool_results})
 
     if log_fn:
-        log_fn("error", "Agent reached iteration limit.")
+        log_fn("warning", "Agent reached iteration limit.")
     return "Agent reached iteration limit.", total_tokens

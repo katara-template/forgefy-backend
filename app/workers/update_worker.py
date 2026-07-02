@@ -39,6 +39,10 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
     from app.build.cancel import is_cancelled, clear_cancel
 
     settings = get_settings()
+    # Wipe any stale cancel flag left over from a previous crashed/timed-out run
+    # before we start fresh work. Any legitimate cancel from the new run will
+    # be set after this point, so this is safe.
+    clear_cancel(settings.REDIS_URL, project_id)
     cancel_fn = lambda: is_cancelled(settings.REDIS_URL, project_id)
     db = refresh_async_firestore_client()  # bind fresh gRPC channel to this event loop
 
@@ -179,27 +183,43 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         was_stopped = cancel_fn()
         clear_cancel(settings.REDIS_URL, project_id)
 
-        log_fn("info", "Pushing changes to GitHub…")
         pushed = workspace.sync_to_github(
             commit_message=f"feat: {prompt[:60]}",  # original short prompt, not the full context
             push_url=push_url,
         )
+        if pushed:
+            log_fn("info", "Changes pushed to GitHub.")
 
-        clean_summary = (summary or "").strip()
-        if clean_summary.upper().startswith("DONE"):
-            clean_summary = clean_summary[4:].lstrip(":").strip()
-        if clean_summary.upper().startswith("VALIDATED"):
-            clean_summary = clean_summary[9:].lstrip(":").strip()
+        raw = (summary or "").strip()
+        # Extract the human-readable part of the summary.
+        # The validator output is "DESIGN AUDIT: ... VALIDATED: <message>" —
+        # find the VALIDATED section wherever it appears, not just at the start.
+        upper = raw.upper()
+        val_idx = upper.find("VALIDATED:")
+        if val_idx != -1:
+            clean_summary = raw[val_idx + len("VALIDATED:"):].lstrip().strip()
+        elif upper.startswith("DONE"):
+            clean_summary = raw[4:].lstrip(":").strip()
+        else:
+            clean_summary = raw
 
         hit_limit = "Agent reached iteration limit." in (summary or "")
 
+        # Capture .env.local placeholder content before workspace is deleted so the
+        # code viewer can display it (gitignored, won't be on GitHub).
+        env_local_path = workspace.path / ".env.local"
+        env_local_content = env_local_path.read_text(encoding="utf-8") if env_local_path.exists() else None
+
         now = datetime.now(timezone.utc)
-        await _patch_project(project_id, {
+        patch: dict = {
             "is_updating": False,
             "build_error": None,
             "last_summary": clean_summary or None,
             "updated_at": now,
-        })
+        }
+        if env_local_content is not None:
+            patch["env_local_template"] = env_local_content
+        await _patch_project(project_id, patch)
 
         if was_stopped:
             if pushed:
@@ -229,13 +249,25 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
             )
             logger.warning("Preview build skipped — agent hit iteration limit project=%s", project_id)
         else:
-            agent_said = f'\n\nAgent response: "{clean_summary}"' if clean_summary else ""
-            log_fn(
-                "warning",
-                f"The agent finished but made no file changes.{agent_said}\n\n"
-                "Try breaking your request into a smaller, more specific step — "
-                "e.g. 'Add a RiskScore badge to the task list item that shows High/Medium/Low.'"
+            # Distinguish between "agent confirmed everything already correct" (not an error)
+            # vs "agent genuinely failed to act on the request".
+            summary_upper = upper  # already computed above
+            already_done = (
+                "all checks passed" in summary_upper
+                or "no issues found" in summary_upper
+                or "no changes" in summary_upper
+                or ("validated" in summary_upper and "no other issues" in summary_upper)
             )
+            if already_done:
+                log_fn("done", clean_summary or "Everything is already up to date — no changes needed.")
+            else:
+                agent_said = f'\n\nAgent response: "{clean_summary}"' if clean_summary else ""
+                log_fn(
+                    "warning",
+                    f"The agent finished but made no file changes.{agent_said}\n\n"
+                    "Try breaking your request into a smaller, more specific step — "
+                    "e.g. 'Add a RiskScore badge to the task list item that shows High/Medium/Low.'"
+                )
         logger.info("Update done project=%s pushed=%s prompt=%s", project_id, pushed, prompt[:40])
         return {"summary": summary, "pushed": pushed}
 
