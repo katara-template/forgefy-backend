@@ -17,7 +17,7 @@ from app.deps import get_current_user, get_db, get_redis
 from app.main import app
 
 _ASYNC_TERMINALS = ("get", "set", "update", "delete", "add", "stream")
-_CHAIN_METHODS = ("collection", "document", "where", "limit", "order_by")
+_CHAIN_METHODS = ("collection", "document", "where", "limit", "order_by", "count")
 
 
 def wire_firestore_chain(node: MagicMock, depth: int = 4) -> None:
@@ -67,6 +67,27 @@ def mock_redis() -> AsyncMock:
     return redis
 
 
+@pytest.fixture(autouse=True)
+def _default_under_quota():
+    """Default every test to "on the free tier, not over their monthly quota".
+
+    chat_with_project/update_project/approve_blueprint all call
+    check_not_over_limit(), which reads the users/{uid} doc and
+    users/{uid}/usage/{period} — Firestore paths no test configures explicitly.
+    Without this, wire_firestore_chain's unconfigured terminal mock for those
+    paths resolves to a bare AsyncMock, whose .to_dict() returns a coroutine
+    instead of a dict, breaking every endpoint test that doesn't care about
+    quota at all. Tests that specifically exercise the quota-exceeded path
+    (see test_usage_quota.py) override these locally with their own patch(...)
+    inside the test body.
+    """
+    with (
+        patch("app.core.usage.get_monthly_tokens", new=AsyncMock(return_value=0)),
+        patch("app.core.usage.get_user_tier", new=AsyncMock(return_value="free")),
+    ):
+        yield
+
+
 @pytest.fixture
 def test_user() -> User:
     """A minimal User object for auth-protected endpoint tests."""
@@ -77,6 +98,20 @@ def test_user() -> User:
         hashed_password="irrelevant-in-tests",
         created_at=now,
         updated_at=now,
+    )
+
+
+@pytest.fixture
+def admin_user() -> User:
+    """A User with is_admin=True, for AdminUser-gated endpoint tests."""
+    now = datetime.now(UTC)
+    return User(
+        id=uuid.uuid4(),
+        email="admin@example.com",
+        hashed_password="irrelevant-in-tests",
+        created_at=now,
+        updated_at=now,
+        is_admin=True,
     )
 
 

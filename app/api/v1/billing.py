@@ -66,10 +66,10 @@ async def create_checkout(
             data = resp.json()
     except httpx.HTTPStatusError as e:
         logger.error("Notchpay checkout error: %s", e.response.text)
-        raise HTTPException(status_code=502, detail="Payment provider error")
+        raise HTTPException(status_code=502, detail="Payment provider error") from e
     except Exception as e:
         logger.error("Notchpay request failed: %s", e)
-        raise HTTPException(status_code=502, detail="Could not reach payment provider")
+        raise HTTPException(status_code=502, detail="Could not reach payment provider") from e
 
     auth_url = (
         data.get("transaction", {}).get("authorization_url")

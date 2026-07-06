@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+from contextlib import suppress
 
 import firebase_admin
 from firebase_admin import credentials, firestore_async
@@ -61,10 +62,8 @@ def refresh_async_firestore_client() -> AsyncClient:
     loop.run_until_complete() in a Celery task. Helper functions that call
     get_firestore_client() afterward will get the freshly-initialized client.
     """
-    try:
+    with suppress(ValueError):
         firebase_admin.delete_app(firebase_admin.get_app())
-    except ValueError:
-        pass
     cred = _load_credentials()
     app = firebase_admin.initialize_app(cred)
     return firestore_async.client(app=app)

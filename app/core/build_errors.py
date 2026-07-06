@@ -30,7 +30,7 @@ _SCRUB_PATTERNS: list[re.Pattern] = [
 ]
 
 
-def _scrub(raw: str) -> str:
+def scrub_sensitive(raw: str) -> str:
     """Remove URLs, API keys, and tokens from an error string."""
     for pattern in _SCRUB_PATTERNS:
         raw = pattern.sub("[redacted]", raw)
@@ -40,7 +40,11 @@ def _scrub(raw: str) -> str:
 # ── User-facing patterns (matched against the scrubbed string) ───────────────
 _PATTERNS: list[tuple[re.Pattern, str, str]] = [
     # AI provider billing / credits
-    (re.compile(r"credit balance is too low|insufficient.{0,20}credits|upgrade or purchase credits", re.I),
+    (re.compile(
+        r"credit balance is too low|insufficient.{0,20}credits|upgrade or purchase credits"
+        r"|credits.{0,20}(are )?depleted|resource_exhausted.{0,80}credit",
+        re.I,
+    ),
      "Your AI service plan has run out of credits. Please contact support.",
      "support"),
 
@@ -101,10 +105,15 @@ _PATTERNS: list[tuple[re.Pattern, str, str]] = [
 ]
 
 
+# Shown to end users in place of any "support"-tier message — the real detail
+# goes to the admin alerts feed (app/core/alerts.py) instead.
+GENERIC_OPERATOR_MESSAGE = "Build failed — our team has been notified and is looking into it."
+
+
 def sanitize_build_error(exc: Exception) -> BuildError:
     """Return a user-safe BuildError, scrubbing URLs/keys and mapping to friendly messages."""
     raw = str(exc)
-    scrubbed = _scrub(raw)
+    scrubbed = scrub_sensitive(raw)
 
     for pattern, message, action in _PATTERNS:
         if pattern.search(scrubbed):

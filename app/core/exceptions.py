@@ -54,6 +54,13 @@ class RateLimitedError(ForgefyError):
     title = "Too Many Requests"
 
 
+class QuotaExceededError(ForgefyError):
+    """Raised when a user has exhausted their tier's monthly token budget."""
+
+    status_code = 402
+    title = "Quota Exceeded"
+
+
 class InvalidStateTransition(ForgefyError):
     """Raised when a state machine transition is not permitted."""
 
