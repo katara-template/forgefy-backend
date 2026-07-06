@@ -67,8 +67,8 @@ def decode_token(
         payload = jwt.decode(
             token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
         )
-    except JWTError:
-        raise UnauthorizedError("Invalid or expired token")
+    except JWTError as exc:
+        raise UnauthorizedError("Invalid or expired token") from exc
 
     if payload.get("type") != expected_type:
         raise UnauthorizedError(f"Expected '{expected_type}' token, got '{payload.get('type')}'")

@@ -42,7 +42,7 @@ Deepgram WS     LangGraph pipeline    BlueprintAggregator
 
 ## Environment Variables
 
-Copy `.env.example` to `.env` and fill in your values. Below are the variables most relevant to getting a local instance running — see `.env.example` for the full list (Cloudinary, Cloudflare, GitHub OAuth, Recall.ai, NotchPay, Sentry, etc. are optional integrations, not required to boot the app).
+Copy `.env.example` to `.env` and fill in your values. Below are the variables most relevant to getting a local instance running — see `.env.example` for the full list (Cloudinary, Cloudflare, GitHub OAuth, Supabase OAuth, Neon, Recall.ai, NotchPay, Sentry, etc. are optional integrations, not required to boot the app).
 
 | Variable | Default | Description |
 |---|---|---|
@@ -111,7 +111,9 @@ celery -A app.workers.celery_app worker -Q meeting.extract -c 2 --loglevel=info
 
 ### Firestore indexes
 
-Firestore auto-indexes every field individually, which covers almost every query in this codebase (`.where("x", "==", y)` on a single field). One query combines two equality filters on different fields and needs a manually-declared composite index: `blueprints` filtered by `session_id` + `approved` (`app/workers/build_worker.py`).
+Firestore auto-indexes every field individually, which covers almost every query in this codebase (`.where("x", "==", y)` on a single field). Two queries need a manually-declared composite index:
+- `blueprints` filtered by `session_id` + `approved` (`app/workers/build_worker.py`) — two equality filters on different fields.
+- `operator_alerts` filtered by `resolved` + ordered by `created_at` (`app/api/v1/admin.py`) — a filter and an `order_by` on different fields.
 
 That index is declared in `firestore.indexes.json` at the repo root. Deploy it with the Firebase CLI:
 

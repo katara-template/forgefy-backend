@@ -16,6 +16,7 @@ import json
 import logging
 import threading
 import time
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import redis as sync_redis
@@ -75,10 +76,8 @@ class TranscriptionSession:
             return
         self._closed = True
         self._close_connection()
-        try:
+        with suppress(Exception):
             self._redis.close()
-        except Exception:
-            pass
         logger.info("TranscriptionSession closed session=%s", self._session_id)
 
     # ── Connection management ─────────────────────────────────────────────────

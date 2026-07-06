@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
@@ -55,11 +56,9 @@ async def ws_sessions(
     try:
         await push()
         while True:
-            try:
-                # Wait for any client message or the 5 s poll interval
+            # Wait for any client message or the 5 s poll interval
+            with suppress(TimeoutError):
                 await asyncio.wait_for(ws.receive_text(), timeout=5.0)
-            except TimeoutError:
-                pass
             await push()
     except WebSocketDisconnect:
         logger.info("ws/sessions disconnected user=%s", user_id_str)

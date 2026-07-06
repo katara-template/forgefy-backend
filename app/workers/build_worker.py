@@ -231,8 +231,8 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
             ],
             capture_output=True, text=True, env=env, timeout=180,
         )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Cloudflare Pages deploy timed out after 180 s — try again or check your Cloudflare dashboard.")
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Cloudflare Pages deploy timed out after 180 s — try again or check your Cloudflare dashboard.") from exc
 
     output = (result.stdout + result.stderr).strip()
     logger.info("Wrangler output (rc=%d):\n%s", result.returncode, output[-1500:])
@@ -668,6 +668,24 @@ async def _run(session_id: str, project_id: str) -> dict:
             )
         logger.info("Build agent used %d tokens session=%s", tokens_used, session_id)
 
+        # If a database is already connected for this project, replace the
+        # agent's placeholders with the real values (see app/build/workspace.py).
+        proj_doc = await db.collection("projects").document(project_id).get()
+        proj_data = proj_doc.to_dict() or {} if proj_doc.exists else {}
+        if proj_data.get("supabase_url") and proj_data.get("supabase_anon_key"):
+            workspace.write_supabase_env(proj_data["supabase_url"], proj_data["supabase_anon_key"])
+        if proj_data.get("neon_data_api_url"):
+            workspace.write_neon_env(proj_data["neon_data_api_url"])
+        if proj_data.get("firebase_project_id"):
+            workspace.write_firebase_env({
+                "apiKey": proj_data.get("firebase_api_key"),
+                "authDomain": proj_data.get("firebase_auth_domain"),
+                "projectId": proj_data.get("firebase_project_id"),
+                "storageBucket": proj_data.get("firebase_storage_bucket"),
+                "messagingSenderId": proj_data.get("firebase_messaging_sender_id"),
+                "appId": proj_data.get("firebase_app_id"),
+            })
+
         # Record usage against the user's monthly quota
         from app.core.usage import record_usage
         await record_usage(db, owner_id, tokens_used, is_build=True)
@@ -841,19 +859,32 @@ async def _run(session_id: str, project_id: str) -> dict:
         return {}
 
     except Exception as exc:
-        from app.core.build_errors import sanitize_build_error
+        from app.core.build_errors import GENERIC_OPERATOR_MESSAGE, sanitize_build_error
         build_err = sanitize_build_error(exc)
         logger.error("Build FAILED session=%s: %s", session_id, exc, exc_info=True)
 
+        user_message = build_err.message
+        if build_err.action == "support":
+            from app.core.alerts import record_operator_alert
+            await record_operator_alert(
+                db,
+                title=build_err.message,
+                raw_detail=str(exc),
+                source="build",
+                session_id=session_id,
+                project_id=project_id,
+            )
+            user_message = GENERIC_OPERATOR_MESSAGE
+
         await _patch_blueprint(blueprint_id, {
             "build_status": "FAILED",
-            "build_error": build_err.message,
+            "build_error": user_message,
         })
 
         now = datetime.now(UTC)
         proj_err: dict = {
             "is_updating": False,
-            "build_error": build_err.message,
+            "build_error": user_message,
             "build_error_action": build_err.action,
             "updated_at": now,
         }
@@ -864,7 +895,7 @@ async def _run(session_id: str, project_id: str) -> dict:
             proj_err["repo_owner"] = "platform" if using_platform_github else "user"
         await db.collection("projects").document(project_id).update(proj_err)
 
-        log_fn("error", f"Build failed: {build_err.message}")
+        log_fn("error", f"Build failed: {user_message}")
         raise
 
     finally:
@@ -923,6 +954,26 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
     push_url = f"https://{github_token}@github.com/{repo_full_name}.git"
     try:
         workspace.ensure()
+
+        # If a database is connected for this project, keep .env in sync with
+        # the real values (see app/build/workspace.py) — a prior commit may
+        # only have the agent's placeholders.
+        if project_data.get("supabase_url") and project_data.get("supabase_anon_key"):
+            workspace.write_supabase_env(
+                template_key, project_data["supabase_url"], project_data["supabase_anon_key"]
+            )
+        if project_data.get("neon_data_api_url"):
+            workspace.write_neon_env(template_key, project_data["neon_data_api_url"])
+        if project_data.get("firebase_project_id"):
+            workspace.write_firebase_env(template_key, {
+                "apiKey": project_data.get("firebase_api_key"),
+                "authDomain": project_data.get("firebase_auth_domain"),
+                "projectId": project_data.get("firebase_project_id"),
+                "storageBucket": project_data.get("firebase_storage_bucket"),
+                "messagingSenderId": project_data.get("firebase_messaging_sender_id"),
+                "appId": project_data.get("firebase_app_id"),
+            })
+
         log_fn("info", f"Compiling {stack_label} project (this may take a few minutes)…")
 
         artifact_path = None
@@ -1032,13 +1083,26 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         return {}
 
     except Exception as exc:
-        from app.core.build_errors import sanitize_build_error
+        from app.core.build_errors import GENERIC_OPERATOR_MESSAGE, sanitize_build_error
         build_err = sanitize_build_error(exc)
         logger.error("Preview build FAILED project=%s: %s", project_id, exc, exc_info=True)
-        log_fn("error", f"Preview build failed: {build_err.message}")
+
+        user_message = build_err.message
+        if build_err.action == "support":
+            from app.core.alerts import record_operator_alert
+            await record_operator_alert(
+                db,
+                title=build_err.message,
+                raw_detail=str(exc),
+                source="preview_update",
+                project_id=project_id,
+            )
+            user_message = GENERIC_OPERATOR_MESSAGE
+
+        log_fn("error", f"Preview build failed: {user_message}")
         await db.collection("projects").document(project_id).update({
             "is_updating": False,
-            "build_error": build_err.message,
+            "build_error": user_message,
             "build_error_action": build_err.action,
             "updated_at": datetime.now(UTC),
         })

@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -38,10 +39,8 @@ def transcribe_upload(session_id: str, file_path: str) -> None:
         logger.error("Transcription failed session=%s: %s", session_id, exc, exc_info=True)
         return
     finally:
-        try:
+        with suppress(Exception):
             path.unlink(missing_ok=True)
-        except Exception:
-            pass
 
     if not transcript:
         logger.warning("Empty transcript session=%s — nothing to process", session_id)

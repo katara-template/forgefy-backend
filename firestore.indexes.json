@@ -7,6 +7,14 @@
         { "fieldPath": "session_id", "order": "ASCENDING" },
         { "fieldPath": "approved", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "operator_alerts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "resolved", "order": "ASCENDING" },
+        { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

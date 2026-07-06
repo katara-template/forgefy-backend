@@ -43,7 +43,10 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
     # before we start fresh work. Any legitimate cancel from the new run will
     # be set after this point, so this is safe.
     clear_cancel(settings.REDIS_URL, project_id)
-    cancel_fn = lambda: is_cancelled(settings.REDIS_URL, project_id)
+
+    def cancel_fn() -> bool:
+        return is_cancelled(settings.REDIS_URL, project_id)
+
     db = refresh_async_firestore_client()  # bind fresh gRPC channel to this event loop
 
     project = await _load_project(project_id)
@@ -179,6 +182,25 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
             )
         logger.info("Update agent used %d tokens project=%s", tokens_used, project_id)
         await record_usage(db, user_id, tokens_used, is_update=True)
+
+        # If a database is connected for this project, keep .env in sync with
+        # the real values (see app/build/workspace.py) in case the agent
+        # rewrote them.
+        if project.get("supabase_url") and project.get("supabase_anon_key"):
+            workspace.write_supabase_env(
+                template_key, project["supabase_url"], project["supabase_anon_key"]
+            )
+        if project.get("neon_data_api_url"):
+            workspace.write_neon_env(template_key, project["neon_data_api_url"])
+        if project.get("firebase_project_id"):
+            workspace.write_firebase_env(template_key, {
+                "apiKey": project.get("firebase_api_key"),
+                "authDomain": project.get("firebase_auth_domain"),
+                "projectId": project.get("firebase_project_id"),
+                "storageBucket": project.get("firebase_storage_bucket"),
+                "messagingSenderId": project.get("firebase_messaging_sender_id"),
+                "appId": project.get("firebase_app_id"),
+            })
 
         was_stopped = cancel_fn()
         clear_cancel(settings.REDIS_URL, project_id)

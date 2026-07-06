@@ -1,8 +1,8 @@
-"""Shared SQLAlchemy-compatible Python enums."""
-from enum import Enum
+"""Shared string-valued enums (JSON/Firestore friendly)."""
+from enum import StrEnum
 
 
-class SessionStatus(str, Enum):
+class SessionStatus(StrEnum):
     WAITING = "WAITING"
     JOINING = "JOINING"
     LISTENING = "LISTENING"
@@ -13,14 +13,14 @@ class SessionStatus(str, Enum):
     FAILED = "FAILED"
 
 
-class Platform(str, Enum):
+class Platform(StrEnum):
     MEET = "meet"
     ZOOM = "zoom"
     TEAMS = "teams"
     PHYSICAL = "physical"
 
 
-class Priority(str, Enum):
+class Priority(StrEnum):
     LOW = "low"
     MED = "med"
     HIGH = "high"

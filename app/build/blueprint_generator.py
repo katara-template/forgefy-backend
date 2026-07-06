@@ -463,7 +463,7 @@ class BlueprintAggregator:
                 raw = (msg.content[0].text or "").strip()
                 # Strip markdown fences if present
                 import re as _re
-                raw = _re.sub(r"```[a-z]*\n?", "", raw).strip().strip("```").strip()
+                raw = _re.sub(r"```[a-z]*\n?", "", raw).strip().strip("`").strip()
                 result = _json.loads(raw)
                 if isinstance(result, dict) and "palette" in result:
                     return result
@@ -568,3 +568,70 @@ def _build_blueprint_json(
         "action_items": action_items,
         "requirements_count": len(features) + len(questions) + len(conflicts) + len(action_items),
     }
+
+
+_DB_NEED_SYSTEM = (
+    "You determine whether an app idea requires a real, persistent database.\n\n"
+    "Answer yes ONLY if the app needs to durably store structured data across "
+    "sessions/devices/users — e.g. user accounts, saved records, inventory, posts, "
+    "orders, chat history, bookmarks.\n"
+    "Answer no for apps that are purely local/ephemeral — a calculator, a stopwatch, "
+    "a static info screen, a game with only in-memory/on-device state, a single-user "
+    "offline note that doesn't need to sync.\n\n"
+    'Reply ONLY with JSON: {"needs_database": true|false, "reason": "<one short sentence, '
+    'or empty string if false>"}'
+)
+
+
+async def classify_needs_database(description: str, features: list[dict]) -> tuple[bool, str]:
+    """Decide whether an app idea needs a real database, so the build pipeline can ask
+    for consent before ever provisioning or wiring one in (see app/api/v1/blueprints.py's
+    approve_blueprint and app/api/v1/projects.py's chat_with_project).
+
+    Defaults to (False, "") on any classifier failure — never blocks a build on an AI
+    call succeeding, mirroring _derive_features/_infer_app_name above.
+    """
+    import json as _json
+
+    from app.config import get_settings
+
+    feature_lines = "\n".join(
+        f"- {f.get('title', '')}: {f.get('description', '')}" for f in (features or [])
+    )
+    content = f"App description: {description}\n\nFeatures:\n{feature_lines}"
+
+    settings = get_settings()
+    try:
+        if settings.BP_MODEL == "Qwen3":
+            from app.ai.agents.ollama_synthesizer import call_ollama
+            result = call_ollama(
+                system_prompt=_DB_NEED_SYSTEM,
+                user_content=content,
+                base_url=settings.OLLAMA_URL,
+                model=settings.OLLAMA_MODEL,
+                timeout=settings.OLLAMA_TIMEOUT,
+            )
+        elif settings.BP_MODEL == "gemini":
+            from app.ai.agents.gemini_synthesizer import call_gemini
+            result = call_gemini(
+                system_prompt=_DB_NEED_SYSTEM,
+                user_content=content,
+                api_key=settings.GEMINI_API_KEY,
+                model=settings.GEMINI_MODEL,
+                max_tokens=256,
+            )
+        else:
+            import anthropic
+            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=120.0)
+            msg = client.messages.create(
+                model=settings.ANTHROPIC_MODEL,
+                max_tokens=256,
+                system=_DB_NEED_SYSTEM,
+                messages=[{"role": "user", "content": content}],
+            )
+            result = _json.loads(msg.content[0].text.strip())
+
+        return bool(result.get("needs_database")), str(result.get("reason") or "")
+    except Exception as exc:
+        logger.warning("Database-need classification failed, defaulting to no: %s", exc)
+        return False, ""

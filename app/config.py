@@ -74,6 +74,26 @@ class Settings(BaseSettings):
     GITHUB_CLIENT_SECRET: str = ""
     FRONTEND_URL: str = "http://localhost:3000"
 
+    # Supabase OAuth App (for linking user Supabase account + provisioning DBs)
+    SUPABASE_CLIENT_ID: str = ""
+    SUPABASE_CLIENT_SECRET: str = ""
+
+    # Neon — embedded/project-per-user model: one platform-level API key,
+    # no per-user OAuth. Projects are provisioned under Forgefy's own account.
+    NEON_API_KEY: str = ""
+
+    # Firebase OAuth App (Google Cloud OAuth client) — for linking a user's own
+    # Google account so Forgefy can provision a Firebase/Firestore project under
+    # IT, not Forgefy's own. Distinct from FIREBASE_CREDENTIALS_JSON/PATH (raw
+    # env vars read in app/db/firebase.py), which are Forgefy's own service
+    # account for its own Firestore usage.
+    FIREBASE_OAUTH_CLIENT_ID: str = ""
+    FIREBASE_OAUTH_CLIENT_SECRET: str = ""
+
+    # Encryption key for secrets stored at rest (OAuth tokens, DB passwords).
+    # Any string works — it's hashed into a Fernet key. Change in production.
+    SECRETS_ENCRYPTION_KEY: str = "changeme-replace-with-a-real-secret"
+
     # GitHub
     GITHUB_TOKEN: str = ""
 

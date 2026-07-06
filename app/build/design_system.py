@@ -1040,9 +1040,6 @@ def _write_flutter_design_system(
     t = ds.get("typography", {})
     sig = ds.get("signature_element", "Primary-colored accent card")
 
-    theme_dir = root / "lib" / "core" / "theme"
-    widgets_dir = root / "lib" / "core" / "widgets"
-
     written: list[str] = []
 
     def w(rel: str, content: str) -> None:

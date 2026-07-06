@@ -104,7 +104,11 @@ class TestApproveBlueprint:
         with (
             patch("app.api.v1.blueprints._get_owned_blueprint", return_value=bp),
             patch("app.api.v1.blueprints.MeetingStateMachine", return_value=mock_sm),
-            patch("app.workers.build_worker.run_build.apply_async"),
+            patch(
+                "app.build.blueprint_generator.classify_needs_database",
+                new=AsyncMock(return_value=(False, "")),
+            ),
+            patch("app.workers.build_worker.run_build.apply_async") as mock_dispatch,
         ):
             resp = await auth_client.post(f"/api/v1/voxa/blueprint/{bp.id}/approve")
 
@@ -116,6 +120,46 @@ class TestApproveBlueprint:
             SessionStatus.APPROVED,
             extra_payload={"blueprint_id": str(bp.id), "approved_by": str(test_user.id)},
         )
+        mock_dispatch.assert_called_once()
+
+        project_payload = mock_db.collection.return_value.document.return_value.set.call_args[0][0]
+        assert project_payload["is_updating"] is True
+        assert project_payload["db_decision_pending"] is False
+
+    async def test_needs_database_withholds_build(
+        self, auth_client: AsyncClient, mock_db: MagicMock, test_user
+    ) -> None:
+        """If the classifier thinks the app needs persistent storage, the initial
+        build must be withheld until the user is asked — never provisioned/wired
+        without consent."""
+        sess = _session(user_id=test_user.id, status=SessionStatus.BLUEPRINT_READY)
+        bp = _blueprint(sess)
+
+        mock_db.collection.return_value.document.return_value.get.return_value = (
+            make_doc_snapshot({"status": sess.status.value})
+        )
+
+        mock_sm = AsyncMock()
+        mock_sm.transition = AsyncMock()
+
+        with (
+            patch("app.api.v1.blueprints._get_owned_blueprint", return_value=bp),
+            patch("app.api.v1.blueprints.MeetingStateMachine", return_value=mock_sm),
+            patch(
+                "app.build.blueprint_generator.classify_needs_database",
+                new=AsyncMock(return_value=(True, "Tracks inventory items across sessions.")),
+            ),
+            patch("app.workers.build_worker.run_build.apply_async") as mock_dispatch,
+        ):
+            resp = await auth_client.post(f"/api/v1/voxa/blueprint/{bp.id}/approve")
+
+        assert resp.status_code == 200
+        mock_dispatch.assert_not_called()
+
+        project_payload = mock_db.collection.return_value.document.return_value.set.call_args[0][0]
+        assert project_payload["is_updating"] is False
+        assert project_payload["db_decision_pending"] is True
+        assert project_payload["db_decision_reason"] == "Tracks inventory items across sessions."
 
     async def test_forbidden_returns_403(self, auth_client: AsyncClient) -> None:
         from app.core.exceptions import ForbiddenError

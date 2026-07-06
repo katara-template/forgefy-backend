@@ -42,14 +42,16 @@ async def recall_webhook(
     """Receive and process Recall.ai webhook events."""
     settings = get_settings()
 
-    if settings.RECALL_WORKSPACE_VERIFICATION_SECRET:
-        if x_recall_workspace_verification_secret != settings.RECALL_WORKSPACE_VERIFICATION_SECRET:
-            raise HTTPException(status_code=401, detail="Invalid webhook secret")
+    if (
+        settings.RECALL_WORKSPACE_VERIFICATION_SECRET
+        and x_recall_workspace_verification_secret != settings.RECALL_WORKSPACE_VERIFICATION_SECRET
+    ):
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
     try:
         body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
 
     event_type: str = body.get("event", "")
     data: dict = body.get("data", {})
@@ -136,6 +138,8 @@ async def _try_transition_session(
     settings,
 ) -> None:
     """Attempt a session status transition; ignore invalid-transition errors."""
+    from contextlib import suppress
+
     from app.core.exceptions import InvalidStateTransition
     from app.db.firebase import get_firestore_client
     from app.db.models.enums import SessionStatus
@@ -144,10 +148,8 @@ async def _try_transition_session(
     db = get_firestore_client()
     target = SessionStatus(target_status_value)
     sm = MeetingStateMachine(db)
-    try:
+    with suppress(InvalidStateTransition):
         await sm.transition(uuid.UUID(session_id), target)
-    except InvalidStateTransition:
-        pass  # already in target or ahead
 
 
 async def _end_session_from_bot(session_id: str, settings) -> None:
@@ -234,8 +236,8 @@ async def notchpay_webhook(request: Request) -> dict:
 
     try:
         body = json.loads(raw_body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
 
     event: str = body.get("event", "")
     data: dict = body.get("data", {})

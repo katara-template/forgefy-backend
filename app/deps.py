@@ -53,8 +53,8 @@ async def get_current_user(
     user_id_str = decode_access_token(token, settings)
     try:
         uid = uuid.UUID(user_id_str)
-    except ValueError:
-        raise UnauthorizedError("Token subject is not a valid UUID")
+    except ValueError as exc:
+        raise UnauthorizedError("Token subject is not a valid UUID") from exc
 
     doc = await db.collection("users").document(str(uid)).get()
     if not doc.exists:

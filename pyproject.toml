@@ -81,9 +81,14 @@ line-length = 100
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
 
+[tool.ruff.lint.flake8-bugbear]
+# fastapi.File(...) is a dependency-injection marker, not a mutable default —
+# same category as Depends/Query, which ruff already exempts by default.
+extend-immutable-calls = ["fastapi.File"]
+
 [tool.black]
 line-length = 100
-target-version = ["py311"]
+target-version = ["py312"]
 
 [tool.mypy]
 python_version = "3.12"

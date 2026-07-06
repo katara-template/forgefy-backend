@@ -75,7 +75,7 @@ def cleanup_workspaces() -> dict:
 
     if total_bytes > cap_bytes:
         entries.sort(key=lambda x: x[0])  # oldest first
-        for mtime, path, size in entries:
+        for _mtime, path, size in entries:
             if total_bytes <= cap_bytes:
                 break
             try:
