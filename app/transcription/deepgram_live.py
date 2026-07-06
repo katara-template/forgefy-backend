@@ -13,7 +13,8 @@ import json
 import logging
 import uuid
 import wave
-from datetime import datetime, timezone
+from contextlib import suppress
+from datetime import UTC, datetime
 
 import redis.asyncio as aioredis
 from deepgram import AsyncDeepgramClient
@@ -88,10 +89,8 @@ class DeepgramLiveSession:
 
         if self._flush_task and not self._flush_task.done():
             self._flush_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._flush_task
-            except asyncio.CancelledError:
-                pass
 
         # Flush whatever remains in the buffer
         async with self._lock:
@@ -123,7 +122,7 @@ class DeepgramLiveSession:
                     "session_id": self._session_id,
                     "event_type": "transcript.segment",
                     "payload": {"text": text},
-                    "timestamp": datetime.now(timezone.utc),
+                    "timestamp": datetime.now(UTC),
                 })
             )
         except Exception as exc:

@@ -49,6 +49,18 @@ class ValidationError(ForgefyError):
     title = "Unprocessable Entity"
 
 
+class RateLimitedError(ForgefyError):
+    status_code = 429
+    title = "Too Many Requests"
+
+
+class QuotaExceededError(ForgefyError):
+    """Raised when a user has exhausted their tier's monthly token budget."""
+
+    status_code = 402
+    title = "Quota Exceeded"
+
+
 class InvalidStateTransition(ForgefyError):
     """Raised when a state machine transition is not permitted."""
 

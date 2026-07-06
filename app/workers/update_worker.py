@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.config import get_settings
 from app.workers.celery_app import celery_app
@@ -32,18 +32,21 @@ async def _patch_project(project_id: str, updates: dict) -> None:
 
 
 async def _run(project_id: str, prompt: str, user_id: str) -> dict:
-    from app.build.workspace import EditWorkspace
     from app.build.build_agent import run_update_agent
-    from app.db.firebase import refresh_async_firestore_client
+    from app.build.cancel import clear_cancel, is_cancelled
+    from app.build.workspace import EditWorkspace
     from app.core.usage import get_user_tier, is_over_limit, record_usage
-    from app.build.cancel import is_cancelled, clear_cancel
+    from app.db.firebase import refresh_async_firestore_client
 
     settings = get_settings()
     # Wipe any stale cancel flag left over from a previous crashed/timed-out run
     # before we start fresh work. Any legitimate cancel from the new run will
     # be set after this point, so this is safe.
     clear_cancel(settings.REDIS_URL, project_id)
-    cancel_fn = lambda: is_cancelled(settings.REDIS_URL, project_id)
+
+    def cancel_fn() -> bool:
+        return is_cancelled(settings.REDIS_URL, project_id)
+
     db = refresh_async_firestore_client()  # bind fresh gRPC channel to this event loop
 
     project = await _load_project(project_id)
@@ -60,8 +63,8 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
     # Check token quota before doing any expensive work
     user_tier = await get_user_tier(db, user_id)
     if await is_over_limit(db, user_id, user_tier):
-        from app.core.tiers import get_tier
         from app.build.build_logger import publish_user_event
+        from app.core.tiers import get_tier
         tier = get_tier(user_tier)
         error_msg = (
             f"You've used all {tier.monthly_tokens:,} tokens in your {tier.name} plan this month. "
@@ -70,7 +73,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         await _patch_project(project_id, {
             "build_error": error_msg,
             "build_error_action": "support",
-            "updated_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(UTC),
         })
         publish_user_event(
             settings.REDIS_URL, user_id, "quota_exceeded", error_msg,
@@ -180,6 +183,25 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         logger.info("Update agent used %d tokens project=%s", tokens_used, project_id)
         await record_usage(db, user_id, tokens_used, is_update=True)
 
+        # If a database is connected for this project, keep .env in sync with
+        # the real values (see app/build/workspace.py) in case the agent
+        # rewrote them.
+        if project.get("supabase_url") and project.get("supabase_anon_key"):
+            workspace.write_supabase_env(
+                template_key, project["supabase_url"], project["supabase_anon_key"]
+            )
+        if project.get("neon_data_api_url"):
+            workspace.write_neon_env(template_key, project["neon_data_api_url"])
+        if project.get("firebase_project_id"):
+            workspace.write_firebase_env(template_key, {
+                "apiKey": project.get("firebase_api_key"),
+                "authDomain": project.get("firebase_auth_domain"),
+                "projectId": project.get("firebase_project_id"),
+                "storageBucket": project.get("firebase_storage_bucket"),
+                "messagingSenderId": project.get("firebase_messaging_sender_id"),
+                "appId": project.get("firebase_app_id"),
+            })
+
         was_stopped = cancel_fn()
         clear_cancel(settings.REDIS_URL, project_id)
 
@@ -210,7 +232,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         env_local_path = workspace.path / ".env.local"
         env_local_content = env_local_path.read_text(encoding="utf-8") if env_local_path.exists() else None
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         patch: dict = {
             "is_updating": False,
             "build_error": None,
@@ -279,7 +301,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
             "is_updating": False,
             "build_error": build_err.message,
             "build_error_action": build_err.action,
-            "updated_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(UTC),
         })
         log_fn("error", f"Update failed: {build_err.message}")
         raise

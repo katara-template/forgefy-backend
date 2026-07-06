@@ -16,7 +16,7 @@ no live Firebase or Anthropic credentials are needed.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -53,7 +53,7 @@ def _session_doc(status: str = "PROCESSING", platform: str = "physical") -> Magi
         "meeting_url": None,
         "start_time": None,
         "end_time": None,
-        "created_at": datetime.now(timezone.utc),
+        "created_at": datetime.now(UTC),
     }
     return doc
 
@@ -63,7 +63,7 @@ def _event_doc(event_type: str, payload: dict) -> MagicMock:
     doc.to_dict.return_value = {
         "event_type": event_type,
         "payload": payload,
-        "timestamp": datetime.now(timezone.utc),
+        "timestamp": datetime.now(UTC),
     }
     return doc
 
@@ -108,7 +108,7 @@ def _session_obj(status: SessionStatus = SessionStatus.BLUEPRINT_READY) -> Meeti
         meeting_url=None,
         start_time=None,
         end_time=None,
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
     )
 
 
@@ -178,9 +178,11 @@ class TestBlueprintGeneratorGenerate:
         """Empty events collection → ValueError mentioning 'No transcript data'."""
         db = _make_db(_session_doc(), [])  # no events whatsoever
 
-        with patch("app.build.blueprint_generator.MeetingStateMachine"):
-            with pytest.raises(ValueError, match="No transcript data"):
-                await BlueprintAggregator(db).generate(SESSION_ID)
+        with (
+            patch("app.build.blueprint_generator.MeetingStateMachine"),
+            pytest.raises(ValueError, match="No transcript data"),
+        ):
+            await BlueprintAggregator(db).generate(SESSION_ID)
 
     async def test_raises_when_synthesizer_returns_nothing_useful(self):
         """Synthesizer producing no description AND no features → ValueError."""
@@ -191,9 +193,9 @@ class TestBlueprintGeneratorGenerate:
             patch("app.build.blueprint_generator.MeetingStateMachine"),
             patch("app.config.get_settings", return_value=_FAKE_SETTINGS),
             patch("app.ai.agents.synthesizer.run", return_value=[]),
+            pytest.raises(ValueError, match="No requirements could be extracted"),
         ):
-            with pytest.raises(ValueError, match="No requirements could be extracted"):
-                await BlueprintAggregator(db).generate(SESSION_ID)
+            await BlueprintAggregator(db).generate(SESSION_ID)
 
     async def test_platform_both_saves_two_blueprints(self):
         """Content with both mobile and web keywords → two blueprint docs written."""
@@ -331,3 +333,75 @@ class TestAnthropicTimeoutEnforcement:
             result = await agg._infer_app_name({"app_description": "An app", "features": []})
 
         assert result == ""
+
+
+class TestClassifyNeedsDatabase:
+    """The gate that decides whether the pipeline should ask for database consent
+    (see app/api/v1/blueprints.py's approve_blueprint and app/api/v1/projects.py's
+    chat_with_project)."""
+
+    async def test_returns_true_with_reason(self):
+        from app.build.blueprint_generator import classify_needs_database
+
+        mock_response = MagicMock()
+        mock_response.content = [
+            MagicMock(text='{"needs_database": true, "reason": "Tracks user orders."}')
+        ]
+
+        with (
+            patch("app.config.get_settings", return_value=_FAKE_SETTINGS),
+            patch("anthropic.Anthropic") as mock_cls,
+        ):
+            mock_cls.return_value.messages.create.return_value = mock_response
+            needs_db, reason = await classify_needs_database(
+                "An e-commerce app", [{"title": "Orders", "description": "Track orders"}]
+            )
+
+        assert needs_db is True
+        assert reason == "Tracks user orders."
+
+    async def test_returns_false_for_ephemeral_app(self):
+        from app.build.blueprint_generator import classify_needs_database
+
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text='{"needs_database": false, "reason": ""}')]
+
+        with (
+            patch("app.config.get_settings", return_value=_FAKE_SETTINGS),
+            patch("anthropic.Anthropic") as mock_cls,
+        ):
+            mock_cls.return_value.messages.create.return_value = mock_response
+            needs_db, reason = await classify_needs_database("A simple stopwatch", [])
+
+        assert needs_db is False
+        assert reason == ""
+
+    async def test_defaults_to_false_on_api_error(self):
+        """A failed classifier call must never block a build — default to no."""
+        from app.build.blueprint_generator import classify_needs_database
+
+        with (
+            patch("app.config.get_settings", return_value=_FAKE_SETTINGS),
+            patch("anthropic.Anthropic") as mock_cls,
+        ):
+            mock_cls.return_value.messages.create.side_effect = RuntimeError("API down")
+            needs_db, reason = await classify_needs_database("An app", [])
+
+        assert needs_db is False
+        assert reason == ""
+
+    async def test_defaults_to_false_on_malformed_json(self):
+        from app.build.blueprint_generator import classify_needs_database
+
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text="not json at all")]
+
+        with (
+            patch("app.config.get_settings", return_value=_FAKE_SETTINGS),
+            patch("anthropic.Anthropic") as mock_cls,
+        ):
+            mock_cls.return_value.messages.create.return_value = mock_response
+            needs_db, reason = await classify_needs_database("An app", [])
+
+        assert needs_db is False
+        assert reason == ""

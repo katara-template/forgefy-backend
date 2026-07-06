@@ -12,14 +12,14 @@ User doc fields managed here:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from google.cloud.firestore import AsyncClient, Increment
 
 
 def _period() -> str:
     """Current billing period key, e.g. '2026-06'."""
-    return datetime.now(timezone.utc).strftime("%Y-%m")
+    return datetime.now(UTC).strftime("%Y-%m")
 
 
 async def get_monthly_tokens(db: AsyncClient, user_id: str) -> int:
@@ -69,6 +69,27 @@ async def is_over_limit(db: AsyncClient, user_id: str, tier_key: str) -> bool:
     return used >= tier.monthly_tokens
 
 
+async def check_not_over_limit(db: AsyncClient, user_id: str) -> None:
+    """Raise QuotaExceededError immediately if the user is already out of tokens.
+
+    Until now, quota was only checked inside the Celery workers — a request
+    over budget would still get queued and return 200, only failing silently
+    once a worker picked it up minutes later. Call this at the top of any
+    endpoint that's about to dispatch a build/update, so the caller gets an
+    immediate, clear rejection instead of a doomed "queued" response.
+    """
+    from app.core.exceptions import QuotaExceededError
+    from app.core.tiers import get_tier
+
+    tier_key = await get_user_tier(db, user_id)
+    if await is_over_limit(db, user_id, tier_key):
+        tier = get_tier(tier_key)
+        raise QuotaExceededError(
+            f"You've used all {tier.monthly_tokens:,} tokens included in your "
+            f"{tier.name} plan this month. Upgrade your plan to keep building."
+        )
+
+
 async def get_user_tier(db: AsyncClient, user_id: str) -> str:
     """Return the user's active tier, downgrading to free if the subscription has expired."""
     from app.core.tiers import DEFAULT_TIER
@@ -84,7 +105,7 @@ async def get_user_tier(db: AsyncClient, user_id: str) -> str:
 
     # Check subscription expiry — paid tiers have a tier_expires_at timestamp
     expires_at = data.get("tier_expires_at")
-    if expires_at and expires_at < datetime.now(timezone.utc):
+    if expires_at and expires_at < datetime.now(UTC):
         # Subscription lapsed — silently downgrade
         await db.collection("users").document(user_id).update({
             "tier": DEFAULT_TIER,

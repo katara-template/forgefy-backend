@@ -17,13 +17,13 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from google.cloud.firestore import AsyncClient
 
 from app.db.models.blueprint import Blueprint
-from app.db.models.enums import SessionStatus, Platform
+from app.db.models.enums import Platform, SessionStatus
 from app.db.models.meeting_session import MeetingSession
 from app.modules.voxa.state_machine import MeetingStateMachine
 
@@ -183,7 +183,7 @@ class BlueprintAggregator:
             json_output["design_system"] = await self._generate_design_system(json_output)
 
         platform = _detect_platform(json_output)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         feature_count = len(json_output.get("features", []))
 
         if platform == "both":
@@ -253,8 +253,9 @@ class BlueprintAggregator:
 
     async def _derive_features(self, description: str) -> list[dict]:
         """Ask the AI to infer likely features from the app description when none were extracted."""
-        from app.config import get_settings
         import json as _json
+
+        from app.config import get_settings
 
         settings = get_settings()
         try:
@@ -357,8 +358,9 @@ class BlueprintAggregator:
                 )
                 raw = result.get("app_name", "").strip().strip('"').strip("'")
             else:
-                import anthropic
                 import json as _json
+
+                import anthropic
                 client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=120.0)
                 msg = client.messages.create(
                     model=settings.ANTHROPIC_MODEL,
@@ -382,8 +384,9 @@ class BlueprintAggregator:
 
     async def _generate_design_system(self, blueprint: dict[str, Any]) -> dict:
         """Ask the AI to generate a design_system block tailored to this app's domain."""
-        from app.config import get_settings
         import json as _json
+
+        from app.config import get_settings
 
         settings = get_settings()
 
@@ -460,7 +463,7 @@ class BlueprintAggregator:
                 raw = (msg.content[0].text or "").strip()
                 # Strip markdown fences if present
                 import re as _re
-                raw = _re.sub(r"```[a-z]*\n?", "", raw).strip().strip("```").strip()
+                raw = _re.sub(r"```[a-z]*\n?", "", raw).strip().strip("`").strip()
                 result = _json.loads(raw)
                 if isinstance(result, dict) and "palette" in result:
                     return result
@@ -525,7 +528,7 @@ class BlueprintAggregator:
             "version": "1.0",
             "session_id": str(session_id),
             "session_platform": session.platform.value,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": datetime.now(UTC).isoformat(),
             "app_name": app_name,
             "app_description": app_description,
             "features": features,
@@ -556,7 +559,7 @@ def _build_blueprint_json(
         "version": "1.0",
         "session_id": str(session.id),
         "session_platform": session.platform.value,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "app_name": app_name,
         "app_description": app_description,
         "features": features,
@@ -565,3 +568,70 @@ def _build_blueprint_json(
         "action_items": action_items,
         "requirements_count": len(features) + len(questions) + len(conflicts) + len(action_items),
     }
+
+
+_DB_NEED_SYSTEM = (
+    "You determine whether an app idea requires a real, persistent database.\n\n"
+    "Answer yes ONLY if the app needs to durably store structured data across "
+    "sessions/devices/users — e.g. user accounts, saved records, inventory, posts, "
+    "orders, chat history, bookmarks.\n"
+    "Answer no for apps that are purely local/ephemeral — a calculator, a stopwatch, "
+    "a static info screen, a game with only in-memory/on-device state, a single-user "
+    "offline note that doesn't need to sync.\n\n"
+    'Reply ONLY with JSON: {"needs_database": true|false, "reason": "<one short sentence, '
+    'or empty string if false>"}'
+)
+
+
+async def classify_needs_database(description: str, features: list[dict]) -> tuple[bool, str]:
+    """Decide whether an app idea needs a real database, so the build pipeline can ask
+    for consent before ever provisioning or wiring one in (see app/api/v1/blueprints.py's
+    approve_blueprint and app/api/v1/projects.py's chat_with_project).
+
+    Defaults to (False, "") on any classifier failure — never blocks a build on an AI
+    call succeeding, mirroring _derive_features/_infer_app_name above.
+    """
+    import json as _json
+
+    from app.config import get_settings
+
+    feature_lines = "\n".join(
+        f"- {f.get('title', '')}: {f.get('description', '')}" for f in (features or [])
+    )
+    content = f"App description: {description}\n\nFeatures:\n{feature_lines}"
+
+    settings = get_settings()
+    try:
+        if settings.BP_MODEL == "Qwen3":
+            from app.ai.agents.ollama_synthesizer import call_ollama
+            result = call_ollama(
+                system_prompt=_DB_NEED_SYSTEM,
+                user_content=content,
+                base_url=settings.OLLAMA_URL,
+                model=settings.OLLAMA_MODEL,
+                timeout=settings.OLLAMA_TIMEOUT,
+            )
+        elif settings.BP_MODEL == "gemini":
+            from app.ai.agents.gemini_synthesizer import call_gemini
+            result = call_gemini(
+                system_prompt=_DB_NEED_SYSTEM,
+                user_content=content,
+                api_key=settings.GEMINI_API_KEY,
+                model=settings.GEMINI_MODEL,
+                max_tokens=256,
+            )
+        else:
+            import anthropic
+            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=120.0)
+            msg = client.messages.create(
+                model=settings.ANTHROPIC_MODEL,
+                max_tokens=256,
+                system=_DB_NEED_SYSTEM,
+                messages=[{"role": "user", "content": content}],
+            )
+            result = _json.loads(msg.content[0].text.strip())
+
+        return bool(result.get("needs_database")), str(result.get("reason") or "")
+    except Exception as exc:
+        logger.warning("Database-need classification failed, defaulting to no: %s", exc)
+        return False, ""

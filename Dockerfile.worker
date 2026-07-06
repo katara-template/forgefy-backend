@@ -53,5 +53,4 @@ RUN pip install --no-cache-dir --upgrade pip && \
 RUN playwright install chromium --with-deps
 
 COPY . .
-
-CMD ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=info", "-Q", "meeting.audio,meeting.transcribe,meeting.extract,build", "-B"]
+CMD ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=info", "-Q", "meeting.audio,meeting.transcribe,meeting.extract,build", "-B", "--concurrency=2", "--uid=nobody"]

@@ -10,9 +10,10 @@ import hashlib
 import hmac
 import json
 import logging
+import secrets
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlencode
 
 import firebase_admin.auth
@@ -21,6 +22,11 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import RedirectResponse
 
 from app.core.exceptions import ConflictError, UnauthorizedError
+from app.core.login_guard import (
+    check_not_locked_out,
+    clear_failed_attempts,
+    record_failed_attempt,
+)
 from app.core.rate_limit import limiter
 from app.core.security import (
     create_access_token,
@@ -29,7 +35,7 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
-from app.deps import DBSession, SettingsDep
+from app.deps import DBSession, RedisDep, SettingsDep
 from app.schemas.auth import (
     GoogleAuthRequest,
     LoginRequest,
@@ -68,7 +74,7 @@ async def register(
 
         # Generate user ID and timestamp
         user_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         
         # Hash password
         try:
@@ -117,9 +123,12 @@ async def login(
     request: Request,
     body: LoginRequest,
     db: DBSession,
+    redis: RedisDep,
     settings: SettingsDep,
 ) -> TokenResponse:
     """Authenticate with email + password; return access + refresh tokens."""
+    await check_not_locked_out(redis, body.email)
+
     docs = await db.collection("users").where("email", "==", body.email).limit(1).get()
 
     user_doc = docs[0] if docs else None
@@ -127,8 +136,10 @@ async def login(
 
     # Always verify to avoid timing-based user enumeration
     if not user_data or not verify_password(body.password, user_data["hashed_password"]):
+        await record_failed_attempt(redis, body.email)
         raise UnauthorizedError("Invalid email or password")
 
+    await clear_failed_attempts(redis, body.email)
     logger.info("User logged in: id=%s", user_doc.id)
     return TokenResponse(
         access_token=create_access_token(user_doc.id, settings),
@@ -162,8 +173,8 @@ async def google_auth(
     """Authenticate via Google — verify Firebase ID token, create user on first sign-in."""
     try:
         decoded = firebase_admin.auth.verify_id_token(body.id_token)
-    except Exception:
-        raise UnauthorizedError("Invalid Google token")
+    except Exception as exc:
+        raise UnauthorizedError("Invalid Google token") from exc
 
     email: str | None = decoded.get("email")
     if not email:
@@ -175,7 +186,7 @@ async def google_auth(
         user_id = docs[0].id
     else:
         user_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         await db.collection("users").document(user_id).set({
             "email": email,
             "hashed_password": "",
@@ -256,27 +267,28 @@ async def github_callback(
         return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?github_error=invalid_state")
 
     try:
-        resp = httpx.post(
-            "https://github.com/login/oauth/access_token",
-            headers={"Accept": "application/json"},
-            data={
-                "client_id": settings.GITHUB_CLIENT_ID,
-                "client_secret": settings.GITHUB_CLIENT_SECRET,
-                "code": code,
-            },
-            timeout=30,
-        )
-        token_data = resp.json()
-        github_token = token_data.get("access_token")
-        if not github_token:
-            return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?github_error=exchange_failed")
+        async with httpx.AsyncClient() as http_client:
+            resp = await http_client.post(
+                "https://github.com/login/oauth/access_token",
+                headers={"Accept": "application/json"},
+                data={
+                    "client_id": settings.GITHUB_CLIENT_ID,
+                    "client_secret": settings.GITHUB_CLIENT_SECRET,
+                    "code": code,
+                },
+                timeout=30,
+            )
+            token_data = resp.json()
+            github_token = token_data.get("access_token")
+            if not github_token:
+                return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?github_error=exchange_failed")
 
-        user_resp = httpx.get(
-            "https://api.github.com/user",
-            headers={"Authorization": f"Bearer {github_token}", "Accept": "application/json"},
-            timeout=15,
-        )
-        github_username: str = user_resp.json().get("login", "")
+            user_resp = await http_client.get(
+                "https://api.github.com/user",
+                headers={"Authorization": f"Bearer {github_token}", "Accept": "application/json"},
+                timeout=15,
+            )
+            github_username: str = user_resp.json().get("login", "")
 
         await db.collection("users").document(user_id).update({
             "github_access_token": github_token,
@@ -299,3 +311,199 @@ async def github_status(db: DBSession, user: CurrentUser) -> dict:
         "linked": bool(data.get("github_access_token")),
         "username": data.get("github_username"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Supabase OAuth — link a personal Supabase account so Forgefy can provision
+# a real database for the user's generated app (see app/api/v1/projects.py
+# for the per-project "connect" step that uses this linked account).
+# ---------------------------------------------------------------------------
+
+_SUPABASE_PKCE_PREFIX = "supabase_oauth_verifier:"
+_SUPABASE_PKCE_TTL = 600  # matches _verify_state's freshness window
+
+
+def _make_pkce_pair() -> tuple[str, str]:
+    """Return (code_verifier, code_challenge) per RFC 7636 (S256)."""
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+@router.get("/supabase/authorize")
+async def supabase_authorize(
+    settings: SettingsDep,
+    redis: RedisDep,
+    user: CurrentUser,
+) -> dict:
+    """Return the Supabase OAuth redirect URL for the current user."""
+    if not settings.SUPABASE_CLIENT_ID:
+        return {"error": "Supabase OAuth not configured"}
+
+    state = _make_state(str(user.id), settings.SECRET_KEY)
+    code_verifier, code_challenge = _make_pkce_pair()
+    await redis.set(f"{_SUPABASE_PKCE_PREFIX}{state}", code_verifier, ex=_SUPABASE_PKCE_TTL)
+
+    params = urlencode({
+        "response_type": "code",
+        "client_id": settings.SUPABASE_CLIENT_ID,
+        "redirect_uri": f"{settings.PUBLIC_API_BASE_URL}/api/v1/auth/supabase/callback",
+        "scope": "all",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    })
+    return {"url": f"https://api.supabase.com/v1/oauth/authorize?{params}"}
+
+
+@router.get("/supabase/callback")
+async def supabase_callback(
+    settings: SettingsDep,
+    db: DBSession,
+    redis: RedisDep,
+    code: str = Query(...),
+    state: str = Query(...),
+) -> RedirectResponse:
+    """Exchange code for Supabase tokens, store them (encrypted), redirect to the frontend."""
+    from app.core.crypto import encrypt
+    from app.integrations import supabase_management
+
+    user_id = _verify_state(state, settings.SECRET_KEY)
+    if not user_id:
+        return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?supabase_error=invalid_state")
+
+    redis_key = f"{_SUPABASE_PKCE_PREFIX}{state}"
+    code_verifier = await redis.get(redis_key)
+    await redis.delete(redis_key)
+    if not code_verifier:
+        return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?supabase_error=expired_state")
+
+    try:
+        token_data = await supabase_management.exchange_code_for_token(
+            code=code,
+            code_verifier=code_verifier,
+            client_id=settings.SUPABASE_CLIENT_ID,
+            client_secret=settings.SUPABASE_CLIENT_SECRET,
+            redirect_uri=f"{settings.PUBLIC_API_BASE_URL}/api/v1/auth/supabase/callback",
+        )
+        await db.collection("users").document(user_id).update({
+            "supabase_access_token": encrypt(token_data["access_token"]),
+            "supabase_refresh_token": encrypt(token_data["refresh_token"]),
+            "supabase_token_expires_at": time.time() + token_data.get("expires_in", 3600),
+        })
+        logger.info("Supabase account linked user=%s", user_id)
+    except Exception as exc:
+        logger.error("Supabase OAuth callback error: %s", exc)
+        return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?supabase_error=server_error")
+
+    return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?supabase=connected")
+
+
+@router.get("/supabase/status")
+async def supabase_status(db: DBSession, user: CurrentUser) -> dict:
+    """Return whether the current user has a linked Supabase account."""
+    doc = await db.collection("users").document(str(user.id)).get()
+    data = doc.to_dict() if doc.exists else {}
+    return {"linked": bool(data.get("supabase_access_token"))}
+
+
+@router.get("/supabase/organizations")
+async def supabase_organizations(db: DBSession, settings: SettingsDep, user: CurrentUser) -> list[dict]:
+    """List the Supabase organizations available to the connected account."""
+    from app.build.supabase_token import get_valid_supabase_token
+    from app.integrations import supabase_management
+
+    token = await get_valid_supabase_token(db, str(user.id), settings)
+    if not token:
+        raise UnauthorizedError("No Supabase account linked")
+    return await supabase_management.list_organizations(token)
+
+
+# ---------------------------------------------------------------------------
+# Firebase OAuth — link a personal Google account so Forgefy can provision a
+# real Firebase/Firestore project under the USER's own GCP account (see
+# app/api/v1/projects.py for the per-project "connect" step that uses this
+# linked account). Separate from Forgefy's own Firebase usage in app/db/firebase.py.
+# ---------------------------------------------------------------------------
+
+_FIREBASE_PKCE_PREFIX = "firebase_oauth_verifier:"
+_FIREBASE_PKCE_TTL = 600  # matches _verify_state's freshness window
+
+
+@router.get("/firebase/authorize")
+async def firebase_authorize(
+    settings: SettingsDep,
+    redis: RedisDep,
+    user: CurrentUser,
+) -> dict:
+    """Return the Google OAuth redirect URL for the current user."""
+    if not settings.FIREBASE_OAUTH_CLIENT_ID:
+        return {"error": "Firebase OAuth not configured"}
+
+    state = _make_state(str(user.id), settings.SECRET_KEY)
+    code_verifier, code_challenge = _make_pkce_pair()
+    await redis.set(f"{_FIREBASE_PKCE_PREFIX}{state}", code_verifier, ex=_FIREBASE_PKCE_TTL)
+
+    params = urlencode({
+        "response_type": "code",
+        "client_id": settings.FIREBASE_OAUTH_CLIENT_ID,
+        "redirect_uri": f"{settings.PUBLIC_API_BASE_URL}/api/v1/auth/firebase/callback",
+        "scope": "https://www.googleapis.com/auth/cloud-platform",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+        "access_type": "offline",
+        "prompt": "consent",
+    })
+    return {"url": f"https://accounts.google.com/o/oauth2/v2/auth?{params}"}
+
+
+@router.get("/firebase/callback")
+async def firebase_callback(
+    settings: SettingsDep,
+    db: DBSession,
+    redis: RedisDep,
+    code: str = Query(...),
+    state: str = Query(...),
+) -> RedirectResponse:
+    """Exchange code for Google tokens, store them (encrypted), redirect to the frontend."""
+    from app.core.crypto import encrypt
+    from app.integrations import firebase_management
+
+    user_id = _verify_state(state, settings.SECRET_KEY)
+    if not user_id:
+        return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?firebase_error=invalid_state")
+
+    redis_key = f"{_FIREBASE_PKCE_PREFIX}{state}"
+    code_verifier = await redis.get(redis_key)
+    await redis.delete(redis_key)
+    if not code_verifier:
+        return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?firebase_error=expired_state")
+
+    try:
+        token_data = await firebase_management.exchange_code_for_token(
+            code=code,
+            code_verifier=code_verifier,
+            client_id=settings.FIREBASE_OAUTH_CLIENT_ID,
+            client_secret=settings.FIREBASE_OAUTH_CLIENT_SECRET,
+            redirect_uri=f"{settings.PUBLIC_API_BASE_URL}/api/v1/auth/firebase/callback",
+        )
+        await db.collection("users").document(user_id).update({
+            "firebase_access_token": encrypt(token_data["access_token"]),
+            "firebase_refresh_token": encrypt(token_data["refresh_token"]),
+            "firebase_token_expires_at": time.time() + token_data.get("expires_in", 3600),
+        })
+        logger.info("Firebase (Google) account linked user=%s", user_id)
+    except Exception as exc:
+        logger.error("Firebase OAuth callback error: %s", exc)
+        return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?firebase_error=server_error")
+
+    return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?firebase=connected")
+
+
+@router.get("/firebase/status")
+async def firebase_status(db: DBSession, user: CurrentUser) -> dict:
+    """Return whether the current user has a linked Google account for Firebase."""
+    doc = await db.collection("users").document(str(user.id)).get()
+    data = doc.to_dict() if doc.exists else {}
+    return {"linked": bool(data.get("firebase_access_token"))}

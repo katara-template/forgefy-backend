@@ -7,11 +7,10 @@ Firestore collections used:
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter
 from google.cloud.firestore import AsyncClient
-
 from pydantic import BaseModel
 
 from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
@@ -161,6 +160,9 @@ async def approve_blueprint(
     crashed before starting), the state transition is skipped and the build is
     re-dispatched so the user can retry without manual intervention.
     """
+    from app.core.usage import check_not_over_limit
+    await check_not_over_limit(db, str(user.id))
+
     blueprint = await _get_owned_blueprint(blueprint_id, user.id, db)
 
     sess_doc = await db.collection("sessions").document(str(blueprint.session_id)).get()
@@ -193,7 +195,16 @@ async def approve_blueprint(
     raw_name = json_out.get("app_name") or (json_out.get("app_description") or "")[:40] or f"app-{str(blueprint.session_id)[:8]}"
     stub_app_name = re.sub(r"[^a-zA-Z0-9._-]", "-", raw_name).strip("-").lower()[:100] or "forgefy-app"
     stub_template = json_out.get("template", "next")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
+
+    # Never provision/wire a database on our own initiative — ask first. See
+    # app/build/blueprint_generator.py's classify_needs_database and the project
+    # page's handling of db_decision_pending (app/api/v1/projects.py).
+    from app.build.blueprint_generator import classify_needs_database
+    needs_db, db_reason = await classify_needs_database(
+        json_out.get("app_description", ""), json_out.get("features", [])
+    )
+
     await db.collection("projects").document(project_id).set({
         "owner_id": str(user.id),
         "session_id": str(blueprint.session_id),
@@ -204,15 +215,23 @@ async def approve_blueprint(
         "github_url": "",
         "preview_url": None,
         "artifact_url": None,
-        "is_updating": True,
+        "is_updating": not needs_db,
         "build_error": None,
         "blueprint_context": json_out,
+        "db_decision_pending": needs_db,
+        "db_decision_reason": db_reason if needs_db else None,
         "created_at": now,
         "updated_at": now,
     })
 
-    from app.workers.build_worker import run_build
-    run_build.apply_async(args=[str(blueprint.session_id), project_id], queue="build")
-    logger.info("Build dispatched session=%s blueprint=%s project=%s", blueprint.session_id, blueprint_id, project_id)
+    if needs_db:
+        logger.info(
+            "Build withheld pending database decision session=%s blueprint=%s project=%s",
+            blueprint.session_id, blueprint_id, project_id,
+        )
+    else:
+        from app.workers.build_worker import run_build
+        run_build.apply_async(args=[str(blueprint.session_id), project_id], queue="build")
+        logger.info("Build dispatched session=%s blueprint=%s project=%s", blueprint.session_id, blueprint_id, project_id)
 
     return BlueprintOut.model_validate(blueprint)

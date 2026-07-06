@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.config import get_settings
@@ -106,7 +105,7 @@ def _make_fix_prompt_with_hint(error_msg: str, template_key: str, retry_hint: bo
 
 
 def _run_agent_fix(
-    workspace_path: "Path",
+    workspace_path: Path,
     error_msg: str,
     template_key: str,
     app_name: str,
@@ -232,8 +231,8 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
             ],
             capture_output=True, text=True, env=env, timeout=180,
         )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Cloudflare Pages deploy timed out after 180 s — try again or check your Cloudflare dashboard.")
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Cloudflare Pages deploy timed out after 180 s — try again or check your Cloudflare dashboard.") from exc
 
     output = (result.stdout + result.stderr).strip()
     logger.info("Wrangler output (rc=%d):\n%s", result.returncode, output[-1500:])
@@ -336,6 +335,7 @@ def _deploy_appetize(apk_path: Path, api_token: str) -> str | None:
 def _deploy_expo_snack(workspace: Path, app_name: str) -> str | None:
     try:
         import json as _json
+
         import httpx
 
         _SKIP_DIRS = {"node_modules", "android", "ios", ".expo", ".git", ".next", "dist", "out"}
@@ -389,6 +389,7 @@ def _upload_artifact(artifact: Path, session_id: str) -> str | None:
     try:
         import io
         import zipfile
+
         import cloudinary
         import cloudinary.uploader
 
@@ -444,10 +445,10 @@ async def _patch_blueprint(blueprint_id: str, updates: dict) -> None:
 
 
 async def _run(session_id: str, project_id: str) -> dict:
-    from app.build.workspace import Workspace
-    from app.build.github_client import GitHubClient
     from app.build.build_agent import run_build_agent
     from app.build.build_logger import make_log_publisher
+    from app.build.github_client import GitHubClient
+    from app.build.workspace import Workspace
     from app.db.firebase import refresh_async_firestore_client
     from app.db.models.enums import SessionStatus
     from app.modules.voxa.state_machine import MeetingStateMachine
@@ -498,14 +499,14 @@ async def _run(session_id: str, project_id: str) -> dict:
     from app.core.usage import get_user_tier, is_over_limit
     user_tier = await get_user_tier(db, owner_id)
     if await is_over_limit(db, owner_id, user_tier):
-        from app.core.tiers import get_tier
         from app.build.build_logger import publish_user_event
+        from app.core.tiers import get_tier
         tier = get_tier(user_tier)
         error_msg = (
             f"You've used all {tier.monthly_tokens:,} tokens in your {tier.name} plan this month. "
             "Upgrade to continue building."
         )
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         await db.collection("projects").document(project_id).set({
             "owner_id": owner_id,
             "session_id": session_id,
@@ -537,7 +538,7 @@ async def _run(session_id: str, project_id: str) -> dict:
     await _patch_blueprint(blueprint_id, {"build_status": "IN_PROGRESS"})
 
     # 6. Create project doc early so frontend shows build in progress
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     await db.collection("projects").document(project_id).set({
         "owner_id": owner_id,
         "session_id": session_id,
@@ -596,7 +597,7 @@ async def _run(session_id: str, project_id: str) -> dict:
         workspace.push(push_url)
 
         # Save repo info immediately — update prompts can now work even while the agent runs
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         await db.collection("projects").document(project_id).update({
             "repo_full_name": repo_full_name,
             "github_url": repo_url,
@@ -667,6 +668,24 @@ async def _run(session_id: str, project_id: str) -> dict:
             )
         logger.info("Build agent used %d tokens session=%s", tokens_used, session_id)
 
+        # If a database is already connected for this project, replace the
+        # agent's placeholders with the real values (see app/build/workspace.py).
+        proj_doc = await db.collection("projects").document(project_id).get()
+        proj_data = proj_doc.to_dict() or {} if proj_doc.exists else {}
+        if proj_data.get("supabase_url") and proj_data.get("supabase_anon_key"):
+            workspace.write_supabase_env(proj_data["supabase_url"], proj_data["supabase_anon_key"])
+        if proj_data.get("neon_data_api_url"):
+            workspace.write_neon_env(proj_data["neon_data_api_url"])
+        if proj_data.get("firebase_project_id"):
+            workspace.write_firebase_env({
+                "apiKey": proj_data.get("firebase_api_key"),
+                "authDomain": proj_data.get("firebase_auth_domain"),
+                "projectId": proj_data.get("firebase_project_id"),
+                "storageBucket": proj_data.get("firebase_storage_bucket"),
+                "messagingSenderId": proj_data.get("firebase_messaging_sender_id"),
+                "appId": proj_data.get("firebase_app_id"),
+            })
+
         # Record usage against the user's monthly quota
         from app.core.usage import record_usage
         await record_usage(db, owner_id, tokens_used, is_build=True)
@@ -694,7 +713,7 @@ async def _run(session_id: str, project_id: str) -> dict:
             _MAX_FIX = 10
             _MAX_SAME_STREAK = 3
             _MAX_HIT_LIMIT_STREAK = 2  # stop immediately after 2 consecutive iteration-limit hits
-            from app.build.cancel import is_cancelled, clear_cancel
+            from app.build.cancel import clear_cancel, is_cancelled
             while True:
                 if is_cancelled(settings.REDIS_URL, session_id):
                     clear_cancel(settings.REDIS_URL, session_id)
@@ -785,7 +804,7 @@ async def _run(session_id: str, project_id: str) -> dict:
         env_local_path = workspace.path / ".env.local"
         env_local_content = env_local_path.read_text(encoding="utf-8") if env_local_path.exists() else None
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         proj_update: dict = {
             "repo_full_name": repo_full_name,
             "github_url": repo_url,
@@ -824,7 +843,7 @@ async def _run(session_id: str, project_id: str) -> dict:
         )
         logger.error("Build auto-fix exhausted session=%s: %s", session_id, exc)
         await _patch_blueprint(blueprint_id, {"build_status": "FAILED", "build_error": user_msg})
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         proj_err: dict = {
             "is_updating": False,
             "build_error": user_msg,
@@ -840,19 +859,32 @@ async def _run(session_id: str, project_id: str) -> dict:
         return {}
 
     except Exception as exc:
-        from app.core.build_errors import sanitize_build_error
+        from app.core.build_errors import GENERIC_OPERATOR_MESSAGE, sanitize_build_error
         build_err = sanitize_build_error(exc)
         logger.error("Build FAILED session=%s: %s", session_id, exc, exc_info=True)
 
+        user_message = build_err.message
+        if build_err.action == "support":
+            from app.core.alerts import record_operator_alert
+            await record_operator_alert(
+                db,
+                title=build_err.message,
+                raw_detail=str(exc),
+                source="build",
+                session_id=session_id,
+                project_id=project_id,
+            )
+            user_message = GENERIC_OPERATOR_MESSAGE
+
         await _patch_blueprint(blueprint_id, {
             "build_status": "FAILED",
-            "build_error": build_err.message,
+            "build_error": user_message,
         })
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         proj_err: dict = {
             "is_updating": False,
-            "build_error": build_err.message,
+            "build_error": user_message,
             "build_error_action": build_err.action,
             "updated_at": now,
         }
@@ -863,7 +895,7 @@ async def _run(session_id: str, project_id: str) -> dict:
             proj_err["repo_owner"] = "platform" if using_platform_github else "user"
         await db.collection("projects").document(project_id).update(proj_err)
 
-        log_fn("error", f"Build failed: {build_err.message}")
+        log_fn("error", f"Build failed: {user_message}")
         raise
 
     finally:
@@ -883,9 +915,9 @@ def run_build(self, session_id: str, project_id: str) -> dict:
 
 async def _run_preview(project_id: str, user_id: str) -> dict:
     """Clone the project repo, compile, deploy preview, update Firestore."""
-    from app.build.workspace import EditWorkspace
     from app.build.build_logger import make_log_publisher
     from app.build.github_token import get_valid_github_token
+    from app.build.workspace import EditWorkspace
     from app.db.firebase import refresh_async_firestore_client
 
     settings = get_settings()
@@ -914,7 +946,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
     await db.collection("projects").document(project_id).update({
         "is_updating": True,
         "build_error": None,
-        "updated_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(UTC),
     })
     log_fn("started", f"Building preview for {app_name}…")
 
@@ -922,6 +954,26 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
     push_url = f"https://{github_token}@github.com/{repo_full_name}.git"
     try:
         workspace.ensure()
+
+        # If a database is connected for this project, keep .env in sync with
+        # the real values (see app/build/workspace.py) — a prior commit may
+        # only have the agent's placeholders.
+        if project_data.get("supabase_url") and project_data.get("supabase_anon_key"):
+            workspace.write_supabase_env(
+                template_key, project_data["supabase_url"], project_data["supabase_anon_key"]
+            )
+        if project_data.get("neon_data_api_url"):
+            workspace.write_neon_env(template_key, project_data["neon_data_api_url"])
+        if project_data.get("firebase_project_id"):
+            workspace.write_firebase_env(template_key, {
+                "apiKey": project_data.get("firebase_api_key"),
+                "authDomain": project_data.get("firebase_auth_domain"),
+                "projectId": project_data.get("firebase_project_id"),
+                "storageBucket": project_data.get("firebase_storage_bucket"),
+                "messagingSenderId": project_data.get("firebase_messaging_sender_id"),
+                "appId": project_data.get("firebase_app_id"),
+            })
+
         log_fn("info", f"Compiling {stack_label} project (this may take a few minutes)…")
 
         artifact_path = None
@@ -933,7 +985,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         _MAX_FIX = 10
         _MAX_SAME_STREAK = 3
         _MAX_HIT_LIMIT_STREAK = 2
-        from app.build.cancel import is_cancelled, clear_cancel
+        from app.build.cancel import clear_cancel, is_cancelled
         while True:
             if is_cancelled(settings.REDIS_URL, project_id):
                 clear_cancel(settings.REDIS_URL, project_id)
@@ -1001,7 +1053,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         else:
             log_fn("warning", "Compilation produced no output — check the GitHub repo for errors.")
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         updates: dict = {"is_updating": False, "updated_at": now}
         if preview_url:
             updates["preview_url"] = preview_url
@@ -1026,20 +1078,33 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
             "is_updating": False,
             "build_error": user_msg,
             "build_error_action": "user_fix",
-            "updated_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(UTC),
         })
         return {}
 
     except Exception as exc:
-        from app.core.build_errors import sanitize_build_error
+        from app.core.build_errors import GENERIC_OPERATOR_MESSAGE, sanitize_build_error
         build_err = sanitize_build_error(exc)
         logger.error("Preview build FAILED project=%s: %s", project_id, exc, exc_info=True)
-        log_fn("error", f"Preview build failed: {build_err.message}")
+
+        user_message = build_err.message
+        if build_err.action == "support":
+            from app.core.alerts import record_operator_alert
+            await record_operator_alert(
+                db,
+                title=build_err.message,
+                raw_detail=str(exc),
+                source="preview_update",
+                project_id=project_id,
+            )
+            user_message = GENERIC_OPERATOR_MESSAGE
+
+        log_fn("error", f"Preview build failed: {user_message}")
         await db.collection("projects").document(project_id).update({
             "is_updating": False,
-            "build_error": build_err.message,
+            "build_error": user_message,
             "build_error_action": build_err.action,
-            "updated_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(UTC),
         })
         raise
     finally:

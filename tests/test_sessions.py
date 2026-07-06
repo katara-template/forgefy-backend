@@ -1,20 +1,18 @@
 """Session endpoint tests.
 
-Endpoint tests mock VoxaService at the module level so SQLAlchemy column
-defaults (UUID PKs) don't interfere with the mock DB.  State machine and
-service logic are covered by test_state_machine.py and service unit tests.
+Endpoint tests mock VoxaService at the module level, so they don't need a
+Firestore mock at all. State machine and service logic are covered by
+test_state_machine.py and service unit tests.
 """
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from httpx import AsyncClient
 
 from app.db.models.enums import Platform, SessionStatus
 from app.db.models.meeting_event import MeetingEvent
 from app.db.models.meeting_session import MeetingSession
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -29,7 +27,9 @@ def _session(
         status=status,
         platform=Platform.MEET,
         meeting_url="https://meet.google.com/abc",
-        created_at=datetime.now(timezone.utc),
+        start_time=None,
+        end_time=None,
+        created_at=datetime.now(UTC),
     )
 
 
@@ -39,7 +39,7 @@ def _event(session_id: uuid.UUID) -> MeetingEvent:
         session_id=session_id,
         event_type="state_transition",
         payload={"from": "WAITING", "to": "JOINING"},
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
     )
 
 

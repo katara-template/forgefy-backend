@@ -103,10 +103,126 @@ class Workspace:
         """Run the platform-appropriate build; return path to the artifact or None."""
         return build_artifacts_at(self.path, self.template_key)
 
+    def write_supabase_env(self, url: str, anon_key: str) -> None:
+        """Overwrite the build agent's placeholder Supabase values with real ones."""
+        inject_supabase_env(self.path, self.template_key, url, anon_key)
+
+    def write_neon_env(self, data_api_url: str) -> None:
+        """Overwrite the build agent's placeholder Neon Data API URL with the real one."""
+        inject_neon_env(self.path, self.template_key, data_api_url)
+
+    def write_firebase_env(self, config: dict) -> None:
+        """Overwrite the build agent's placeholder Firebase client config with real values."""
+        inject_firebase_env(self.path, self.template_key, config)
+
 
 # ---------------------------------------------------------------------------
 # Shared artifact-build helpers (used by Workspace and EditWorkspace)
 # ---------------------------------------------------------------------------
+
+# Variable names the build agent is instructed to use (app/build/build_agent.py
+# _BUILD_SUFFIX) — kept in one place so injection and the prompt can't drift apart.
+SUPABASE_ENV_VAR_NAMES: dict[str, tuple[str, str]] = {
+    "next": ("NEXT_PUBLIC_SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_ANON_KEY"),
+    "react_native": ("EXPO_PUBLIC_SUPABASE_URL", "EXPO_PUBLIC_SUPABASE_ANON_KEY"),
+    "flutter": ("SUPABASE_URL", "SUPABASE_ANON_KEY"),
+}
+
+NEON_ENV_VAR_NAMES: dict[str, str] = {
+    "next": "NEXT_PUBLIC_NEON_DATA_API_URL",
+    "react_native": "EXPO_PUBLIC_NEON_DATA_API_URL",
+    "flutter": "NEON_DATA_API_URL",
+}
+
+# Logical config keys (as returned by app/integrations/firebase_management.py's
+# get_web_app_config) mapped to the exact per-template env var name.
+_FIREBASE_CONFIG_KEYS = (
+    "apiKey", "authDomain", "projectId", "storageBucket", "messagingSenderId", "appId",
+)
+
+FIREBASE_ENV_VAR_NAMES: dict[str, dict[str, str]] = {
+    "next": {
+        "apiKey": "NEXT_PUBLIC_FIREBASE_API_KEY",
+        "authDomain": "NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN",
+        "projectId": "NEXT_PUBLIC_FIREBASE_PROJECT_ID",
+        "storageBucket": "NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET",
+        "messagingSenderId": "NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID",
+        "appId": "NEXT_PUBLIC_FIREBASE_APP_ID",
+    },
+    "react_native": {
+        "apiKey": "EXPO_PUBLIC_FIREBASE_API_KEY",
+        "authDomain": "EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN",
+        "projectId": "EXPO_PUBLIC_FIREBASE_PROJECT_ID",
+        "storageBucket": "EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET",
+        "messagingSenderId": "EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID",
+        "appId": "EXPO_PUBLIC_FIREBASE_APP_ID",
+    },
+    "flutter": {
+        "apiKey": "FIREBASE_API_KEY",
+        "authDomain": "FIREBASE_AUTH_DOMAIN",
+        "projectId": "FIREBASE_PROJECT_ID",
+        "storageBucket": "FIREBASE_STORAGE_BUCKET",
+        "messagingSenderId": "FIREBASE_MESSAGING_SENDER_ID",
+        "appId": "FIREBASE_APP_ID",
+    },
+}
+
+
+def _inject_env_values(path: Path, values: dict[str, str]) -> None:
+    """Overwrite/append the given KEY=value pairs in .env, preserving everything else."""
+    env_path = path / ".env"
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+
+    replaced: set[str] = set()
+    for i, line in enumerate(lines):
+        name = line.split("=", 1)[0].strip()
+        if name in values:
+            lines[i] = f'{name}="{values[name]}"'
+            replaced.add(name)
+
+    for name, value in values.items():
+        if name not in replaced:
+            lines.append(f'{name}="{value}"')
+
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def inject_supabase_env(path: Path, template_key: str, url: str, anon_key: str) -> None:
+    """Overwrite the placeholder Supabase URL/anon key in .env with real values.
+
+    .env (not .env.local) is intentional — the anon key is public-safe by
+    design (protected by Row Level Security, not secrecy) and is committed to
+    GitHub like every other NEXT_PUBLIC_-style value. Never call this with a
+    service_role key or DB password — those never belong in a client app.
+    """
+    url_var, key_var = SUPABASE_ENV_VAR_NAMES.get(template_key, SUPABASE_ENV_VAR_NAMES["next"])
+    _inject_env_values(path, {url_var: url, key_var: anon_key})
+
+
+def inject_neon_env(path: Path, template_key: str, data_api_url: str) -> None:
+    """Overwrite the placeholder Neon Data API URL in .env with the real one.
+
+    Only the Data API URL — never the raw Postgres connection string/password,
+    which is a real secret and stays backend-only (see app/api/v1/projects.py).
+    """
+    url_var = NEON_ENV_VAR_NAMES.get(template_key, NEON_ENV_VAR_NAMES["next"])
+    _inject_env_values(path, {url_var: data_api_url})
+
+
+def inject_firebase_env(path: Path, template_key: str, config: dict) -> None:
+    """Overwrite the placeholder Firebase client config in .env with real values.
+
+    `config` is the dict returned by firebase_management.get_web_app_config
+    (apiKey/authDomain/projectId/storageBucket/messagingSenderId/appId) — all
+    public-safe by design (security enforced by Firestore Security Rules).
+    """
+    var_names = FIREBASE_ENV_VAR_NAMES.get(template_key, FIREBASE_ENV_VAR_NAMES["next"])
+    values = {
+        var_names[key]: config[key]
+        for key in _FIREBASE_CONFIG_KEYS
+        if config.get(key) is not None
+    }
+    _inject_env_values(path, values)
 
 _NEXT_CONFIG_CANONICAL = """\
 /** @type {import('next').NextConfig} */
@@ -188,7 +304,8 @@ def _ensure_wrangler_toml(path: Path, project_name: str) -> None:
 
 def _patch_tsconfig(path: Path) -> None:
     """Relax tsconfig strictness so minor AI-generated type errors don't block builds."""
-    import json, re
+    import json
+    import re
 
     tsconfig_path = path / "tsconfig.json"
     if not tsconfig_path.exists():
@@ -455,6 +572,18 @@ class EditWorkspace:
     def build_artifacts(self, template_key: str) -> Path | None:
         """Compile the cloned repo and return the artifact path."""
         return build_artifacts_at(self.path, template_key)
+
+    def write_supabase_env(self, template_key: str, url: str, anon_key: str) -> None:
+        """Overwrite the build agent's placeholder Supabase values with real ones."""
+        inject_supabase_env(self.path, template_key, url, anon_key)
+
+    def write_neon_env(self, template_key: str, data_api_url: str) -> None:
+        """Overwrite the build agent's placeholder Neon Data API URL with the real one."""
+        inject_neon_env(self.path, template_key, data_api_url)
+
+    def write_firebase_env(self, template_key: str, config: dict) -> None:
+        """Overwrite the build agent's placeholder Firebase client config with real values."""
+        inject_firebase_env(self.path, template_key, config)
 
     def cleanup(self) -> None:
         """Delete the workspace directory to free disk space."""

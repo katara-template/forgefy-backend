@@ -4,8 +4,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import anthropic
 
@@ -23,6 +25,12 @@ _WARN_AT_ITERATION = 50
 
 _FLUTTER_STRUCTURE = """
 ARCHITECTURE: Clean Architecture with Feature-first organisation.
+
+DATABASE RULE (if a database is connected — Supabase/Neon/Firebase): the SDK is
+initialized and queried ONLY inside data/datasources/{feature}_remote_datasource.dart.
+data/repositories/{feature}_repository_impl.dart calls only the datasource — never
+the SDK directly. Business/validation logic lives in domain/usecases/, not in the
+datasource or repository. presentation/bloc never imports a datasource or the SDK.
 
 EXACT FOLDER STRUCTURE — call create_directory for every path below before writing any files:
 
@@ -102,6 +110,15 @@ goes in app/api/**  (Route Handlers running on the server).
 Client pages/components call these API routes via fetch — they never import server
 modules directly.
 
+DATABASE RULE (if a database is connected — Supabase / Neon / Firebase): ALL reads
+and writes go through lib/services/{entity}.ts, never inline queries scattered across
+route handlers or pages. Route handlers call lib/services/* functions; they never
+call the database client (lib/db.ts) or a provider SDK directly. This is true even
+for public-safe values like a Supabase anon key or Firebase client config — the
+database client/SDK is initialized and queried ONLY inside lib/db.ts and
+lib/services/*.ts, and lib/services/*.ts is imported ONLY by app/api/** route
+handlers, NEVER by a "use client" component.
+
 EXACT FOLDER STRUCTURE — call create_directory for EVERY path before writing files:
 
   ── Server-side API routes (run on the server, never sent to the browser) ──
@@ -130,6 +147,9 @@ EXACT FOLDER STRUCTURE — call create_directory for EVERY path before writing f
 
   ── Server utilities (imported only by app/api/**) ──
   lib/db.ts                     — database client singleton (Prisma / Supabase / mongoose)
+  For each entity/feature that needs persistence:
+    lib/services/{entity}.ts    — the ONLY place with queries for this entity: getX/listX,
+                                   createX, updateX, deleteX — imported only by app/api/**
   lib/auth.ts                   — session helpers, JWT sign/verify, cookie utilities  [AUTH ONLY]
   lib/validations.ts            — Zod schemas for validating request bodies
 
@@ -142,10 +162,22 @@ EXACT FOLDER STRUCTURE — call create_directory for EVERY path before writing f
   middleware.ts                 — Next.js edge middleware (protects /app/* routes)  [AUTH ONLY]
   public/images/                — AI-generated assets
 
-API ROUTE PATTERN — use this shape for every route.ts:
+SERVICES LAYER PATTERN — use this shape for every lib/services/{entity}.ts:
+  import {{ db }} from '@/lib/db'
+  import type {{ {Entity} }} from '@/types'
+
+  export async function list{Entity}s(/* filters */): Promise<{Entity}[]> {{
+    return db...
+  }}
+  export async function create{Entity}(data: ...): Promise<{Entity}> {{
+    return db...
+  }}
+  // update{Entity}, delete{Entity}, get{Entity}ById follow the same shape
+
+API ROUTE PATTERN — use this shape for every route.ts (call lib/services/*, never db directly):
   import {{ NextRequest, NextResponse }} from 'next/server'
   import {{ z }} from 'zod'
-  import {{ db }} from '@/lib/db'
+  import {{ list{Entity}s, create{Entity} }} from '@/lib/services/{entity}'
   import {{ getSession }} from '@/lib/auth'
 
   const Schema = z.object({{ ... }})
@@ -153,7 +185,7 @@ API ROUTE PATTERN — use this shape for every route.ts:
   export async function GET(req: NextRequest) {{
     const session = await getSession(req)
     if (!session) return NextResponse.json({{ error: 'Unauthorized' }}, {{ status: 401 }})
-    const data = await db...
+    const data = await list{Entity}s()
     return NextResponse.json(data)
   }}
 
@@ -161,35 +193,36 @@ API ROUTE PATTERN — use this shape for every route.ts:
     const session = await getSession(req)
     if (!session) return NextResponse.json({{ error: 'Unauthorized' }}, {{ status: 401 }})
     const body = Schema.parse(await req.json())
-    const result = await db...
+    const result = await create{Entity}(body)
     return NextResponse.json(result, {{ status: 201 }})
   }}
 
 BUILD ORDER (strictly follow; skip [AUTH ONLY] steps if auth decision is NO):
   1.  types/index.ts                        — all shared TypeScript interfaces
   2.  lib/db.ts                             — database client
-  3.  lib/auth.ts                           — session / JWT helpers              [AUTH ONLY]
-  4.  lib/validations.ts                    — Zod schemas (one per resource)
-  5.  lib/api.ts                            — client-side fetch wrapper
-  6.  lib/utils.ts                          — shared helpers
-  7.  app/api/auth/login/route.ts           — POST: validate → hash → session    [AUTH ONLY]
-  8.  app/api/auth/register/route.ts        — POST: validate → hash → user       [AUTH ONLY]
-  9.  app/api/auth/logout/route.ts          — POST: clear session cookie          [AUTH ONLY]
-  10. app/api/auth/me/route.ts              — GET: return session user             [AUTH ONLY]
-  11. For each feature: app/api/{f}/route.ts and app/api/{f}/[id]/route.ts
-  12. middleware.ts                         — protect (app)/* group               [AUTH ONLY]
-  13. components/ui/*.tsx                  — ALL base components before any page
-  14. components/layout/*.tsx              — layout components
-  15. hooks/useAuth.ts                     — auth hook                            [AUTH ONLY]
+  3.  lib/services/{entity}.ts              — one per entity/feature that needs persistence
+  4.  lib/auth.ts                           — session / JWT helpers              [AUTH ONLY]
+  5.  lib/validations.ts                    — Zod schemas (one per resource)
+  6.  lib/api.ts                            — client-side fetch wrapper
+  7.  lib/utils.ts                          — shared helpers
+  8.  app/api/auth/login/route.ts           — POST: validate → hash → session    [AUTH ONLY]
+  9.  app/api/auth/register/route.ts        — POST: validate → hash → user       [AUTH ONLY]
+  10. app/api/auth/logout/route.ts          — POST: clear session cookie          [AUTH ONLY]
+  11. app/api/auth/me/route.ts              — GET: return session user             [AUTH ONLY]
+  12. For each feature: app/api/{f}/route.ts and app/api/{f}/[id]/route.ts (call lib/services/*)
+  13. middleware.ts                         — protect (app)/* group               [AUTH ONLY]
+  14. components/ui/*.tsx                  — ALL base components before any page
+  15. components/layout/*.tsx              — layout components
+  16. hooks/useAuth.ts                     — auth hook                            [AUTH ONLY]
       hooks/use{Feature}.ts               — SWR/RQ hooks calling lib/api.ts
-  16. app/layout.tsx                       — root layout with providers
-  17. app/(auth)/login/page.tsx            — login form, calls /api/auth/login    [AUTH ONLY]
-  18. app/(auth)/register/page.tsx         — register form, calls /api/auth/register [AUTH ONLY]
-  19. app/(app)/layout.tsx                 — authenticated shell                  [AUTH ONLY → otherwise use plain app/layout.tsx]
-  20. For each feature: app/(app)/{f}/page.tsx using the components and hooks
-  21. Generate all image/video assets, reference in pages
-  22. tailwind.config.ts / globals.css     — theme tokens
-  23. package.json                         — finalize dependencies (zod, swr, etc.)
+  17. app/layout.tsx                       — root layout with providers
+  18. app/(auth)/login/page.tsx            — login form, calls /api/auth/login    [AUTH ONLY]
+  19. app/(auth)/register/page.tsx         — register form, calls /api/auth/register [AUTH ONLY]
+  20. app/(app)/layout.tsx                 — authenticated shell                  [AUTH ONLY → otherwise use plain app/layout.tsx]
+  21. For each feature: app/(app)/{f}/page.tsx using the components and hooks
+  22. Generate all image/video assets, reference in pages
+  23. tailwind.config.ts / globals.css     — theme tokens
+  24. package.json                         — finalize dependencies (zod, swr, etc.)
 
 TYPESCRIPT RULES — follow exactly to avoid build errors:
 
@@ -243,6 +276,10 @@ EXACT FOLDER STRUCTURE — call create_directory for every path before writing f
 
   src/navigation/               — navigator files
   src/services/                 — shared HTTP client
+  For each entity that needs persistence:
+    src/services/db/{entity}Service.ts   — the ONLY place that calls Supabase/Neon/Firebase
+                                            SDKs for this entity — never call them from a
+                                            screen, component, hook, or slice directly
   src/hooks/                    — shared app-level hooks
   src/styles/                   — shared style constants
   src/utils/                    — constants, helpers
@@ -259,7 +296,8 @@ CANONICAL FILE NAMES — use these exact names, no variations:
   src/features/{feature}/types/{feature}.types.ts    — TypeScript interfaces for this feature
   src/features/{feature}/hooks/use{Feature}.ts       — hook encapsulating dispatch + selectors
   src/navigation/AppNavigator.tsx                    — root Stack/Tab navigator (DO NOT rename)
-  src/services/httpClient.ts                         — axios instance with interceptors
+  src/services/httpClient.ts                         — axios instance with interceptors (remote API, not a database)
+  src/services/db/{entity}Service.ts                 — database reads/writes for this entity (if a database is connected)
   src/hooks/useAppDispatch.ts                        — typed dispatch hook
   src/styles/tailwind.config.js                      — NativeWind / StyleSheet tokens
   src/utils/constants.ts                             — API_URL, storage keys, etc.
@@ -267,17 +305,18 @@ CANONICAL FILE NAMES — use these exact names, no variations:
 
 BUILD ORDER (strictly follow; skip auth feature steps if auth decision is NO):
   1. src/utils/constants.ts and src/services/httpClient.ts
-  2. types files for every feature  (skip auth feature if auth decision is NO)
-  3. slice files for every feature  (skip auth slice if auth decision is NO)
-  4. src/app/store.ts + rootReducer.ts (import all slices)
-  5. api files for every feature    (skip auth API if auth decision is NO)
-  6. hooks for every feature + src/hooks/useAppDispatch.ts
-  7. feature components/ (reusable, no screens yet)
-  8. feature screens/               (skip login/register screens if auth decision is NO)
-  9. src/navigation/AppNavigator.tsx — if auth YES: include auth stack; if NO: go straight to main stack
-  10. src/App.tsx
-  11. Generate all image assets, reference in screens
-  12. package.json / app.json — finalize dependencies
+  2. src/services/db/{entity}Service.ts for every entity that needs persistence (if a database is connected)
+  3. types files for every feature  (skip auth feature if auth decision is NO)
+  4. slice files for every feature  (skip auth slice if auth decision is NO)
+  5. src/app/store.ts + rootReducer.ts (import all slices)
+  6. api files for every feature    (skip auth API if auth decision is NO) — call src/services/db/*Service.ts, never the SDK directly
+  7. hooks for every feature + src/hooks/useAppDispatch.ts
+  8. feature components/ (reusable, no screens yet)
+  9. feature screens/               (skip login/register screens if auth decision is NO)
+  10. src/navigation/AppNavigator.tsx — if auth YES: include auth stack; if NO: go straight to main stack
+  11. src/App.tsx
+  12. Generate all image assets, reference in screens
+  13. package.json / app.json — finalize dependencies
 """
 
 _STRUCTURE_MAP = {
@@ -320,6 +359,10 @@ RULES:
   • Pages go in presentation/pages/ ONLY. Never at lib/ root or lib/screens/.
   • Widgets go in presentation/widgets/ ONLY.
   • Data models go in data/models/ ONLY.
+  • If a database is connected (Supabase/Neon/Firebase), the SDK is initialized and
+    queried ONLY inside data/datasources/{feature}_remote_datasource.dart — the
+    repository_impl calls only the datasource, business/validation logic lives in
+    domain/usecases/, and presentation/bloc never touches the datasource or SDK directly.
   • If you add a new feature, create ALL sub-folders listed above.
   • If you add a new screen, register it in lib/app.dart (GoRouter or named routes).
 """,
@@ -328,7 +371,9 @@ REACT NATIVE FOLDER STRUCTURE — every file you create MUST follow this layout:
 
   src/app/store.ts               src/app/rootReducer.ts
   src/navigation/AppNavigator.tsx   ← only navigator file, do NOT rename
-  src/services/httpClient.ts
+  src/services/httpClient.ts        ← remote API HTTP client, NOT a database
+  src/services/db/{entity}Service.ts  ← ONE per entity that needs persistence — the
+                                        ONLY place that calls Supabase/Neon/Firebase SDKs
   src/hooks/useAppDispatch.ts
   src/styles/tailwind.config.js
   src/utils/constants.ts
@@ -346,6 +391,8 @@ RULES:
   • Screens go in features/{feature}/screens/ ONLY. Never in src/screens/ or root.
   • Components go in features/{feature}/components/ ONLY.
   • Slice files go in features/{feature}/slice/ ONLY.
+  • If a database is connected, ALL reads/writes go through src/services/db/{entity}Service.ts
+    — screens/components/slices never call Supabase/Neon/Firebase SDKs directly.
   • If you add a new screen, register it in src/navigation/AppNavigator.tsx.
   • If you add a new slice, add it to src/app/store.ts and rootReducer.ts.
 """,
@@ -358,13 +405,17 @@ NEXT.JS FOLDER STRUCTURE — every file you create MUST follow this layout:
   components/{feature}/               — feature-specific reusable components
   components/ui/                      — shared primitive components
   components/layout/                  — Header, Sidebar, Footer, etc.
-  lib/db.ts   lib/auth.ts   lib/validations.ts   lib/api.ts   lib/utils.ts
+  lib/db.ts   lib/services/{entity}.ts   lib/auth.ts   lib/validations.ts   lib/api.ts   lib/utils.ts
   hooks/use{Feature}.ts
   types/index.ts
   middleware.ts                        — route protection [auth only]
 
 RULES:
   • API logic goes in app/api/ ONLY — never in page.tsx files.
+  • If a database is connected (Supabase/Neon/Firebase), ALL reads/writes go through
+    lib/services/{entity}.ts — route handlers call these functions, never inline
+    queries against lib/db.ts or a provider SDK directly, and never from a
+    "use client" component.
   • New pages go in app/(app)/{feature}/page.tsx.
   • Add a nav link in components/layout/ when adding a new page.
   • All shared types in types/index.ts — do not scatter them across files.
@@ -538,6 +589,11 @@ _BUILD_SUFFIX = """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ADDITIONAL REQUIREMENTS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• If a database is connected for this project, ALL reads and writes must go through
+  the services/datasource layer described above for this platform (lib/services/*.ts
+  for Next.js, src/services/db/*Service.ts for React Native, data/datasources/* for
+  Flutter) — never scatter raw provider SDK/query calls inside pages, screens, or
+  widgets/components directly.
 • Implement EVERY feature listed in the blueprint — nothing optional
 • Handle loading states, empty states, and basic error states in every screen
 • Add input validation where the app collects user data
@@ -548,9 +604,34 @@ ADDITIONAL REQUIREMENTS
   1. .env  ← committed to GitHub
      Contains ONLY public-safe variables with placeholder values. Public-safe means:
        — NEXT_PUBLIC_* (bundled into browser JS — cannot be secret by design)
-       — Supabase URL + anon key (security enforced by Row Level Security, not the key)
-       — Firebase client config: apiKey, authDomain, projectId, storageBucket,
-         messagingSenderId, appId (security enforced by Firebase Security Rules)
+       — Supabase URL + anon key (security enforced by Row Level Security, not the key).
+         ALWAYS use these EXACT variable names (a build step may overwrite them with
+         a real connected project's values — using any other name means that step
+         silently can't find them):
+           Next.js        → NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY
+           React Native   → EXPO_PUBLIC_SUPABASE_URL, EXPO_PUBLIC_SUPABASE_ANON_KEY
+           Flutter        → SUPABASE_URL, SUPABASE_ANON_KEY
+         If .env already contains these variables with non-placeholder-looking
+         values (not "your-...", not empty), a real database is already connected
+         — leave them exactly as they are, do not overwrite with placeholders.
+       — Neon Data API URL (public-safe — never the raw Postgres connection
+         string, which is a secret and must never appear in any of these files).
+         Same rule: ALWAYS use these exact names, and leave real values alone:
+           Next.js        → NEXT_PUBLIC_NEON_DATA_API_URL
+           React Native   → EXPO_PUBLIC_NEON_DATA_API_URL
+           Flutter        → NEON_DATA_API_URL
+       — Firebase client config (public-safe — security enforced by Firebase
+         Security Rules, not by keeping these values secret): apiKey, authDomain,
+         projectId, storageBucket, messagingSenderId, appId.
+         Same rule: ALWAYS use these exact names, and leave real values alone:
+           Next.js        → NEXT_PUBLIC_FIREBASE_API_KEY, NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+                             NEXT_PUBLIC_FIREBASE_PROJECT_ID, NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+                             NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID, NEXT_PUBLIC_FIREBASE_APP_ID
+           React Native   → EXPO_PUBLIC_FIREBASE_API_KEY, EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN,
+                             EXPO_PUBLIC_FIREBASE_PROJECT_ID, EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET,
+                             EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID, EXPO_PUBLIC_FIREBASE_APP_ID
+           Flutter        → FIREBASE_API_KEY, FIREBASE_AUTH_DOMAIN, FIREBASE_PROJECT_ID,
+                             FIREBASE_STORAGE_BUCKET, FIREBASE_MESSAGING_SENDER_ID, FIREBASE_APP_ID
        — Any other client-side SDK init value
 
   2. .env.local  ← gitignored (add to .gitignore if not already present)
@@ -2046,9 +2127,7 @@ def _validation_needs_fix_pass(val_summary: str) -> bool:
     vs = val_summary.lower().strip()
     if "all checks passed" in vs:
         return False
-    if vs.startswith("validated:") or "\nvalidated:" in vs:
-        return False
-    return True
+    return not (vs.startswith("validated:") or "\nvalidated:" in vs)
 
 
 def _make_fix_prompt(val_summary: str) -> str:
@@ -2254,6 +2333,65 @@ _GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:g
 _TOOL_RESULT_LIMIT = 1500
 
 
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_GEMINI_MAX_RETRIES = 4
+_GEMINI_BASE_DELAY_S = 5.0
+
+
+def _gemini_post_with_retry(
+    url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    timeout: int,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
+    """POST to Gemini, retrying with backoff on rate-limit/overload responses.
+
+    Unlike the Anthropic/OpenAI SDKs (which retry 429/5xx automatically), this
+    loop calls the Gemini REST API directly via `requests`, so a single
+    transient rate-limit or overload response used to kill the entire build
+    task immediately — no second chance. This gives it the same resilience.
+    """
+    import requests as _req
+
+    delay = _GEMINI_BASE_DELAY_S
+    last_exc: Exception | None = None
+
+    for attempt in range(_GEMINI_MAX_RETRIES + 1):
+        try:
+            resp = _req.post(url, params={"key": api_key}, json=payload, timeout=timeout)
+        except _req.exceptions.RequestException as exc:
+            last_exc = exc
+        else:
+            if resp.status_code not in _RETRYABLE_STATUS_CODES:
+                resp.raise_for_status()
+                return resp.json()
+            # 429 covers both "too many requests" (worth retrying) and
+            # depleted prepaid credits (RESOURCE_EXHAUSTED — retrying is
+            # futile, it'll return the exact same response every time).
+            if "RESOURCE_EXHAUSTED" in resp.text and "credit" in resp.text.lower():
+                raise RuntimeError(
+                    "Gemini prepayment credits are depleted. Add credits at "
+                    "https://ai.studio/projects, or switch BUILD_MODEL to "
+                    "'claude' or 'gpt' in .env."
+                )
+            last_exc = _req.exceptions.HTTPError(
+                f"{resp.status_code} {resp.reason} for {url}: {resp.text[:300]}"
+            )
+
+        if attempt < _GEMINI_MAX_RETRIES:
+            if log_fn:
+                log_fn(
+                    "warning",
+                    f"Gemini API busy — retrying in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{_GEMINI_MAX_RETRIES})…",
+                )
+            time.sleep(delay)
+            delay *= 2
+
+    raise RuntimeError(f"Gemini agent request failed after {_GEMINI_MAX_RETRIES} retries: {last_exc}") from last_exc
+
+
 def _tools_to_gemini_format(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{"functionDeclarations": [
         {
@@ -2276,8 +2414,6 @@ def _gemini_loop(
     max_iterations: int = _MAX_ITERATIONS,
 ) -> tuple[str, int]:
     """Gemini tool-use agent loop via REST API. Returns (summary, 0)."""
-    import requests as _req
-
     url = _GEMINI_URL.format(model=model)
     gemini_tools = _tools_to_gemini_format(TOOLS)
     contents: list[dict[str, Any]] = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
@@ -2294,22 +2430,18 @@ def _gemini_loop(
         if iteration == warn_at and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
-        try:
-            resp = _req.post(
-                url,
-                params={"key": api_key},
-                json={
-                    "system_instruction": {"parts": [{"text": system}]},
-                    "contents": contents,
-                    "tools": gemini_tools,
-                    "generationConfig": {"maxOutputTokens": 8192},
-                },
-                timeout=120,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
-            raise RuntimeError(f"Gemini agent request failed: {exc}") from exc
+        data = _gemini_post_with_retry(
+            url,
+            api_key,
+            {
+                "system_instruction": {"parts": [{"text": system}]},
+                "contents": contents,
+                "tools": gemini_tools,
+                "generationConfig": {"maxOutputTokens": 8192},
+            },
+            timeout=120,
+            log_fn=log_fn,
+        )
 
         candidates = data.get("candidates", [])
         if not candidates:

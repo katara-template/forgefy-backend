@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import json
 import uuid
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
+import pytest
 
 # ── Agent base tests ──────────────────────────────────────────────────────────
 
@@ -31,13 +32,12 @@ class TestCallClaude:
         mock_msg = MagicMock()
         mock_msg.content = [MagicMock(text="This is not JSON")]
 
-        with patch("app.ai.agents.base.anthropic.Anthropic") as mock_cls:
+        with (
+            patch("app.ai.agents.base.anthropic.Anthropic") as mock_cls,
+            pytest.raises(ValueError),
+        ):
             mock_cls.return_value.messages.create.return_value = mock_msg
-            try:
-                call_claude("system", "user text", api_key="fake", model="claude-sonnet-4-5")
-                assert False, "Should have raised ValueError"
-            except ValueError:
-                pass
+            call_claude("system", "user text", api_key="fake", model="claude-sonnet-4-5")
 
 
 # ── Individual agent tests ────────────────────────────────────────────────────
@@ -184,7 +184,7 @@ class TestExtractionWorker:
         mock_redis = MagicMock()
 
         with (
-            patch("app.workers.extraction_worker.run_pipeline", return_value=events),
+            patch("app.workers.extraction_worker._run_extraction", return_value=events),
             patch("app.workers.extraction_worker.sync_redis.from_url", return_value=mock_redis),
         ):
             extract_requirements(session_id, "some transcript")
@@ -204,7 +204,7 @@ class TestExtractionWorker:
         mock_redis = MagicMock()
 
         with (
-            patch("app.workers.extraction_worker.run_pipeline", return_value=[]),
+            patch("app.workers.extraction_worker._run_extraction", return_value=[]),
             patch("app.workers.extraction_worker.sync_redis.from_url", return_value=mock_redis),
         ):
             extract_requirements(session_id, "silent meeting")

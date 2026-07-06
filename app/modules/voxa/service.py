@@ -1,7 +1,7 @@
 """VoxaService — meeting session lifecycle orchestration."""
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from google.cloud.firestore import AsyncClient
 
@@ -56,7 +56,7 @@ class VoxaService:
     ) -> MeetingSession:
         """Create a session in WAITING state and log the creation event."""
         session_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         session_data = {
             "user_id": str(user_id),
@@ -108,7 +108,7 @@ class VoxaService:
             SessionStatus.JOINING,
             extra_payload={"initiated_by": str(user_id)},
         )
-        start_time = datetime.now(timezone.utc)
+        start_time = datetime.now(UTC)
         await self._db.collection("sessions").document(str(session_id)).update(
             {"start_time": start_time}
         )
@@ -124,7 +124,7 @@ class VoxaService:
                 "session_id": str(session_id),
                 "event_type": "access",
                 "payload": {"action": "join", "user_id": str(user_id)},
-                "timestamp": datetime.now(timezone.utc),
+                "timestamp": datetime.now(UTC),
             })
         )
 
@@ -154,7 +154,7 @@ class VoxaService:
             SessionStatus.LISTENING,
             extra_payload={"initiated_by": str(user_id)},
         )
-        start_time = datetime.now(timezone.utc)
+        start_time = datetime.now(UTC)
         await self._db.collection("sessions").document(str(session_id)).update(
             {"start_time": start_time}
         )
@@ -176,7 +176,7 @@ class VoxaService:
             )
 
         session = await self._sm.transition(session_id, SessionStatus.PROCESSING)
-        end_time = datetime.now(timezone.utc)
+        end_time = datetime.now(UTC)
         await self._db.collection("sessions").document(str(session_id)).update(
             {"end_time": end_time}
         )
@@ -221,7 +221,7 @@ class VoxaService:
                 "session_id": str(session_id),
                 "event_type": "access",
                 "payload": {"action": "read", "user_id": str(user_id)},
-                "timestamp": datetime.now(timezone.utc),
+                "timestamp": datetime.now(UTC),
             })
         )
         return session, events

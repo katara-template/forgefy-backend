@@ -18,8 +18,8 @@ _CHANNEL_PREFIX = "voxa:session:"
 
 async def _run_aggregation(session_id: str) -> str:
     """Run BlueprintAggregator in an async context; return blueprint_id string."""
-    from app.db.firebase import refresh_async_firestore_client
     from app.build.blueprint_generator import BlueprintAggregator
+    from app.db.firebase import refresh_async_firestore_client
 
     db = refresh_async_firestore_client()
     aggregator = BlueprintAggregator(db)
@@ -43,6 +43,8 @@ async def _mark_session_failed(session_id: str) -> None:
     max_retries=2,
     time_limit=360,       # hard kill after 6 min
     soft_time_limit=300,  # SoftTimeLimitExceeded raised at 5 min
+    acks_late=True,
+    reject_on_worker_lost=True,
 )
 def generate_blueprint(self, session_id: str) -> None:
     """Aggregate requirements, create Blueprint document, notify via Redis."""
@@ -56,13 +58,13 @@ def generate_blueprint(self, session_id: str) -> None:
     except SoftTimeLimitExceeded as exc:
         loop.close()
         logger.warning("Blueprint task soft time limit hit session=%s, retrying", session_id)
-        raise self.retry(exc=exc, countdown=15)
+        raise self.retry(exc=exc, countdown=15) from exc
     except Exception as exc:
         if self.request.retries < self.max_retries:
             # "No transcript data" means extraction tasks haven't landed yet — give
             # them time.  Other transient failures (API errors) get a shorter wait.
             countdown = 30 if "No transcript data" in str(exc) else 10
-            raise self.retry(exc=exc, countdown=countdown)
+            raise self.retry(exc=exc, countdown=countdown) from exc
 
         # All retries exhausted — surface the failure.
         from app.core.build_errors import sanitize_build_error

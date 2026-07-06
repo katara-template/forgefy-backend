@@ -3,7 +3,7 @@
 Uses the `bcrypt` library directly — passlib 1.7.4 is incompatible with
 bcrypt 4/5 (wrap-bug detection raises ValueError on long test passwords).
 """
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import bcrypt as _bcrypt
 from jose import JWTError, jwt
@@ -38,7 +38,7 @@ def _make_token(subject: str, token_type: str, expire: datetime, settings: Setti
 
 def create_access_token(subject: str, settings: Settings) -> str:
     """Encode a short-lived access JWT for the given subject (user UUID)."""
-    expire = datetime.now(timezone.utc) + timedelta(
+    expire = datetime.now(UTC) + timedelta(
         minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
     )
     return _make_token(subject, "access", expire, settings)
@@ -46,7 +46,7 @@ def create_access_token(subject: str, settings: Settings) -> str:
 
 def create_refresh_token(subject: str, settings: Settings) -> str:
     """Encode a long-lived refresh JWT for the given subject (user UUID)."""
-    expire = datetime.now(timezone.utc) + timedelta(
+    expire = datetime.now(UTC) + timedelta(
         days=settings.REFRESH_TOKEN_EXPIRE_DAYS
     )
     return _make_token(subject, "refresh", expire, settings)
@@ -67,8 +67,8 @@ def decode_token(
         payload = jwt.decode(
             token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
         )
-    except JWTError:
-        raise UnauthorizedError("Invalid or expired token")
+    except JWTError as exc:
+        raise UnauthorizedError("Invalid or expired token") from exc
 
     if payload.get("type") != expected_type:
         raise UnauthorizedError(f"Expected '{expected_type}' token, got '{payload.get('type')}'")

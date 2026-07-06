@@ -32,6 +32,11 @@ def _get_or_create_session(session_id: str) -> TranscriptionSession:
     return _sessions[session_id]
 
 
+# Deliberately no acks_late/reject_on_worker_lost here: _sessions is an
+# in-memory, per-worker-process registry tied to a live Deepgram WebSocket.
+# Redelivering a chunk to a different worker after a crash wouldn't find
+# that session — it would silently open a new Deepgram connection out of
+# order, corrupting the transcript rather than safely retrying.
 @celery_app.task(name="app.workers.transcription_worker.process_audio_chunk")
 def process_audio_chunk(session_id: str, chunk_b64: str) -> None:
     """Decode a base64 PCM chunk and forward it to the Deepgram streaming session.

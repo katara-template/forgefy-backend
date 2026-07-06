@@ -3,13 +3,23 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import uuid
+from contextlib import suppress
+from datetime import UTC, datetime
 
 from fastapi import APIRouter
 
 from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
-from app.deps import CurrentUser, DBSession
-from app.schemas.project import ChatHistoryRequest, ChatRequest, ChatResponse, ProjectOut, UpdateProjectRequest
+from app.deps import CurrentUser, DBSession, SettingsDep
+from app.schemas.project import (
+    ChatHistoryRequest,
+    ChatRequest,
+    ChatResponse,
+    ConnectSupabaseRequest,
+    ProjectOut,
+    UpdateProjectRequest,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -34,6 +44,19 @@ def _doc_to_out(doc) -> ProjectOut:
         is_updating=d.get("is_updating", False),
         build_error=d.get("build_error"),
         build_error_action=d.get("build_error_action"),
+        supabase_project_ref=d.get("supabase_project_ref"),
+        supabase_url=d.get("supabase_url"),
+        supabase_anon_key=d.get("supabase_anon_key"),
+        neon_project_id=d.get("neon_project_id"),
+        neon_data_api_url=d.get("neon_data_api_url"),
+        firebase_project_id=d.get("firebase_project_id"),
+        firebase_api_key=d.get("firebase_api_key"),
+        firebase_auth_domain=d.get("firebase_auth_domain"),
+        firebase_storage_bucket=d.get("firebase_storage_bucket"),
+        firebase_messaging_sender_id=d.get("firebase_messaging_sender_id"),
+        firebase_app_id=d.get("firebase_app_id"),
+        db_decision_pending=d.get("db_decision_pending", False),
+        db_decision_reason=d.get("db_decision_reason"),
     )
 
 
@@ -45,6 +68,30 @@ async def _get_owned(project_id: uuid.UUID, user_id: uuid.UUID, db) -> ProjectOu
     if uuid.UUID(d["owner_id"]) != user_id:
         raise ForbiddenError("Access denied")
     return _doc_to_out(doc)
+
+
+async def _finalize_db_connect(project_id: uuid.UUID, project: ProjectOut, db) -> dict:
+    """Called by every connect_* endpoint right after a database provisions.
+
+    Two cases, per the "never touch a database without consent" rule:
+    - The initial build was withheld pending this exact decision (db_decision_pending) —
+      clear the flag and finally dispatch the build the user already approved.
+    - Otherwise this is an already-built project — connecting only provisions the
+      database; a separate explicit confirmation (POST /{id}/wire-database) is required
+      before any code gets rewritten to use it.
+    """
+    if project.db_decision_pending:
+        await db.collection("projects").document(str(project_id)).update({
+            "db_decision_pending": False,
+            "db_decision_reason": None,
+            "is_updating": True,
+            "updated_at": datetime.now(UTC),
+        })
+        from app.workers.build_worker import run_build
+        run_build.apply_async(args=[str(project.session_id), str(project_id)], queue="build")
+        return {"build_queued": True}
+
+    return {"prompt_wire_in": True}
 
 
 @router.get("", response_model=list[ProjectOut])
@@ -82,16 +129,16 @@ async def stop_project(
     """Signal any running agent or build task for this project to stop."""
     await _get_owned(project_id, user.id, db)  # ownership check
 
-    from app.config import get_settings
     from app.build.cancel import request_cancel
+    from app.config import get_settings
     settings = get_settings()
     request_cancel(settings.REDIS_URL, str(project_id))
 
     # Immediately mark as not-updating so the UI unblocks
-    from datetime import datetime, timezone
+    from datetime import datetime
     await db.collection("projects").document(str(project_id)).update({
         "is_updating": False,
-        "updated_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(UTC),
     })
     return {"stopped": True}
 
@@ -103,7 +150,6 @@ async def delete_project(
     user: CurrentUser,
 ) -> dict:
     """Permanently delete a project and its associated resources."""
-    from datetime import datetime, timezone
 
     project = await _get_owned(project_id, user.id, db)
 
@@ -114,17 +160,16 @@ async def delete_project(
 
     # 1. Delete Firestore documents
     await db.collection("projects").document(pid).delete()
-    try:
+    with suppress(Exception):  # non-fatal
         await db.collection("project_chats").document(pid).delete()
-    except Exception:
-        pass  # non-fatal
 
     # 2. Try to delete the GitHub repo (needs delete_repo scope — may fail gracefully)
     if project.repo_full_name:
         try:
-            from app.config import get_settings
-            from app.build.github_token import get_valid_github_token
             import httpx
+
+            from app.build.github_token import get_valid_github_token
+            from app.config import get_settings
             settings = get_settings()
             token = await get_valid_github_token(str(user.id), settings.GITHUB_TOKEN)
             async with httpx.AsyncClient(timeout=10) as client:
@@ -137,8 +182,8 @@ async def delete_project(
 
     # 3. Clear any Redis cancel flag left over
     try:
-        from app.config import get_settings
         from app.build.cancel import clear_cancel
+        from app.config import get_settings
         settings = get_settings()
         clear_cancel(settings.REDIS_URL, pid)
     except Exception:
@@ -168,8 +213,9 @@ async def get_code_tree(
 ) -> dict:
     """Return a flat list of source file paths from the project's GitHub repo."""
     import httpx
-    from app.config import get_settings
+
     from app.build.github_token import get_valid_github_token
+    from app.config import get_settings
 
     project = await _get_owned(project_id, user.id, db)
     if not project.repo_full_name:
@@ -225,9 +271,11 @@ async def get_code_file(
 ) -> dict:
     """Return the text content of a single file from the project's GitHub repo."""
     import base64
+
     import httpx
-    from app.config import get_settings
+
     from app.build.github_token import get_valid_github_token
+    from app.config import get_settings
 
     project = await _get_owned(project_id, user.id, db)
     if not project.repo_full_name:
@@ -273,6 +321,9 @@ async def update_project(
     user: CurrentUser,
 ) -> dict:
     """Dispatch a prompt-driven update for the project. Returns immediately."""
+    from app.core.usage import check_not_over_limit
+    await check_not_over_limit(db, str(user.id))
+
     project = await _get_owned(project_id, user.id, db)
 
     if project.is_updating:
@@ -299,11 +350,18 @@ async def chat_with_project(
     - Clear app-change requests → translate into a precise technical instruction, then queue
     - Vague / ambiguous requests → ask a clarifying question instead of wasting a build
     """
+    from app.core.usage import check_not_over_limit
+    await check_not_over_limit(db, str(user.id))
+
     project = await _get_owned(project_id, user.id, db)
     message = body.message.strip()
 
     if not message:
         return ChatResponse(type="chat", response="I didn't catch that — what would you like to do?")
+
+    db_connected = bool(
+        project.supabase_project_ref or project.neon_project_id or project.firebase_project_id
+    )
 
     from app.config import get_settings
 
@@ -403,6 +461,8 @@ request through as the update_prompt. Big requests are fine.
    DO NOT use for broad-but-specific requests (multiple features, full flows,
    comprehensive improvements). Those are "update".
    response: ask ONE specific question.
+   clarify_options: REQUIRED whenever you use "clarify" (see ASKING CLARIFYING
+   QUESTIONS below) — the user picks an answer, they never type a free-form reply.
 
 3. "update"
    Use for ANY request that names features, screens, behaviour, or improvements —
@@ -410,6 +470,49 @@ request through as the update_prompt. Big requests are fine.
    response: a short, enthusiastic confirmation of what will be built.
    update_prompt: pass the user's request through with full detail, expanding
    any implicit requirements so the planner has everything it needs.
+
+──────────────────────────────────────────────
+DATABASE CONSENT — never assume, always ask
+──────────────────────────────────────────────
+This project currently {"HAS" if db_connected else "has NO"} database connected.
+{"" if db_connected else '''
+If fulfilling this request would require durably storing structured data across
+sessions/devices/users (saved records, user accounts, orders, posts, chat history,
+bookmarks, etc.) — and NOT just simple local/in-memory/on-device state — do NOT
+silently plan to add one. Instead:
+  - type: "clarify"
+  - response: a short note naming what needs storing and asking if they want
+    to connect a database first, e.g. "This needs somewhere to save that data.
+    Want to connect a database first?"
+  - needs_database: true
+  - do NOT set update_prompt and do NOT queue anything in this case.
+
+If the user's message is clearly DECLINING a database you previously suggested
+(a short reply like "no", "not now", "skip it", "continue without one" — check
+the recent conversation above to see if your last message asked this question),
+do not ask again. Instead proceed with the ORIGINAL feature request (look back
+at the message before the decline) as a normal "update", using local/in-memory/
+on-device storage instead of a real database, and set needs_database: false.
+'''}
+Otherwise (a database is already connected, or the request doesn't need durable
+storage), proceed normally and set needs_database: false.
+
+──────────────────────────────────────────────
+ASKING CLARIFYING QUESTIONS — never free text, always a real choice
+──────────────────────────────────────────────
+Only ask when you actually need to (see "clarify" above — genuinely ambiguous
+requests only, not broad-but-specific ones). When you do ask, the user picks an
+answer by tapping a button — they can never type a free-form reply — so every
+clarifying question MUST be phrased as EITHER:
+  - a yes/no question, with clarify_options: ["Yes", "No"] (or two short
+    domain-specific labels that mean the same thing, e.g. ["Grid", "List"]), OR
+  - a multiple-choice question with EXACTLY three concrete, mutually exclusive
+    options, with clarify_options: ["<option 1>", "<option 2>", "<option 3>"]
+Never leave clarify_options empty or omit it when type is "clarify" — an
+open-ended question the user has to type an answer to is not allowed. Keep each
+option short (2-5 words) so it reads well as a button label.
+This does not apply to the DATABASE CONSENT case above, which always uses its
+own fixed Yes/No via needs_database — do not also set clarify_options there.
 
 ──────────────────────────────────────────────
 HOW TO WRITE A GOOD update_prompt
@@ -434,7 +537,9 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
 {{
   "type": "chat" | "clarify" | "update",
   "response": "<message to show the user>",
-  "update_prompt": "<detailed technical instruction — only present when type is update>"
+  "update_prompt": "<detailed technical instruction — only present when type is update>",
+  "needs_database": true | false,
+  "clarify_options": ["Yes", "No"] | ["<option 1>", "<option 2>", "<option 3>"] | null
 }}"""
 
     log_fn("thinking", "Analysing your request…")
@@ -442,6 +547,7 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
     try:
         if settings.BUILD_MODEL == "Qwen3":
             import asyncio
+
             import requests as _req
 
             def _ollama_classify():
@@ -464,6 +570,7 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
 
         elif settings.BUILD_MODEL == "gemini":
             import asyncio
+
             import requests as _req
 
             def _gemini_classify():
@@ -552,6 +659,25 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
     intent = parsed.get("type", "chat")
     user_response = parsed.get("response", "")
     update_prompt = parsed.get("update_prompt", "").strip()
+    needs_database = bool(parsed.get("needs_database", False))
+
+    # A clarifying question must always be a real choice (yes/no or exactly three
+    # options) — never free text. If the classifier didn't comply, drop the
+    # options rather than render a broken/empty button row.
+    raw_clarify_options = parsed.get("clarify_options")
+    clarify_options: list[str] | None = None
+    if (
+        intent == "clarify"
+        and isinstance(raw_clarify_options, list)
+        and len(raw_clarify_options) in (2, 3)
+        and all(isinstance(o, str) and o.strip() for o in raw_clarify_options)
+    ):
+        clarify_options = [o.strip() for o in raw_clarify_options]
+
+    # Defensive: never queue an update alongside a pending database question,
+    # even if the classifier mis-set both fields — asking always wins.
+    if needs_database:
+        return ChatResponse(type="clarify", response=user_response, needs_database=True)
 
     if intent == "update":
         if not update_prompt:
@@ -574,7 +700,7 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
         return ChatResponse(type="update", response=user_response, update_queued=True)
 
     # "chat" or "clarify" — just return the response, nothing queued
-    return ChatResponse(type=intent, response=user_response)
+    return ChatResponse(type=intent, response=user_response, clarify_options=clarify_options)
 
 
 @router.get("/{project_id}/chat-history")
@@ -599,10 +725,10 @@ async def save_chat_history(
 ) -> dict:
     """Persist the chat history for a project (last 100 messages)."""
     await _get_owned(project_id, user.id, db)
-    from datetime import datetime, timezone
+    from datetime import datetime
     messages = body.messages[-100:]
     await db.collection("project_chats").document(str(project_id)).set(
-        {"messages": messages, "updated_at": datetime.now(timezone.utc)},
+        {"messages": messages, "updated_at": datetime.now(UTC)},
     )
     return {"saved": len(messages)}
 
@@ -627,4 +753,225 @@ async def trigger_preview_build(
         args=[str(project_id), str(user.id)],
         queue="build",
     )
+    return {"status": "queued"}
+
+
+@router.post("/{project_id}/supabase/connect", response_model=dict)
+async def connect_supabase(
+    project_id: uuid.UUID,
+    body: ConnectSupabaseRequest,
+    db: DBSession,
+    settings: SettingsDep,
+    user: CurrentUser,
+) -> dict:
+    """Provision a real Supabase project for this Forgefy project.
+
+    Requires the user's Supabase account to already be linked (see
+    /api/v1/auth/supabase/authorize). The generated app's .env is updated
+    with the real URL/anon key on the next build (see
+    Workspace.write_supabase_env in app/build/workspace.py) — never the
+    db_pass or a service_role key, which stay backend-only.
+    """
+    from app.build.supabase_token import get_valid_supabase_token
+    from app.core.crypto import encrypt
+    from app.integrations import supabase_management
+
+    project = await _get_owned(project_id, user.id, db)
+
+    token = await get_valid_supabase_token(db, str(user.id), settings)
+    if not token:
+        raise ValidationError("No Supabase account linked. Connect your Supabase account first.")
+
+    db_pass = secrets.token_urlsafe(24)
+    created = await supabase_management.create_project(
+        token,
+        organization_id=body.organization_id,
+        name=project.app_name,
+        db_pass=db_pass,
+    )
+    project_ref = created["id"]
+
+    keys = await supabase_management.get_api_keys(token, project_ref)
+    anon_key = next((k["api_key"] for k in keys if k.get("name") == "anon"), None)
+
+    await db.collection("projects").document(str(project_id)).update({
+        "supabase_project_ref": project_ref,
+        "supabase_url": f"https://{project_ref}.supabase.co",
+        "supabase_anon_key": anon_key,
+        "supabase_db_pass": encrypt(db_pass),
+        "supabase_connected_at": datetime.now(UTC),
+    })
+    extra = await _finalize_db_connect(project_id, project, db)
+    return {"status": "connected", "project_ref": project_ref, **extra}
+
+
+@router.post("/{project_id}/neon/connect", response_model=dict)
+async def connect_neon(
+    project_id: uuid.UUID,
+    db: DBSession,
+    settings: SettingsDep,
+    user: CurrentUser,
+) -> dict:
+    """Provision a real Neon Postgres project for this Forgefy project.
+
+    Embedded model — no user OAuth, uses Forgefy's own NEON_API_KEY. The raw
+    Postgres connection string is a real secret and is encrypted and kept
+    backend-only; only the Data API URL (public-safe) is ever written into the
+    generated app's .env (see Workspace.write_neon_env in app/build/workspace.py).
+    """
+    from app.core.crypto import encrypt
+    from app.integrations import neon_management
+
+    if not settings.NEON_API_KEY:
+        raise ValidationError("Neon integration is not configured on this server.")
+
+    project = await _get_owned(project_id, user.id, db)
+
+    created = await neon_management.create_project(settings.NEON_API_KEY, name=project.app_name)
+    neon_project_id = created["project"]["id"]
+    branch_id = created["branch"]["id"]
+    connection_uri = created["connection_uris"][0]["connection_uri"]
+
+    data_api = await neon_management.enable_data_api(
+        settings.NEON_API_KEY, project_id=neon_project_id, branch_id=branch_id
+    )
+    # NOTE: Neon's Data API response field name is not verified against a real
+    # API key yet — trying the plausible candidates. Once tested for real,
+    # check the actual response and simplify this to the one true key name.
+    data_api_url = data_api.get("uri") or data_api.get("data_api_url") or data_api.get("url")
+
+    await db.collection("projects").document(str(project_id)).update({
+        "neon_project_id": neon_project_id,
+        "neon_connection_uri": encrypt(connection_uri),
+        "neon_data_api_url": data_api_url,
+        "neon_connected_at": datetime.now(UTC),
+    })
+    extra = await _finalize_db_connect(project_id, project, db)
+    return {"status": "connected", "project_id": neon_project_id, **extra}
+
+
+def _make_gcp_project_id(app_name: str) -> str:
+    """Build a globally-unique, spec-compliant GCP project id.
+
+    GCP project ids must be 6-30 chars, lowercase letters/digits/hyphens, and
+    unique across all of GCP — so a random suffix is required regardless of
+    how unique app_name itself is.
+    """
+    import re
+
+    slug = re.sub(r"[^a-z0-9-]", "-", app_name.lower()).strip("-")[:20] or "forgefy-app"
+    return f"fg-{slug}-{secrets.token_hex(3)}"
+
+
+@router.post("/{project_id}/firebase/connect", response_model=dict)
+async def connect_firebase(
+    project_id: uuid.UUID,
+    db: DBSession,
+    settings: SettingsDep,
+    user: CurrentUser,
+) -> dict:
+    """Provision a real Firebase/Firestore project for this Forgefy project.
+
+    Requires the user's Google account to already be linked (see
+    /api/v1/auth/firebase/authorize). Firestore only — no Firebase Auth /
+    Identity Platform setup, since choosing sign-in providers is a per-app
+    product decision. The generated app's .env is updated with the real
+    client config on the next build (see Workspace.write_firebase_env in
+    app/build/workspace.py). The client config is public-safe by design
+    (security enforced by Firestore Security Rules) so nothing here needs
+    encryption, unlike Supabase's db_pass or Neon's connection string.
+    """
+    from app.build.firebase_token import get_valid_firebase_token
+    from app.integrations import firebase_management
+
+    project = await _get_owned(project_id, user.id, db)
+
+    token = await get_valid_firebase_token(db, str(user.id), settings)
+    if not token:
+        raise ValidationError("No Google account linked. Connect your Google account first.")
+
+    gcp_project_id = _make_gcp_project_id(project.app_name)
+    config = await firebase_management.provision_project(
+        token, project_id=gcp_project_id, display_name=project.app_name
+    )
+    # GCP always assigns the projectId we requested, but prefer whatever the API
+    # actually confirms over the locally-generated value if the two ever diverge.
+    firebase_project_id = config.get("projectId", gcp_project_id)
+
+    await db.collection("projects").document(str(project_id)).update({
+        "firebase_project_id": firebase_project_id,
+        "firebase_api_key": config.get("apiKey"),
+        "firebase_auth_domain": config.get("authDomain"),
+        "firebase_storage_bucket": config.get("storageBucket"),
+        "firebase_messaging_sender_id": config.get("messagingSenderId"),
+        "firebase_app_id": config.get("appId"),
+        "firebase_connected_at": datetime.now(UTC),
+    })
+    extra = await _finalize_db_connect(project_id, project, db)
+    return {"status": "connected", "project_id": firebase_project_id, **extra}
+
+
+@router.post("/{project_id}/skip-database", response_model=dict)
+async def skip_database(
+    project_id: uuid.UUID,
+    db: DBSession,
+    user: CurrentUser,
+) -> dict:
+    """Decline the pre-build database suggestion and dispatch the withheld build.
+
+    Only valid while a decision is actually pending (see approve_blueprint in
+    app/api/v1/blueprints.py, which withholds the initial build when the
+    classifier thinks the app needs persistent storage).
+    """
+    project = await _get_owned(project_id, user.id, db)
+
+    if not project.db_decision_pending:
+        raise ValidationError("No database decision is pending for this project.")
+
+    await db.collection("projects").document(str(project_id)).update({
+        "db_decision_pending": False,
+        "db_decision_reason": None,
+        "is_updating": True,
+        "updated_at": datetime.now(UTC),
+    })
+
+    from app.workers.build_worker import run_build
+    run_build.apply_async(args=[str(project.session_id), str(project_id)], queue="build")
+    return {"status": "queued"}
+
+
+@router.post("/{project_id}/wire-database", response_model=dict)
+async def wire_database(
+    project_id: uuid.UUID,
+    db: DBSession,
+    user: CurrentUser,
+) -> dict:
+    """Explicit second consent step: scan the app and wire the already-connected
+    database into it. Connecting a database only provisions it — this is the
+    separate confirmation required before any code gets rewritten to use it.
+    """
+    project = await _get_owned(project_id, user.id, db)
+
+    if project.is_updating:
+        raise ValidationError("A build or update is already in progress.")
+
+    if project.supabase_project_ref:
+        provider = "Supabase"
+    elif project.neon_project_id:
+        provider = "Neon"
+    elif project.firebase_project_id:
+        provider = "Firebase"
+    else:
+        raise ValidationError("No database is connected for this project yet.")
+
+    prompt = (
+        f"A {provider} database is now connected to this project. Create or extend "
+        "the project's services/datasource layer for all reads and writes, and replace "
+        "any mock/local/in-memory data handling with real calls through it. Scan the "
+        "whole app for places that need updating — every screen or page that currently "
+        "uses placeholder data should use the real database instead."
+    )
+
+    from app.workers.update_worker import apply_update
+    apply_update.apply_async(args=[str(project_id), prompt, str(user.id)], queue="build")
     return {"status": "queued"}

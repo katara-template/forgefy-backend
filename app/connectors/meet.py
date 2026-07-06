@@ -14,14 +14,12 @@ display-name set to "Forgefy Bot".
 """
 from __future__ import annotations
 
-import base64
 import logging
 import threading
 import time
 
 from playwright.sync_api import Page, sync_playwright
 
-from app.config import get_settings
 from app.workers.transcription_worker import process_audio_chunk
 
 logger = logging.getLogger(__name__)

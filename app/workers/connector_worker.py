@@ -15,7 +15,11 @@ from app.workers.celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 
-@celery_app.task(name="app.workers.connector_worker.dispatch_connector")
+@celery_app.task(
+    name="app.workers.connector_worker.dispatch_connector",
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
 def dispatch_connector(session_id: str, platform: str, meeting_url: str | None) -> None:
     """Create a Recall.ai bot to join the meeting (non-blocking HTTP call)."""
     from app.db.models.enums import Platform
@@ -39,7 +43,11 @@ def dispatch_connector(session_id: str, platform: str, meeting_url: str | None) 
         logger.error("Connector error session=%s: %s", session_id, exc, exc_info=True)
 
 
-@celery_app.task(name="app.workers.connector_worker.recall_remove_bot")
+@celery_app.task(
+    name="app.workers.connector_worker.recall_remove_bot",
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
 def recall_remove_bot(session_id: str) -> None:
     """Look up the Recall bot for session_id and delete it."""
     from app.config import get_settings
