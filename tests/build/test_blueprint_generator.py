@@ -174,6 +174,38 @@ class TestBlueprintGeneratorGenerate:
         mock_synth.assert_called_once()
         assert blueprint.json_output["app_description"] == "A team collaboration tool"
 
+    async def test_prefers_full_transcript_synthesis_over_noisy_fragment_events(self):
+        """Regression test: when BOTH raw transcript segments AND incremental
+        per-fragment extraction events exist (the normal case for a real
+        Recall/physical meeting), the final blueprint must come from one
+        synthesis pass over the full transcript — not from concatenating the
+        per-fragment events, which are each extracted from an isolated,
+        often too-short chunk and can be noisy or hallucinated junk.
+        """
+        transcript = _event_doc("transcript.segment", {"text": "We need a login page"})
+        junk_feature = _event_doc(
+            "FEATURE_FOUND",
+            {"title": "Junk", "description": "hallucinated from a 2-word fragment", "priority": "low"},
+        )
+        db = _make_db(_session_doc(), [transcript, junk_feature])
+
+        synth_events = [
+            {"sub_state": "APP_DESCRIPTION", "payload": {"text": "A real product description"}},
+            {"sub_state": "FEATURE_FOUND", "payload": {"title": "Login", "description": "Auth", "priority": "high"}},
+        ]
+
+        with (
+            patch("app.build.blueprint_generator.MeetingStateMachine") as mock_sm_cls,
+            patch("app.config.get_settings", return_value=_FAKE_SETTINGS),
+            patch("app.ai.agents.synthesizer.run", return_value=synth_events) as mock_synth,
+        ):
+            mock_sm_cls.return_value.transition = AsyncMock(return_value=_session_obj())
+            blueprint = await BlueprintAggregator(db).generate(SESSION_ID)
+
+        mock_synth.assert_called_once()
+        assert blueprint.json_output["app_description"] == "A real product description"
+        assert blueprint.json_output["features"][0]["title"] == "Login"
+
     async def test_raises_when_no_transcript_data_at_all(self):
         """Empty events collection → ValueError mentioning 'No transcript data'."""
         db = _make_db(_session_doc(), [])  # no events whatsoever

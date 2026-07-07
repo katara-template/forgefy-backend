@@ -141,15 +141,22 @@ class BlueprintAggregator:
             .order_by("timestamp", direction="ASCENDING")
             .get()
         )
-        extraction_events = [
-            d.to_dict() for d in event_docs
-            if d.to_dict().get("event_type") in _EXTRACTION_TYPES
-        ]
+        event_dicts = [d.to_dict() for d in event_docs]
+        has_raw_transcript = any(e.get("event_type") == "transcript.segment" for e in event_dicts)
+        extraction_events = [e for e in event_dicts if e.get("event_type") in _EXTRACTION_TYPES]
 
-        if not extraction_events:
+        if has_raw_transcript:
+            # Prefer one coherent synthesis pass over the full transcript. The
+            # incremental FEATURE_FOUND/etc. events below are each extracted from
+            # a single realtime fragment (sometimes just a few words) in
+            # isolation, so concatenating them produces noisy, context-free
+            # junk. Only fall back to them when no raw transcript was ever
+            # persisted at all.
             json_output = await self._synthesize_from_segments(session_id, session, event_docs)
-        else:
+        elif extraction_events:
             json_output = _build_blueprint_json(session, extraction_events)
+        else:
+            raise ValueError(f"No transcript data found for session {session_id}. Nothing was recorded or stored.")
 
         # Reject completely empty blueprints — better to surface the error than save dead data
         if not json_output.get("app_description") and not json_output.get("features"):
