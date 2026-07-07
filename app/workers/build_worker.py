@@ -491,6 +491,11 @@ async def _run(session_id: str, project_id: str) -> dict:
     from app.build.github_token import get_valid_github_token
     sess_doc = await db.collection("sessions").document(session_id).get()
     owner_id: str = sess_doc.to_dict()["user_id"] if sess_doc.exists else ""
+
+    from app.core.build_model import get_effective_build_model
+    effective_model = await get_effective_build_model(db, settings, user_id=owner_id)
+    settings = settings.model_copy(update={"BUILD_MODEL": effective_model})
+
     github_token = await get_valid_github_token(owner_id, settings.GITHUB_TOKEN)
     # True when user hasn't connected their GitHub — repo lands on the platform account
     using_platform_github: bool = github_token == settings.GITHUB_TOKEN
@@ -922,6 +927,10 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
 
     settings = get_settings()
     db = refresh_async_firestore_client()
+
+    from app.core.build_model import get_effective_build_model
+    effective_model = await get_effective_build_model(db, settings, user_id=user_id)
+    settings = settings.model_copy(update={"BUILD_MODEL": effective_model})
 
     # Wipe any stale cancel flag before starting fresh work.
     from app.build.cancel import clear_cancel as _clear_cancel

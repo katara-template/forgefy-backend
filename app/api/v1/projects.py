@@ -364,8 +364,11 @@ async def chat_with_project(
     )
 
     from app.config import get_settings
+    from app.core.build_model import get_effective_build_model
 
     settings = get_settings()
+    effective_model = await get_effective_build_model(db, settings, user_id=str(user.id))
+    settings = settings.model_copy(update={"BUILD_MODEL": effective_model})
     fw = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(
         project.template_key, project.template_key
     )

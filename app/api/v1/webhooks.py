@@ -71,12 +71,17 @@ async def recall_webhook(
 # ---------------------------------------------------------------------------
 
 async def _handle_transcript(data: dict, settings) -> None:
-    """Publish transcript segment to Redis and enqueue extraction."""
-    bot_id: str = data.get("bot_id", "")
-    transcript: dict = data.get("transcript", {})
-    words: list[dict] = transcript.get("words", [])
-    speaker: str = transcript.get("speaker", "")
-    is_final: bool = bool(transcript.get("is_final", True))
+    """Publish transcript segment to Redis and enqueue extraction.
+
+    Recall only sends `transcript.data` (never `transcript.partial_data`, which
+    we don't subscribe to) — every event here is already a finalized utterance.
+    """
+    bot_id: str = data.get("bot", {}).get("id", "")
+    inner: dict = data.get("data", {})
+    words: list[dict] = inner.get("words", [])
+    participant: dict = inner.get("participant") or {}
+    speaker: str = participant.get("name") or ""
+    is_final = True
 
     text = " ".join(w.get("text", "") for w in words).strip()
     if not text:
