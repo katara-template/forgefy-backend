@@ -39,9 +39,22 @@ class RecallConnector:
         payload = {
             "meeting_url": meeting_url,
             "bot_name": _BOT_NAME,
-            "real_time_transcription": {
-                "destination_url": self._webhook_url,
-                "partial_results": False,
+            "recording_config": {
+                "transcript": {
+                    "provider": {
+                        "recallai_streaming": {
+                            "mode": "prioritize_low_latency",
+                            "language_code": "en",
+                        }
+                    },
+                },
+                "realtime_endpoints": [
+                    {
+                        "type": "webhook",
+                        "url": self._webhook_url,
+                        "events": ["transcript.data"],
+                    }
+                ],
             },
             "automatic_leave": {
                 "everyone_left_timeout": 2,
