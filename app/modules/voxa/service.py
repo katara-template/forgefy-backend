@@ -55,6 +55,11 @@ class VoxaService:
         meeting_url: str | None = None,
     ) -> MeetingSession:
         """Create a session in WAITING state and log the creation event."""
+        if platform != Platform.PHYSICAL and not (meeting_url and meeting_url.strip()):
+            raise ValidationError(
+                "A meeting URL is required for Google Meet, Zoom, and Teams sessions."
+            )
+
         session_id = str(uuid.uuid4())
         now = datetime.now(UTC)
 
