@@ -53,6 +53,11 @@ class RecallConnector:
                 json=payload,
                 headers=self._auth_headers(),
             )
+            if resp.is_error:
+                logger.error(
+                    "Recall bot creation failed session=%s status=%s body=%s",
+                    session_id, resp.status_code, resp.text,
+                )
             resp.raise_for_status()
             bot_id = resp.json()["id"]
 
