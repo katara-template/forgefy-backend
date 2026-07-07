@@ -3,9 +3,14 @@ Recall's `transcript.data` event nests bot id under `bot.id` and the words/speak
 under a *second* `data` level (`data.data.words`, `data.data.participant.name`),
 not the flatter shape the handler used to assume.
 """
+import base64
+import hashlib
+import hmac
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from httpx import AsyncClient
 
 from app.api.v1.webhooks import _handle_transcript
 
@@ -92,6 +97,67 @@ class TestHandleTranscript:
 
         payload = json.loads(redis_mock.publish.call_args[0][1])
         assert payload["speaker"] == ""
+
+
+class TestRecallWebhookSignature:
+    """Recall signs requests Svix-style: HMAC-SHA256 over "id.timestamp.body",
+    keyed by the base64 portion of the whsec_ secret, sent as Webhook-Signature.
+    """
+
+    _SECRET_BYTES = b"0123456789abcdef0123456789abcdef"
+    _SECRET = "whsec_" + base64.b64encode(_SECRET_BYTES).decode()
+
+    def _sign(self, webhook_id: str, timestamp: str, body: str) -> str:
+        to_sign = f"{webhook_id}.{timestamp}.{body}".encode()
+        digest = hmac.new(self._SECRET_BYTES, to_sign, hashlib.sha256).digest()
+        return f"v1,{base64.b64encode(digest).decode()}"
+
+    async def test_missing_headers_rejected_when_secret_configured(
+        self, client: AsyncClient
+    ) -> None:
+        fake_settings = MagicMock(RECALL_WORKSPACE_VERIFICATION_SECRET=self._SECRET)
+        with patch("app.api.v1.webhooks.get_settings", return_value=fake_settings):
+            resp = await client.post("/api/v1/webhooks/recall", json={"event": "ping", "data": {}})
+        assert resp.status_code == 401
+
+    async def test_invalid_signature_rejected(self, client: AsyncClient) -> None:
+        fake_settings = MagicMock(RECALL_WORKSPACE_VERIFICATION_SECRET=self._SECRET)
+        with patch("app.api.v1.webhooks.get_settings", return_value=fake_settings):
+            resp = await client.post(
+                "/api/v1/webhooks/recall",
+                json={"event": "ping", "data": {}},
+                headers={
+                    "Webhook-Id": "msg_1",
+                    "Webhook-Timestamp": "1700000000",
+                    "Webhook-Signature": "v1,bm90dGhlcmlnaHRzaWc=",
+                },
+            )
+        assert resp.status_code == 401
+
+    async def test_valid_signature_accepted(self, client: AsyncClient) -> None:
+        fake_settings = MagicMock(
+            RECALL_WORKSPACE_VERIFICATION_SECRET=self._SECRET, REDIS_URL="redis://test"
+        )
+        body = json.dumps({"event": "ping", "data": {}})
+        sig = self._sign("msg_1", "1700000000", body)
+        with patch("app.api.v1.webhooks.get_settings", return_value=fake_settings):
+            resp = await client.post(
+                "/api/v1/webhooks/recall",
+                content=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Webhook-Id": "msg_1",
+                    "Webhook-Timestamp": "1700000000",
+                    "Webhook-Signature": sig,
+                },
+            )
+        assert resp.status_code == 204
+
+    async def test_no_secret_configured_skips_verification(self, client: AsyncClient) -> None:
+        fake_settings = MagicMock(RECALL_WORKSPACE_VERIFICATION_SECRET="", REDIS_URL="redis://test")
+        with patch("app.api.v1.webhooks.get_settings", return_value=fake_settings):
+            resp = await client.post("/api/v1/webhooks/recall", json={"event": "ping", "data": {}})
+        assert resp.status_code == 204
 
 
 if __name__ == "__main__":
