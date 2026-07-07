@@ -16,6 +16,15 @@ logger = logging.getLogger(__name__)
 
 _CHANNEL_PREFIX = "voxa:session:"
 
+# Realtime transcript providers (Recall's recallai_streaming in particular) can
+# finalize utterances as short as 2-3 words. Below this word count there's no
+# coherent product signal to extract, and running the full synthesis prompt on
+# an isolated fragment this small tends to produce hallucinated junk (the model
+# has nothing real to describe, so it drifts toward describing its own
+# instructions instead). Skip AI extraction entirely for these — the raw text
+# is still persisted below so it's included in the final full-transcript pass.
+_MIN_WORDS_FOR_EXTRACTION = 6
+
 
 async def _persist_transcript(session_id: str, transcript_segment: str) -> None:
     """Write a transcript segment to Firestore unconditionally."""
@@ -97,6 +106,13 @@ def extract_requirements(session_id: str, transcript_segment: str) -> None:
             loop.close()
     except Exception as exc:
         logger.warning("Failed to persist transcript segment session=%s: %s", session_id, exc)
+
+    if len(transcript_segment.split()) < _MIN_WORDS_FOR_EXTRACTION:
+        logger.debug(
+            "Skipping extraction for too-short fragment session=%s words=%d",
+            session_id, len(transcript_segment.split()),
+        )
+        return
 
     events = _run_extraction(transcript_segment, settings)
 
