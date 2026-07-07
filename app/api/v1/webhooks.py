@@ -4,12 +4,15 @@ Recall delivers two event types:
   • transcript.data   — real-time transcript segment for a bot
   • bot.status_change — bot lifecycle (joining → in_call_recording → call_ended …)
 
-Security: every request carries the workspace verification secret in the
-X-Recall-Workspace-Verification-Secret header.  If the secret is configured
-we reject anything that doesn't match.
+Security: requests carry a Svix-style HMAC signature (Webhook-Id / Webhook-
+Timestamp / Webhook-Signature headers), verified against
+RECALL_WORKSPACE_VERIFICATION_SECRET. If the secret is configured we reject
+anything that doesn't verify.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -37,19 +40,35 @@ _TERMINAL_STATUSES = {"call_ended", "done", "fatal"}
 @router.post("/recall", status_code=204)
 async def recall_webhook(
     request: Request,
-    x_recall_workspace_verification_secret: str | None = Header(default=None),
+    webhook_id: str | None = Header(default=None, alias="Webhook-Id"),
+    webhook_timestamp: str | None = Header(default=None, alias="Webhook-Timestamp"),
+    webhook_signature: str | None = Header(default=None, alias="Webhook-Signature"),
 ) -> None:
-    """Receive and process Recall.ai webhook events."""
-    settings = get_settings()
+    """Receive and process Recall.ai webhook events.
 
-    if (
-        settings.RECALL_WORKSPACE_VERIFICATION_SECRET
-        and x_recall_workspace_verification_secret != settings.RECALL_WORKSPACE_VERIFICATION_SECRET
-    ):
-        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+    Recall signs requests the same way Svix does — HMAC-SHA256 over
+    "{id}.{timestamp}.{raw body}", keyed by the base64 portion of the
+    workspace secret after its `whsec_` prefix, base64-encoded, and sent
+    as one or more space-separated `v1,<sig>` tokens in Webhook-Signature.
+    """
+    settings = get_settings()
+    raw_body = await request.body()
+
+    if settings.RECALL_WORKSPACE_VERIFICATION_SECRET:
+        if not (webhook_id and webhook_timestamp and webhook_signature):
+            raise HTTPException(status_code=401, detail="Missing webhook signature headers")
+
+        secret_b64 = settings.RECALL_WORKSPACE_VERIFICATION_SECRET.removeprefix("whsec_")
+        key = base64.b64decode(secret_b64)
+        to_sign = f"{webhook_id}.{webhook_timestamp}.{raw_body.decode()}".encode()
+        expected = base64.b64encode(hmac.new(key, to_sign, hashlib.sha256).digest()).decode()
+
+        provided_sigs = [s.split(",", 1)[1] for s in webhook_signature.split() if "," in s]
+        if not any(hmac.compare_digest(expected, sig) for sig in provided_sigs):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     try:
-        body = await request.json()
+        body = json.loads(raw_body)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
 
