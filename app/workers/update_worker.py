@@ -95,7 +95,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         log_fn("info", "Workspace ready, running update agent…")
 
         from app.core.build_model import get_effective_build_model
-        build_model = await get_effective_build_model(db, settings)
+        build_model = await get_effective_build_model(db, settings, user_id=user_id)
 
         # Build a condensed history of previous requests + what was done so the
         # agent understands what already exists and doesn't repeat or contradict it.

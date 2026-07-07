@@ -7,13 +7,12 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from app.core.build_model import VALID_BUILD_MODELS
 from app.core.exceptions import ValidationError
 from app.core.tiers import TIERS
 from app.deps import AdminUser, DBSession
 
 router = APIRouter()
-
-VALID_BUILD_MODELS = ("claude", "Qwen3", "gemini", "gpt")
 
 TEMPLATE_LABELS: dict[str, str] = {
     "flutter": "Flutter",

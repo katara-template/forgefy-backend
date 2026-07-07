@@ -99,13 +99,19 @@ class RecallConnector:
 
 
 def remove_bot(bot_id: str, base_url: str, api_key: str) -> None:
-    """DELETE a Recall bot — safe to call even if already gone."""
+    """Make a Recall bot leave the call — safe to call even if it's already gone."""
     try:
         with httpx.Client(timeout=15) as client:
-            client.delete(
-                f"{base_url}/bot/{bot_id}/",
+            resp = client.post(
+                f"{base_url}/bot/{bot_id}/leave_call/",
                 headers={"Authorization": f"Token {api_key}"},
             )
-        logger.info("Recall bot removed bot_id=%s", bot_id)
+        if resp.is_error:
+            logger.warning(
+                "Recall bot removal failed bot_id=%s status=%s body=%s",
+                bot_id, resp.status_code, resp.text,
+            )
+        else:
+            logger.info("Recall bot removed bot_id=%s", bot_id)
     except Exception as exc:
         logger.warning("Failed to remove Recall bot %s: %s", bot_id, exc)
