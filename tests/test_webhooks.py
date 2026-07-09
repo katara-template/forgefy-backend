@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from httpx import AsyncClient
 
-from app.api.v1.webhooks import _handle_transcript
+from app.api.v1.webhooks import _handle_status_change, _handle_transcript
 
 
 def _recall_transcript_payload(bot_id: str, words: list[str], speaker: str | None) -> dict:
@@ -97,6 +97,88 @@ class TestHandleTranscript:
 
         payload = json.loads(redis_mock.publish.call_args[0][1])
         assert payload["speaker"] == ""
+
+
+class TestHandleStatusChange:
+    """Recall sends bot lifecycle events in two shapes — the current API emits
+    one event per status (`bot.done`, `bot.call_ended`, …) with the code under
+    `data.data.code`; older versions emit a single `bot.status_change` event
+    with the code under `data.bot.status.code`. Both must auto-end the session.
+    """
+
+    def _legacy_payload(self, bot_id: str, code: str) -> dict:
+        return {"bot": {"id": bot_id, "status": {"code": code}}}
+
+    def _current_payload(self, bot_id: str, code: str) -> dict:
+        return {
+            "data": {"code": code, "sub_code": None, "updated_at": "2026-01-01T00:00:00Z"},
+            "bot": {"id": bot_id, "metadata": {}},
+        }
+
+    async def _run(self, event_type: str, data: dict, get_return: str | None = "session-1"):
+        settings = MagicMock(REDIS_URL="redis://test")
+        redis_mock = _mock_redis(get_return=get_return)
+
+        with (
+            patch("app.api.v1.webhooks.aioredis.from_url", return_value=redis_mock),
+            patch(
+                "app.api.v1.webhooks._end_session_from_bot", new_callable=AsyncMock
+            ) as mock_end,
+            patch(
+                "app.api.v1.webhooks._try_transition_session", new_callable=AsyncMock
+            ) as mock_transition,
+            patch("app.workers.connector_worker.recall_delete_media") as mock_delete,
+        ):
+            await _handle_status_change(event_type, data, settings)
+
+        return settings, redis_mock, mock_end, mock_transition, mock_delete
+
+    def _assert_ended_and_purged(self, settings, redis_mock, mock_end, mock_delete) -> None:
+        from app.workers.connector_worker import DELETE_MEDIA_COUNTDOWN_SECONDS
+
+        mock_end.assert_awaited_once_with("session-1", settings)
+        mock_delete.apply_async.assert_called_once_with(
+            args=["bot-1"],
+            countdown=DELETE_MEDIA_COUNTDOWN_SECONDS,
+            queue="meeting.audio",
+        )
+        redis_mock.delete.assert_awaited_once_with(
+            "recall:bot:bot-1", "recall:session:session-1"
+        )
+
+    async def test_legacy_terminal_status_ends_session_and_purges_media(self) -> None:
+        settings, redis_mock, mock_end, _, mock_delete = await self._run(
+            "bot.status_change", self._legacy_payload("bot-1", "call_ended")
+        )
+        self._assert_ended_and_purged(settings, redis_mock, mock_end, mock_delete)
+
+    async def test_current_terminal_event_ends_session_and_purges_media(self) -> None:
+        settings, redis_mock, mock_end, _, mock_delete = await self._run(
+            "bot.done", self._current_payload("bot-1", "done")
+        )
+        self._assert_ended_and_purged(settings, redis_mock, mock_end, mock_delete)
+
+    async def test_status_falls_back_to_event_name_when_no_code_in_payload(self) -> None:
+        settings, redis_mock, mock_end, _, mock_delete = await self._run(
+            "bot.call_ended", {"bot": {"id": "bot-1"}}
+        )
+        self._assert_ended_and_purged(settings, redis_mock, mock_end, mock_delete)
+
+    async def test_current_non_terminal_event_transitions_without_ending(self) -> None:
+        _, _, mock_end, mock_transition, mock_delete = await self._run(
+            "bot.in_call_recording", self._current_payload("bot-1", "in_call_recording")
+        )
+        mock_transition.assert_awaited_once()
+        assert mock_transition.await_args[0][1] == "LISTENING"
+        mock_end.assert_not_awaited()
+        mock_delete.apply_async.assert_not_called()
+
+    async def test_unknown_bot_does_nothing(self) -> None:
+        _, _, mock_end, _, mock_delete = await self._run(
+            "bot.done", self._current_payload("bot-x", "done"), get_return=None
+        )
+        mock_end.assert_not_awaited()
+        mock_delete.apply_async.assert_not_called()
 
 
 class TestRecallWebhookSignature:

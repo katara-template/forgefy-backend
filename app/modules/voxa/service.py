@@ -13,6 +13,14 @@ from app.modules.voxa.state_machine import MeetingStateMachine
 
 logger = logging.getLogger(__name__)
 
+_ENDABLE = frozenset({SessionStatus.JOINING, SessionStatus.LISTENING})
+_ALREADY_ENDED = frozenset({
+    SessionStatus.PROCESSING,
+    SessionStatus.BLUEPRINT_READY,
+    SessionStatus.APPROVED,
+    SessionStatus.BUILDING,
+})
+
 
 def _doc_to_session(doc) -> MeetingSession:
     data = doc.to_dict()
@@ -171,32 +179,53 @@ class VoxaService:
         session_id: uuid.UUID,
         user_id: uuid.UUID,
     ) -> MeetingSession:
-        """End the meeting: transition to PROCESSING and record end_time."""
+        """End the meeting: transition to PROCESSING and record end_time.
+
+        Idempotent with the bot-detected meeting end: if the session was
+        already ended (by the Recall webhook or a double click), return it
+        as-is instead of erroring.
+        """
+        from app.core.exceptions import InvalidStateTransition
+
         session = await self._require_owned(session_id, user_id)
 
-        endable = {SessionStatus.JOINING, SessionStatus.LISTENING}
-        if session.status not in endable:
+        if session.status in _ALREADY_ENDED:
+            return session
+
+        if session.status not in _ENDABLE:
             raise ValidationError(
                 f"Cannot end a session in '{session.status.value}' state"
             )
 
-        session = await self._sm.transition(session_id, SessionStatus.PROCESSING)
-        end_time = datetime.now(UTC)
-        await self._db.collection("sessions").document(str(session_id)).update(
-            {"end_time": end_time}
-        )
-        session.end_time = end_time
+        try:
+            return await self._finalize_end(session, remove_bot=True)
+        except InvalidStateTransition:
+            # Raced with the bot-detected end — the session is already
+            # PROCESSING and the blueprint is on its way.
+            return await self._require_owned(session_id, user_id)
 
-        if session.platform != Platform.PHYSICAL:
-            from app.workers.connector_worker import recall_remove_bot
-            recall_remove_bot.apply_async(args=[str(session_id)], queue="meeting.audio")
+    async def end_session_from_bot(self, session_id: uuid.UUID) -> MeetingSession | None:
+        """End a session when the bot reports the meeting itself ended.
 
-        from app.workers.blueprint_worker import generate_blueprint
-        generate_blueprint.apply_async(
-            args=[str(session_id)],
-            queue="meeting.extract",
-        )
-        return session
+        Runs the same pipeline as the frontend end button (end_session),
+        minus the ownership check (Recall's webhook is the caller) and the
+        bot removal (the bot already left). Returns None when there is
+        nothing to do — session missing or already ended.
+        """
+        from app.core.exceptions import InvalidStateTransition
+
+        doc = await self._db.collection("sessions").document(str(session_id)).get()
+        if not doc.exists:
+            return None
+
+        session = _doc_to_session(doc)
+        if session.status not in _ENDABLE:
+            return None
+
+        try:
+            return await self._finalize_end(session, remove_bot=False)
+        except InvalidStateTransition:
+            return None
 
     async def get_session(
         self,
@@ -232,6 +261,38 @@ class VoxaService:
         return session, events
 
     # ── Private helpers ───────────────────────────────────────────────────────
+
+    async def _finalize_end(
+        self,
+        session: MeetingSession,
+        *,
+        remove_bot: bool,
+    ) -> MeetingSession:
+        """Shared end-of-meeting pipeline: PROCESSING + end_time + blueprint.
+
+        Raises InvalidStateTransition if another caller ended the session
+        between the caller's status check and the transition.
+        """
+        session_id = session.id
+        platform = session.platform
+
+        session = await self._sm.transition(session_id, SessionStatus.PROCESSING)
+        end_time = datetime.now(UTC)
+        await self._db.collection("sessions").document(str(session_id)).update(
+            {"end_time": end_time}
+        )
+        session.end_time = end_time
+
+        if remove_bot and platform != Platform.PHYSICAL:
+            from app.workers.connector_worker import recall_remove_bot
+            recall_remove_bot.apply_async(args=[str(session_id)], queue="meeting.audio")
+
+        from app.workers.blueprint_worker import generate_blueprint
+        generate_blueprint.apply_async(
+            args=[str(session_id)],
+            queue="meeting.extract",
+        )
+        return session
 
     async def _require_owned(
         self,

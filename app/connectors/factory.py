@@ -32,4 +32,5 @@ def get_connector(platform: Platform):
         region=settings.RECALL_REGION,
         redis_url=settings.REDIS_URL,
         webhook_base_url=settings.PUBLIC_API_BASE_URL,
+        avatar_path=settings.RECALL_BOT_AVATAR_PATH,
     )

@@ -14,6 +14,10 @@ from app.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
+# Recall needs time to finalize media after a call ends before it can be
+# deleted; the task's retry backoff covers bots that take longer.
+DELETE_MEDIA_COUNTDOWN_SECONDS = 120
+
 
 @celery_app.task(
     name="app.workers.connector_worker.dispatch_connector",
@@ -67,6 +71,39 @@ def recall_remove_bot(session_id: str) -> None:
             base_url=f"https://{settings.RECALL_REGION}.recall.ai/api/v1",
             api_key=settings.RECALL_API_KEY,
         )
+        # Clearing the mapping stops the terminal-status webhook from acting
+        # on this bot, so the media purge must be scheduled from here.
+        recall_delete_media.apply_async(
+            args=[bot_id],
+            countdown=DELETE_MEDIA_COUNTDOWN_SECONDS,
+            queue="meeting.audio",
+        )
         r.delete(f"recall:session:{session_id}", f"recall:bot:{bot_id}")
     finally:
         r.close()
+
+
+@celery_app.task(
+    name="app.workers.connector_worker.recall_delete_media",
+    acks_late=True,
+    reject_on_worker_lost=True,
+    autoretry_for=(Exception,),
+    retry_backoff=60,
+    retry_backoff_max=900,
+    retry_jitter=True,
+    max_retries=6,
+)
+def recall_delete_media(bot_id: str) -> None:
+    """Purge the recording/transcript media Recall.ai stores for bot_id."""
+    from app.config import get_settings
+    from app.connectors.recall import delete_media
+
+    settings = get_settings()
+    if not settings.RECALL_API_KEY:
+        return
+
+    delete_media(
+        bot_id=bot_id,
+        base_url=f"https://{settings.RECALL_REGION}.recall.ai/api/v1",
+        api_key=settings.RECALL_API_KEY,
+    )
