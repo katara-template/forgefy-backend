@@ -1,8 +1,10 @@
 """Recall.ai webhook receiver.
 
-Recall delivers two event types:
-  • transcript.data   — real-time transcript segment for a bot
-  • bot.status_change — bot lifecycle (joining → in_call_recording → call_ended …)
+Recall delivers two kinds of events:
+  • transcript.data — real-time transcript segment for a bot
+  • bot lifecycle — one event per status (bot.joining_call, bot.in_call_recording,
+    bot.call_ended, bot.done, bot.fatal, …) on current API versions, or a single
+    legacy bot.status_change event on older ones; both shapes are handled
 
 Security: requests carry a Svix-style HMAC signature (Webhook-Id / Webhook-
 Timestamp / Webhook-Signature headers), verified against
@@ -79,8 +81,8 @@ async def recall_webhook(
 
     if event_type == "transcript.data":
         await _handle_transcript(data, settings)
-    elif event_type == "bot.status_change":
-        await _handle_status_change(data, settings)
+    elif event_type.startswith("bot."):
+        await _handle_status_change(event_type, data, settings)
     else:
         logger.debug("Unhandled Recall event type: %s", event_type)
 
@@ -134,11 +136,22 @@ async def _handle_transcript(data: dict, settings) -> None:
         )
 
 
-async def _handle_status_change(data: dict, settings) -> None:
-    """Transition session status and trigger blueprint generation when meeting ends."""
-    bot: dict = data.get("bot", {})
-    bot_id: str = bot.get("id", "")
-    status_code: str = bot.get("status", {}).get("code", "")
+async def _handle_status_change(event_type: str, data: dict, settings) -> None:
+    """Transition session status and trigger blueprint generation when meeting ends.
+
+    Recall delivers bot lifecycle events in two shapes:
+      • current per-status events (`bot.call_ended`, `bot.done`, …) — the
+        status code lives under `data.data.code` (and in the event name),
+        with the bot id under `data.bot.id`
+      • legacy `bot.status_change` — the code lives under `data.bot.status.code`
+    """
+    bot: dict = data.get("bot") or {}
+    bot_id: str = bot.get("id") or data.get("bot_id") or ""
+    status_code: str = (
+        (data.get("data") or {}).get("code")
+        or (bot.get("status") or {}).get("code")
+        or event_type.removeprefix("bot.")
+    )
 
     session_id = await _lookup_session(bot_id, settings.REDIS_URL)
     if not session_id:
@@ -153,6 +166,19 @@ async def _handle_status_change(data: dict, settings) -> None:
 
     elif status_code in _TERMINAL_STATUSES:
         await _end_session_from_bot(session_id, settings)
+
+        # Purge the recording/transcript from Recall's platform — transcripts
+        # already streamed to us, so their stored copy is never needed.
+        from app.workers.connector_worker import (
+            DELETE_MEDIA_COUNTDOWN_SECONDS,
+            recall_delete_media,
+        )
+        recall_delete_media.apply_async(
+            args=[bot_id],
+            countdown=DELETE_MEDIA_COUNTDOWN_SECONDS,
+            queue="meeting.audio",
+        )
+
         await _clear_mapping(bot_id, session_id, settings.REDIS_URL)
 
 
@@ -177,35 +203,15 @@ async def _try_transition_session(
 
 
 async def _end_session_from_bot(session_id: str, settings) -> None:
-    """Transition session to PROCESSING and dispatch blueprint generation."""
-    from app.core.exceptions import InvalidStateTransition
+    """Run the same end-of-meeting pipeline as the frontend end button."""
     from app.db.firebase import get_firestore_client
-    from app.db.models.enums import SessionStatus
-    from app.modules.voxa.state_machine import MeetingStateMachine
+    from app.modules.voxa.service import VoxaService
 
     db = get_firestore_client()
-
-    doc = await db.collection("sessions").document(session_id).get()
-    if not doc.exists:
-        return
-
-    current_status = SessionStatus(doc.to_dict()["status"])
-    endable = {SessionStatus.JOINING, SessionStatus.LISTENING}
-    if current_status not in endable:
-        return
-
-    sm = MeetingStateMachine(db)
-    try:
-        await sm.transition(uuid.UUID(session_id), SessionStatus.PROCESSING)
-        await db.collection("sessions").document(session_id).update(
-            {"end_time": datetime.now(UTC)}
-        )
-    except InvalidStateTransition:
-        return
-
-    from app.workers.blueprint_worker import generate_blueprint
-    generate_blueprint.apply_async(args=[session_id], queue="meeting.extract")
-    logger.info("Blueprint enqueued from bot end session=%s", session_id)
+    service = VoxaService(db)
+    session = await service.end_session_from_bot(uuid.UUID(session_id))
+    if session:
+        logger.info("Session auto-ended from bot session=%s", session_id)
 
 
 # ---------------------------------------------------------------------------

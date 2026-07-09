@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     RECALL_REGION: str = "us-east-1"
     RECALL_WORKSPACE_VERIFICATION_SECRET: str = ""
     PUBLIC_API_BASE_URL: str = ""
+    # JPEG shown as the bot's camera feed in meetings (its "avatar").
+    # Relative paths resolve against the backend root. Skipped if missing.
+    RECALL_BOT_AVATAR_PATH: str = "assets/bot_avatar.jpg"
 
     # Cloudinary (APK / bundle storage)
     CLOUDINARY_CLOUD_NAME: str = ""

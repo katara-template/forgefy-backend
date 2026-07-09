@@ -187,7 +187,8 @@ class TestExtractionWorker:
             patch("app.workers.extraction_worker._run_extraction", return_value=events),
             patch("app.workers.extraction_worker.sync_redis.from_url", return_value=mock_redis),
         ):
-            extract_requirements(session_id, "some transcript")
+            # ≥ _MIN_WORDS_FOR_EXTRACTION words, or the worker skips extraction
+            extract_requirements(session_id, "we need a login page with google auth")
 
         mock_redis.publish.assert_called_once()
         channel, payload_str = mock_redis.publish.call_args[0]

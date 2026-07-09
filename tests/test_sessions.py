@@ -6,8 +6,9 @@ test_state_machine.py and service unit tests.
 """
 import uuid
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from httpx import AsyncClient
 
 from app.db.models.enums import Platform, SessionStatus
@@ -176,3 +177,133 @@ class TestGetSession:
     async def test_no_auth_returns_401(self, client: AsyncClient) -> None:
         resp = await client.get(f"/api/v1/voxa/session/{uuid.uuid4()}")
         assert resp.status_code == 401
+
+
+# ── VoxaService end-of-meeting unit tests ─────────────────────────────────────
+# The bot-detected meeting end (Recall webhook) and the frontend end button
+# must run the same pipeline, and whichever fires first wins without errors.
+
+
+def _session_doc(session: MeetingSession) -> MagicMock:
+    doc = MagicMock()
+    doc.exists = True
+    doc.id = str(session.id)
+    doc.to_dict.return_value = {
+        "user_id": str(session.user_id),
+        "status": session.status.value,
+        "platform": session.platform.value,
+        "meeting_url": session.meeting_url,
+        "start_time": session.start_time,
+        "end_time": session.end_time,
+        "created_at": session.created_at,
+    }
+    return doc
+
+
+def _mock_db(doc: MagicMock) -> MagicMock:
+    db = MagicMock()
+    document = db.collection.return_value.document.return_value
+    document.get = AsyncMock(return_value=doc)
+    document.update = AsyncMock()
+    return db
+
+
+def _service_with_transition(db: MagicMock, session: MeetingSession):
+    """VoxaService whose state machine transition returns session as PROCESSING."""
+    from app.modules.voxa.service import VoxaService
+
+    service = VoxaService(db)
+    ended = MeetingSession(
+        id=session.id,
+        user_id=session.user_id,
+        status=SessionStatus.PROCESSING,
+        platform=session.platform,
+        meeting_url=session.meeting_url,
+        start_time=session.start_time,
+        end_time=None,
+        created_at=session.created_at,
+    )
+    service._sm = MagicMock()
+    service._sm.transition = AsyncMock(return_value=ended)
+    return service
+
+
+class TestEndSessionFromBot:
+    async def test_endable_session_runs_end_pipeline(self) -> None:
+        sess = _session(status=SessionStatus.LISTENING)
+        service = _service_with_transition(_mock_db(_session_doc(sess)), sess)
+
+        with (
+            patch("app.workers.blueprint_worker.generate_blueprint") as mock_bp,
+            patch("app.workers.connector_worker.recall_remove_bot") as mock_remove,
+        ):
+            result = await service.end_session_from_bot(sess.id)
+
+        assert result is not None
+        assert result.status == SessionStatus.PROCESSING
+        assert result.end_time is not None
+        mock_bp.apply_async.assert_called_once_with(
+            args=[str(sess.id)], queue="meeting.extract"
+        )
+        # The bot already left the call — no removal needed
+        mock_remove.apply_async.assert_not_called()
+
+    async def test_already_ended_session_returns_none(self) -> None:
+        sess = _session(status=SessionStatus.PROCESSING)
+        service = _service_with_transition(_mock_db(_session_doc(sess)), sess)
+
+        with patch("app.workers.blueprint_worker.generate_blueprint") as mock_bp:
+            result = await service.end_session_from_bot(sess.id)
+
+        assert result is None
+        mock_bp.apply_async.assert_not_called()
+
+    async def test_missing_session_returns_none(self) -> None:
+        from app.modules.voxa.service import VoxaService
+
+        doc = MagicMock()
+        doc.exists = False
+        service = VoxaService(_mock_db(doc))
+
+        assert await service.end_session_from_bot(uuid.uuid4()) is None
+
+
+class TestEndSessionService:
+    async def test_endable_session_removes_bot_and_enqueues_blueprint(self) -> None:
+        sess = _session(status=SessionStatus.LISTENING)
+        service = _service_with_transition(_mock_db(_session_doc(sess)), sess)
+
+        with (
+            patch("app.workers.blueprint_worker.generate_blueprint") as mock_bp,
+            patch("app.workers.connector_worker.recall_remove_bot") as mock_remove,
+        ):
+            result = await service.end_session(sess.id, sess.user_id)
+
+        assert result.status == SessionStatus.PROCESSING
+        mock_bp.apply_async.assert_called_once_with(
+            args=[str(sess.id)], queue="meeting.extract"
+        )
+        mock_remove.apply_async.assert_called_once_with(
+            args=[str(sess.id)], queue="meeting.audio"
+        )
+
+    async def test_already_ended_is_idempotent(self) -> None:
+        """If the bot auto-ended the session first, the button is a no-op."""
+        sess = _session(status=SessionStatus.PROCESSING)
+        service = _service_with_transition(_mock_db(_session_doc(sess)), sess)
+
+        with patch("app.workers.blueprint_worker.generate_blueprint") as mock_bp:
+            result = await service.end_session(sess.id, sess.user_id)
+
+        assert result.status == SessionStatus.PROCESSING
+        service._sm.transition.assert_not_awaited()
+        mock_bp.apply_async.assert_not_called()
+
+    async def test_waiting_session_still_rejected(self) -> None:
+        from app.core.exceptions import ValidationError
+
+        sess = _session(status=SessionStatus.WAITING)
+        service = _service_with_transition(_mock_db(_session_doc(sess)), sess)
+
+        with pytest.raises(ValidationError):
+            await service.end_session(sess.id, sess.user_id)
