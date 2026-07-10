@@ -110,7 +110,7 @@ logger = logging.getLogger(__name__)
 _SYSTEM = _load_prompt("synthesizer")
 _GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-_KNOWN_KEYS = {"app_description", "features", "questions", "conflicts", "action_items"}
+_KNOWN_KEYS = {"app_name", "app_description", "features", "questions", "conflicts", "action_items"}
 
 # HTTP status codes that represent transient server-side failures and are safe
 # to retry.  503 (Service Unavailable) is the one that triggered this addition.
@@ -198,6 +198,8 @@ def run(transcript: str, api_key: str, model: str) -> list[dict]:
         logger.warning("Gemini returned unexpected keys: %s", unknown)
 
     events: list[dict] = []
+    if app_name := result.get("app_name", ""):
+        events.append({"sub_state": "APP_NAME", "payload": {"text": app_name}})
     if app_desc := result.get("app_description", ""):
         events.append({"sub_state": "APP_DESCRIPTION", "payload": {"text": app_desc}})
     for feature in result.get("features", []):
