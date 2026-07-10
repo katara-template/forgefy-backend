@@ -128,6 +128,11 @@ async def _handle_transcript(data: dict, settings) -> None:
     finally:
         await r.aclose()
 
+    logger.info(
+        "Transcript published session=%s chars=%d speaker=%s",
+        session_id, len(text), speaker or "?",
+    )
+
     if is_final:
         from app.workers.extraction_worker import extract_requirements
         extract_requirements.apply_async(

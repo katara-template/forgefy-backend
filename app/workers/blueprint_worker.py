@@ -37,6 +37,21 @@ async def _mark_session_failed(session_id: str) -> None:
     )
 
 
+async def _record_operator_alert(session_id: str, title: str, exc: Exception) -> None:
+    """Surface a blueprint failure to the admin dashboard alerts feed."""
+    from app.core.alerts import record_operator_alert
+    from app.db.firebase import get_firestore_client
+
+    db = get_firestore_client()
+    await record_operator_alert(
+        db,
+        title=title,
+        raw_detail=str(exc),
+        source="blueprint",
+        session_id=session_id,
+    )
+
+
 @celery_app.task(
     bind=True,
     name="app.workers.blueprint_worker.generate_blueprint",
@@ -67,9 +82,33 @@ def generate_blueprint(self, session_id: str) -> None:
             raise self.retry(exc=exc, countdown=countdown) from exc
 
         # All retries exhausted — surface the failure.
-        from app.core.build_errors import sanitize_build_error
+        from app.core.build_errors import (
+            GENERIC_OPERATOR_MESSAGE,
+            is_ai_quota_error,
+            sanitize_build_error,
+        )
         build_err = sanitize_build_error(exc)
         logger.error("Blueprint generation FAILED session=%s: %s", session_id, exc, exc_info=True)
+
+        # Alert the operator when the AI model ran out of tokens/credits/quota
+        # (the user can't fix that) or on any other support-tier failure.
+        user_message = build_err.message
+        quota_hit = is_ai_quota_error(str(exc))
+        if quota_hit or build_err.action == "support":
+            title = (
+                "AI model tokens/quota exhausted during blueprint generation"
+                if quota_hit
+                else build_err.message
+            )
+            try:
+                loop.run_until_complete(_record_operator_alert(session_id, title, exc))
+            except Exception as alert_exc:
+                logger.warning(
+                    "Could not record operator alert session=%s: %s", session_id, alert_exc
+                )
+            if build_err.action == "support":
+                user_message = GENERIC_OPERATOR_MESSAGE
+
         try:
             loop.run_until_complete(_mark_session_failed(session_id))
         except Exception as mark_exc:
@@ -78,7 +117,7 @@ def generate_blueprint(self, session_id: str) -> None:
         try:
             r.publish(
                 f"{_CHANNEL_PREFIX}{session_id}",
-                json.dumps({"type": "blueprintError", "session_id": session_id, "error": build_err.message}),
+                json.dumps({"type": "blueprintError", "session_id": session_id, "error": user_message}),
             )
         finally:
             r.close()

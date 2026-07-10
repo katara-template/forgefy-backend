@@ -181,31 +181,37 @@ class TestGenerateBlueprintRetry:
 # ── failure (exhausted retries) ───────────────────────────────────────────────
 
 
+def _run_exhausted(exc: Exception, mark_side_effect=None):
+    """Run the task at max retries; return (mock_mark, mock_redis_conn, mock_alert)."""
+    mock_conn = MagicMock()
+    mock_mark = AsyncMock(side_effect=mark_side_effect)
+    mock_alert = AsyncMock()
+
+    with (
+        patch("app.workers.blueprint_worker._run_aggregation", new=AsyncMock(side_effect=exc)),
+        patch("app.workers.blueprint_worker._mark_session_failed", new=mock_mark),
+        patch("app.workers.blueprint_worker._record_operator_alert", new=mock_alert),
+        patch("app.workers.blueprint_worker.get_settings", return_value=_FAKE_SETTINGS),
+        patch("app.workers.blueprint_worker.sync_redis") as mock_redis,
+    ):
+        mock_redis.from_url.return_value = mock_conn
+        _run(_task_self(retries=2, max_retries=2))
+
+    return mock_mark, mock_conn, mock_alert
+
+
 class TestGenerateBlueprintFailed:
     """Tests for the exhausted-retries path: FAILED state + blueprintError event."""
 
     def _run_exhausted(self, exc: Exception, mark_side_effect=None):
-        """Run the task at max retries; return (mock_mark, mock_redis_conn)."""
-        mock_conn = MagicMock()
-        mock_mark = AsyncMock(side_effect=mark_side_effect)
-
-        with (
-            patch("app.workers.blueprint_worker._run_aggregation", new=AsyncMock(side_effect=exc)),
-            patch("app.workers.blueprint_worker._mark_session_failed", new=mock_mark),
-            patch("app.workers.blueprint_worker.get_settings", return_value=_FAKE_SETTINGS),
-            patch("app.workers.blueprint_worker.sync_redis") as mock_redis,
-        ):
-            mock_redis.from_url.return_value = mock_conn
-            _run(_task_self(retries=2, max_retries=2))
-
-        return mock_mark, mock_conn
+        return _run_exhausted(exc, mark_side_effect)
 
     def test_marks_session_failed_in_firestore(self):
-        mock_mark, _ = self._run_exhausted(ValueError("blueprint is empty"))
+        mock_mark, _, _ = self._run_exhausted(ValueError("blueprint is empty"))
         mock_mark.assert_called_once_with(SESSION_ID)
 
     def test_publishes_blueprint_error_to_redis(self):
-        _, mock_conn = self._run_exhausted(ValueError("blueprint is empty"))
+        _, mock_conn, _ = self._run_exhausted(ValueError("blueprint is empty"))
 
         assert mock_conn.publish.called
         _, payload_str = mock_conn.publish.call_args[0]
@@ -214,7 +220,7 @@ class TestGenerateBlueprintFailed:
         assert msg["session_id"] == SESSION_ID
 
     def test_blueprint_error_includes_message(self):
-        _, mock_conn = self._run_exhausted(ValueError("blueprint is empty"))
+        _, mock_conn, _ = self._run_exhausted(ValueError("blueprint is empty"))
 
         _, payload_str = mock_conn.publish.call_args[0]
         msg = json.loads(payload_str)
@@ -222,12 +228,12 @@ class TestGenerateBlueprintFailed:
         assert msg["error"]  # non-empty
 
     def test_closes_redis_after_failure(self):
-        _, mock_conn = self._run_exhausted(ValueError("blueprint is empty"))
+        _, mock_conn, _ = self._run_exhausted(ValueError("blueprint is empty"))
         mock_conn.close.assert_called_once()
 
     def test_still_publishes_error_when_mark_failed_raises(self):
         """Even if the Firestore FAILED update itself errors, blueprintError must be published."""
-        _, mock_conn = self._run_exhausted(
+        _, mock_conn, _ = self._run_exhausted(
             exc=ValueError("blueprint empty"),
             mark_side_effect=RuntimeError("Firestore unavailable"),
         )
@@ -238,7 +244,75 @@ class TestGenerateBlueprintFailed:
 
     def test_error_message_sanitised_for_rate_limit(self):
         """A rate-limit error must become a user-friendly message (via sanitize_build_error)."""
-        _, mock_conn = self._run_exhausted(RuntimeError("rate limit exceeded"))
+        _, mock_conn, _ = self._run_exhausted(RuntimeError("rate limit exceeded"))
 
         msg = json.loads(mock_conn.publish.call_args[0][1])
         assert "rate" not in msg["error"].lower() or "try again" in msg["error"].lower()
+
+
+# ── operator (admin) alerts ───────────────────────────────────────────────────
+
+
+class TestOperatorAlerts:
+    """The admin alerts feed must be notified when the AI model runs out of
+    tokens/credits/quota, or on any other support-tier failure.
+    """
+
+    def _run_exhausted(self, exc: Exception, mark_side_effect=None):
+        return _run_exhausted(exc, mark_side_effect)
+
+    def test_gemini_quota_exhaustion_records_admin_alert(self):
+        exc = RuntimeError(
+            "429 RESOURCE_EXHAUSTED: You exceeded your current quota, "
+            "please check your plan and billing details."
+        )
+        _, _, mock_alert = self._run_exhausted(exc)
+
+        mock_alert.assert_called_once()
+        session_id, title, alert_exc = mock_alert.call_args[0]
+        assert session_id == SESSION_ID
+        assert "tokens/quota exhausted" in title
+        assert alert_exc is exc
+
+    def test_anthropic_credit_exhaustion_records_admin_alert(self):
+        exc = RuntimeError("Your credit balance is too low to access the Anthropic API.")
+        _, _, mock_alert = self._run_exhausted(exc)
+
+        mock_alert.assert_called_once()
+        assert "tokens/quota exhausted" in mock_alert.call_args[0][1]
+
+    def test_credit_exhaustion_shows_generic_message_to_user(self):
+        """Support-tier detail (billing) must never reach the end user."""
+        from app.core.build_errors import GENERIC_OPERATOR_MESSAGE
+
+        _, mock_conn, _ = self._run_exhausted(
+            RuntimeError("Your credit balance is too low to access the API.")
+        )
+
+        msg = json.loads(mock_conn.publish.call_args[0][1])
+        assert msg["error"] == GENERIC_OPERATOR_MESSAGE
+
+    def test_ordinary_failure_does_not_record_admin_alert(self):
+        _, _, mock_alert = self._run_exhausted(ValueError("blueprint is empty"))
+        mock_alert.assert_not_called()
+
+    def test_alert_failure_does_not_block_error_publish(self):
+        """If writing the alert itself fails, the user-facing error must still go out."""
+        mock_conn = MagicMock()
+        exc = RuntimeError("quota exceeded")
+
+        with (
+            patch("app.workers.blueprint_worker._run_aggregation", new=AsyncMock(side_effect=exc)),
+            patch("app.workers.blueprint_worker._mark_session_failed", new=AsyncMock()),
+            patch(
+                "app.workers.blueprint_worker._record_operator_alert",
+                new=AsyncMock(side_effect=RuntimeError("Firestore down")),
+            ),
+            patch("app.workers.blueprint_worker.get_settings", return_value=_FAKE_SETTINGS),
+            patch("app.workers.blueprint_worker.sync_redis") as mock_redis,
+        ):
+            mock_redis.from_url.return_value = mock_conn
+            _run(_task_self(retries=2, max_retries=2))
+
+        msg = json.loads(mock_conn.publish.call_args[0][1])
+        assert msg["type"] == "blueprintError"
