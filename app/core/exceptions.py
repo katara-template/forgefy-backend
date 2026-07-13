@@ -68,6 +68,14 @@ class InvalidStateTransition(ForgefyError):
     title = "Invalid State Transition"
 
 
+class ExternalServiceError(ForgefyError):
+    """Raised when an upstream provider (Neon, Supabase, GitHub, …) rejects or
+    fails a request Forgefy made on the user's behalf."""
+
+    status_code = 502
+    title = "Bad Gateway"
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -76,8 +84,10 @@ def _cors_headers(request: Request) -> dict[str, str]:
     origin = request.headers.get("origin")
     if not origin:
         return {}
-    app = request.app
-    while hasattr(app, "app"):
+    # request.app is the bare FastAPI instance; the middleware instances live
+    # on the stack built at first request (app.middleware_stack → .app → …).
+    app = getattr(request.app, "middleware_stack", None)
+    while app is not None:
         if isinstance(app, CORSMiddleware):
             if app.allow_all_origins or origin in app.allow_origins:
                 allow = origin if not app.allow_all_origins else "*"
@@ -87,7 +97,7 @@ def _cors_headers(request: Request) -> dict[str, str]:
                     "Vary": "Origin",
                 }
             return {}
-        app = app.app  # type: ignore[attr-defined]
+        app = getattr(app, "app", None)
     return {}
 
 

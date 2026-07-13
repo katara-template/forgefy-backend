@@ -162,27 +162,42 @@ async def refresh_tokens(
     )
 
 
-@router.post("/google", response_model=TokenResponse)
+@router.post("/oauth", response_model=TokenResponse)
+@router.post("/google", response_model=TokenResponse)  # legacy alias, pre-GitHub
 @limiter.limit("60/minute")
-async def google_auth(
+async def oauth_auth(
     request: Request,
     body: GoogleAuthRequest,
     db: DBSession,
     settings: SettingsDep,
 ) -> TokenResponse:
-    """Authenticate via Google — verify Firebase ID token, create user on first sign-in."""
+    """Authenticate via a Firebase OAuth provider (Google, GitHub, …).
+
+    Verifies the Firebase ID token and creates the user on first sign-in.
+    Provider-agnostic: Firebase signs the token regardless of which provider
+    the user picked in the popup.
+    """
     try:
         decoded = firebase_admin.auth.verify_id_token(body.id_token)
     except Exception as exc:
-        raise UnauthorizedError("Invalid Google token") from exc
+        raise UnauthorizedError("Invalid sign-in token") from exc
 
     email: str | None = decoded.get("email")
     if not email:
-        raise UnauthorizedError("Google account has no verified email")
+        raise UnauthorizedError("This account has no email we can use")
 
+    provider: str = decoded.get("firebase", {}).get("sign_in_provider", "unknown")
     docs = await db.collection("users").where("email", "==", email).limit(1).get()
 
     if docs:
+        # Only link into an existing account when the provider vouches for the
+        # email — otherwise anyone could claim an unverified address on GitHub
+        # and take over the matching Forgefy account.
+        if decoded.get("email_verified") is False:
+            raise UnauthorizedError(
+                f"An account for {email} already exists. Verify that email with "
+                "your sign-in provider first, or log in with your password."
+            )
         user_id = docs[0].id
     else:
         user_id = str(uuid.uuid4())
@@ -194,9 +209,9 @@ async def google_auth(
             "created_at": now,
             "updated_at": now,
         })
-        logger.info("Google user created: id=%s email=%s", user_id, email)
+        logger.info("OAuth user created: id=%s email=%s provider=%s", user_id, email, provider)
 
-    logger.info("Google user signed in: id=%s", user_id)
+    logger.info("OAuth user signed in: id=%s provider=%s", user_id, provider)
     return TokenResponse(
         access_token=create_access_token(user_id, settings),
         refresh_token=create_refresh_token(user_id, settings),
