@@ -833,15 +833,16 @@ async def connect_neon(
     created = await neon_management.create_project(settings.NEON_API_KEY, name=project.app_name)
     neon_project_id = created["project"]["id"]
     branch_id = created["branch"]["id"]
+    database_name = created["databases"][0]["name"]
     connection_uri = created["connection_uris"][0]["connection_uri"]
 
     data_api = await neon_management.enable_data_api(
-        settings.NEON_API_KEY, project_id=neon_project_id, branch_id=branch_id
+        settings.NEON_API_KEY,
+        project_id=neon_project_id,
+        branch_id=branch_id,
+        database_name=database_name,
     )
-    # NOTE: Neon's Data API response field name is not verified against a real
-    # API key yet — trying the plausible candidates. Once tested for real,
-    # check the actual response and simplify this to the one true key name.
-    data_api_url = data_api.get("uri") or data_api.get("data_api_url") or data_api.get("url")
+    data_api_url = data_api["url"]
 
     await db.collection("projects").document(str(project_id)).update({
         "neon_project_id": neon_project_id,

@@ -79,12 +79,13 @@ class TestConnectNeon:
                     new=AsyncMock(return_value={
                         "project": {"id": "neon-proj-1"},
                         "branch": {"id": "br-1"},
+                        "databases": [{"name": "neondb"}],
                         "connection_uris": [{"connection_uri": "postgres://user:pass@host/db"}],
                     }),
                 ),
                 patch(
                     "app.integrations.neon_management.enable_data_api",
-                    new=AsyncMock(return_value={"uri": "https://neon-proj-1.dataapi.neon.tech"}),
+                    new=AsyncMock(return_value={"url": "https://neon-proj-1.dataapi.neon.tech"}),
                 ),
             ):
                 resp = await auth_client.post(f"/api/v1/projects/{uuid.uuid4()}/neon/connect")
@@ -126,12 +127,13 @@ class TestConnectNeon:
                     new=AsyncMock(return_value={
                         "project": {"id": "neon-proj-1"},
                         "branch": {"id": "br-1"},
+                        "databases": [{"name": "neondb"}],
                         "connection_uris": [{"connection_uri": "postgres://user:pass@host/db"}],
                     }),
                 ),
                 patch(
                     "app.integrations.neon_management.enable_data_api",
-                    new=AsyncMock(return_value={"uri": "https://neon-proj-1.dataapi.neon.tech"}),
+                    new=AsyncMock(return_value={"url": "https://neon-proj-1.dataapi.neon.tech"}),
                 ),
                 patch("app.workers.build_worker.run_build.apply_async") as mock_dispatch,
             ):
