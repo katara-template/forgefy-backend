@@ -20,8 +20,9 @@ import firebase_admin.auth
 import httpx
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import RedirectResponse
+from google.api_core.exceptions import ResourceExhausted
 
-from app.core.exceptions import ConflictError, UnauthorizedError
+from app.core.exceptions import ConflictError, RateLimitedError, UnauthorizedError
 from app.core.login_guard import (
     check_not_locked_out,
     clear_failed_attempts,
@@ -48,6 +49,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _raise_for_firestore_quota(exc: Exception, *, context: str) -> None:
+    """Translate transient Firestore quota errors into a client-visible 429."""
+    if isinstance(exc, ResourceExhausted):
+        raise RateLimitedError(
+            f"The authentication service is temporarily unavailable while {context}. Please try again shortly."
+        ) from exc
+
+    message = str(exc).lower()
+    if "resource exhausted" in message or "quota exceeded" in message or "quota" in message and "exceeded" in message:
+        raise RateLimitedError(
+            f"The authentication service is temporarily unavailable while {context}. Please try again shortly."
+        ) from exc
+
+
 @router.post("/register", response_model=TokenResponse, status_code=201)
 @limiter.limit("60/minute")
 async def register(
@@ -69,6 +84,7 @@ async def register(
         except ConflictError:
             raise
         except Exception as e:
+            _raise_for_firestore_quota(e, context="checking whether the email already exists")
             logger.error("Database query error during email check: %s", e, exc_info=True)
             raise
 
@@ -129,7 +145,12 @@ async def login(
     """Authenticate with email + password; return access + refresh tokens."""
     await check_not_locked_out(redis, body.email)
 
-    docs = await db.collection("users").where("email", "==", body.email).limit(1).get()
+    try:
+        docs = await db.collection("users").where("email", "==", body.email).limit(1).get()
+    except Exception as exc:
+        _raise_for_firestore_quota(exc, context="looking up the user record")
+        logger.error("Firestore lookup failure during login for %s: %s", body.email, exc, exc_info=True)
+        raise
 
     user_doc = docs[0] if docs else None
     user_data = user_doc.to_dict() if user_doc else None
@@ -187,7 +208,12 @@ async def oauth_auth(
         raise UnauthorizedError("This account has no email we can use")
 
     provider: str = decoded.get("firebase", {}).get("sign_in_provider", "unknown")
-    docs = await db.collection("users").where("email", "==", email).limit(1).get()
+    try:
+        docs = await db.collection("users").where("email", "==", email).limit(1).get()
+    except Exception as exc:
+        _raise_for_firestore_quota(exc, context="looking up the OAuth user record")
+        logger.error("Firestore lookup failure during OAuth sign-in for %s: %s", email, exc, exc_info=True)
+        raise
 
     if docs:
         # Only link into an existing account when the provider vouches for the

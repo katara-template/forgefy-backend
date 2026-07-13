@@ -3,6 +3,7 @@ import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
+from google.api_core.exceptions import ResourceExhausted
 from httpx import AsyncClient
 
 from app.config import get_settings
@@ -147,6 +148,20 @@ class TestLogin:
         )
 
         assert resp.status_code == 429
+
+    async def test_firestore_quota_error_returns_429(
+        self, client: AsyncClient, mock_db: MagicMock, mock_redis: AsyncMock
+    ) -> None:
+        query = mock_db.collection.return_value.where.return_value.limit.return_value
+        query.get.side_effect = ResourceExhausted("429 Quota exceeded")
+
+        resp = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "test@example.com", "password": "password123"},
+        )
+
+        assert resp.status_code == 429
+        assert resp.headers["content-type"] == "application/problem+json"
 
 
 # ── Refresh ───────────────────────────────────────────────────────────────────
