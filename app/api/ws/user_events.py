@@ -25,13 +25,16 @@ async def ws_user_events(
 ) -> None:
     """Stream real-time user-scoped events (quota exceeded, etc.)."""
     settings = get_settings()
+    # Accept before auth: rejecting pre-accept surfaces to browsers as a generic
+    # handshake 403, so clients can't tell auth failure from an outage. Accepting
+    # first lets them see close code 4001 and refresh their token.
+    await ws.accept()
     try:
         user_id = decode_access_token(token, settings)
     except Exception:
         await ws.close(code=4001, reason="Unauthorized")
         return
 
-    await ws.accept()
     logger.info("ws/user_events connected user=%s", user_id)
 
     channel = f"user:{user_id}:events"

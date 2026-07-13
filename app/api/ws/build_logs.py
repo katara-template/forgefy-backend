@@ -26,13 +26,15 @@ async def ws_build_logs(
 ) -> None:
     """Stream real-time build/update log events for a project."""
     settings = get_settings()
+    # Accept before auth so a bad token surfaces as close code 4001 (client can
+    # refresh and retry) instead of a generic handshake 403.
+    await ws.accept()
     try:
         decode_access_token(token, settings)
     except Exception:
         await ws.close(code=4001, reason="Unauthorized")
         return
 
-    await ws.accept()
     logger.info("ws/build_logs connected project=%s", project_id)
 
     channel = f"build:{project_id}:logs"
