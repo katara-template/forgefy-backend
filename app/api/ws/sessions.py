@@ -29,13 +29,15 @@ async def ws_sessions(
 ) -> None:
     """Stream the caller's session list; polls every 5 s for changes."""
     settings = get_settings()
+    # Accept before auth so a bad token surfaces as close code 4001 (client can
+    # refresh and retry) instead of a generic handshake 403.
+    await ws.accept()
     try:
         user_id_str = decode_access_token(token, settings)
     except Exception:
         await ws.close(code=4001, reason="Unauthorized")
         return
 
-    await ws.accept()
     logger.info("ws/sessions connected user=%s", user_id_str)
     db = ws.app.state.firestore
     last_data: list | None = None
