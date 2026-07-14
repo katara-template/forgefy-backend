@@ -272,13 +272,12 @@ class BlueprintAggregator:
                 'Each item: {"title": "2-6 word name", "description": "1-2 sentence detail", "priority": "high|med|low"}'
             )
             if settings.BP_MODEL == "Qwen3":
-                from app.ai.agents.ollama_synthesizer import call_ollama
-                result = call_ollama(
+                from app.ai.qwen import FEATURES, call_qwen
+                result = call_qwen(
                     system_prompt=_SYSTEM,
                     user_content=f"App description:\n{description}",
-                    base_url=settings.OLLAMA_URL,
-                    model=settings.OLLAMA_MODEL,
-                    timeout=settings.OLLAMA_TIMEOUT,
+                    task=FEATURES,
+                    max_tokens=1024,
                 )
                 features = result.get("features", [])
             elif settings.BP_MODEL == "gemini":
@@ -345,13 +344,12 @@ class BlueprintAggregator:
         settings = get_settings()
         try:
             if settings.BP_MODEL == "Qwen3":
-                from app.ai.agents.ollama_synthesizer import call_ollama
-                result = call_ollama(
+                from app.ai.qwen import NAMING, call_qwen
+                result = call_qwen(
                     system_prompt=_NAME_SYSTEM,
                     user_content=content,
-                    base_url=settings.OLLAMA_URL,
-                    model=settings.OLLAMA_MODEL,
-                    timeout=settings.OLLAMA_TIMEOUT,
+                    task=NAMING,
+                    max_tokens=64,
                 )
                 raw = result.get("app_name", "").strip().strip('"').strip("'")
             elif settings.BP_MODEL == "gemini":
@@ -437,13 +435,12 @@ class BlueprintAggregator:
 
         try:
             if settings.BP_MODEL == "Qwen3":
-                from app.ai.agents.ollama_synthesizer import call_ollama
-                result = call_ollama(
+                from app.ai.qwen import DESIGN, call_qwen
+                result = call_qwen(
                     system_prompt=_SYSTEM,
                     user_content=content,
-                    base_url=settings.OLLAMA_URL,
-                    model=settings.OLLAMA_MODEL,
-                    timeout=settings.OLLAMA_TIMEOUT,
+                    task=DESIGN,
+                    max_tokens=1024,
                 )
                 if isinstance(result, dict) and "palette" in result:
                     return result
@@ -510,8 +507,8 @@ class BlueprintAggregator:
         settings = get_settings()
         try:
             if settings.BP_MODEL == "Qwen3":
-                from app.ai.agents.ollama_synthesizer import run as synthesize
-                events = synthesize(transcript, settings.OLLAMA_URL, settings.OLLAMA_MODEL, timeout=settings.OLLAMA_TIMEOUT)
+                from app.ai.qwen import run_qwen_synthesis
+                events = run_qwen_synthesis(transcript)
             elif settings.BP_MODEL == "gemini":
                 from app.ai.agents.gemini_synthesizer import run as synthesize
                 events = synthesize(transcript, settings.GEMINI_API_KEY, settings.GEMINI_MODEL)
@@ -610,13 +607,12 @@ async def classify_needs_database(description: str, features: list[dict]) -> tup
     settings = get_settings()
     try:
         if settings.BP_MODEL == "Qwen3":
-            from app.ai.agents.ollama_synthesizer import call_ollama
-            result = call_ollama(
+            from app.ai.qwen import CLASSIFY, call_qwen
+            result = call_qwen(
                 system_prompt=_DB_NEED_SYSTEM,
                 user_content=content,
-                base_url=settings.OLLAMA_URL,
-                model=settings.OLLAMA_MODEL,
-                timeout=settings.OLLAMA_TIMEOUT,
+                task=CLASSIFY,
+                max_tokens=256,
             )
         elif settings.BP_MODEL == "gemini":
             from app.ai.agents.gemini_synthesizer import call_gemini

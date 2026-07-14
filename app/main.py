@@ -89,6 +89,15 @@ def create_app() -> FastAPI:
     """Construct and configure the FastAPI application."""
     settings = get_settings()
 
+    # Refuse to serve production traffic with the dev-default secrets — JWTs
+    # could be forged and encrypted-at-rest tokens decrypted by anyone who has
+    # read this repo.
+    if settings.APP_ENV == "production":
+        if settings.SECRET_KEY == "changeme":
+            raise RuntimeError("SECRET_KEY must be set to a real secret in production")
+        if settings.SECRETS_ENCRYPTION_KEY.startswith("changeme"):
+            raise RuntimeError("SECRETS_ENCRYPTION_KEY must be set to a real secret in production")
+
     app = FastAPI(
         title="Forgefy Backend",
         description="Meeting Mode — AI orchestration backend",
@@ -112,6 +121,23 @@ def create_app() -> FastAPI:
             logger.warning(
                 "slow request: %s %s took %.0f ms",
                 request.method, request.url.path, duration_ms,
+            )
+        return response
+
+    # ── Security headers ───────────────────────────────────────────────────────
+    # The API serves JSON only, so these are cheap blanket protections:
+    # nosniff stops MIME-confusion attacks, DENY stops the API (incl. /docs)
+    # being framed, no-referrer keeps tokens/paths out of third-party logs,
+    # and HSTS (production only, where TLS is guaranteed) pins browsers to HTTPS.
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        if settings.APP_ENV == "production":
+            response.headers.setdefault(
+                "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
             )
         return response
 

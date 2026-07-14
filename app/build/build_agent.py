@@ -1066,22 +1066,28 @@ def _call_planner(
             )
             raw = (resp_oai.choices[0].message.content or "").strip()
 
-        else:  # Qwen3 / Ollama
-            import requests as _req
-            r = _req.post(
-                f"{base_url.rstrip('/')}/api/chat",
-                json={
-                    "model": ollama_model,
-                    "messages": [
-                        {"role": "system", "content": _PLANNER_SYSTEM},
-                        {"role": "user", "content": planner_input},
-                    ],
-                    "stream": False,
-                },
-                timeout=ollama_timeout,
-            )
-            r.raise_for_status()
-            raw = (r.json().get("message") or {}).get("content", "").strip()
+        else:  # Qwen3 — hosted via OpenRouter, or local Ollama
+            from app.ai.qwen import using_openrouter
+
+            if using_openrouter():
+                from app.ai.openrouter import PLAN, chat_openrouter
+                raw = chat_openrouter(_PLANNER_SYSTEM, planner_input, task=PLAN, max_tokens=4096)
+            else:
+                import requests as _req
+                r = _req.post(
+                    f"{base_url.rstrip('/')}/api/chat",
+                    json={
+                        "model": ollama_model,
+                        "messages": [
+                            {"role": "system", "content": _PLANNER_SYSTEM},
+                            {"role": "user", "content": planner_input},
+                        ],
+                        "stream": False,
+                    },
+                    timeout=ollama_timeout,
+                )
+                r.raise_for_status()
+                raw = (r.json().get("message") or {}).get("content", "").strip()
 
         # Normalise: strip think tags, markdown fences, extract first {...}
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()

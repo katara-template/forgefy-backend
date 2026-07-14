@@ -558,7 +558,15 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
 
             import requests as _req
 
-            def _ollama_classify():
+            from app.ai.qwen import using_openrouter
+
+            def _qwen_classify():
+                # Hosted backend: routed to a reasoning model, since this call also
+                # has to author the technical update_prompt, not just pick a type.
+                if using_openrouter():
+                    from app.ai.openrouter import PLAN, chat_openrouter
+                    return chat_openrouter(system, message, task=PLAN, max_tokens=4096)
+
                 r = _req.post(
                     f"{settings.OLLAMA_URL.rstrip('/')}/api/chat",
                     json={
@@ -574,7 +582,7 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
                 r.raise_for_status()
                 return (r.json().get("message") or {}).get("content", "").strip()
 
-            raw = await asyncio.to_thread(_ollama_classify)
+            raw = await asyncio.to_thread(_qwen_classify)
 
         elif settings.BUILD_MODEL == "gemini":
             import asyncio

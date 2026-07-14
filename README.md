@@ -131,9 +131,68 @@ The `BP_MODEL` env var controls which LLM is used to process Deepgram transcript
 |---|---|---|
 | `claude` (default) | Anthropic Claude — 4-agent LangGraph pipeline | `ANTHROPIC_API_KEY` |
 | `gemini` | Google Gemini — single REST call | `GEMINI_API_KEY` |
-| `Qwen3` | Local Qwen3 via Ollama — no external API | Ollama Docker service running |
+| `Qwen3` | OpenRouter (hosted, per-action routing) **or** local Qwen3 via Ollama | `OPENROUTER_API_KEY`, else Ollama running |
 
 Switch backends by changing `BP_MODEL` in `.env`. No rebuild is needed — the value is read at runtime.
+
+---
+
+## OpenRouter (hosted `Qwen3`, no local GPU)
+
+Setting `OPENROUTER_API_KEY` makes `BP_MODEL=Qwen3` (and `BUILD_MODEL=Qwen3`) run against
+OpenRouter's hosted models instead of a local Ollama. Leave the key blank and the Qwen3
+setting behaves exactly as before, calling Ollama — nothing else changes.
+
+```bash
+OPENROUTER_API_KEY=sk-or-v1-...
+BP_MODEL=Qwen3
+BUILD_MODEL=Qwen3
+```
+
+### Per-action model routing
+
+There is no single "best" model, so `Qwen3` does not mean one model. Each action is routed
+to the model that actually suits it — which is frequently *not* a Qwen model. Chains are
+defined in [`app/ai/openrouter.py`](app/ai/openrouter.py):
+
+| Action | Primary model | Why |
+|---|---|---|
+| `synthesis` / `blueprint` | `nvidia/nemotron-3-super-120b` | 1M context + native JSON — swallows a whole transcript |
+| `features` | `nvidia/nemotron-3-super-120b` | Structured JSON, fast |
+| `design` | `google/gemma-4-31b-it` | Strongest aesthetic priors for palette/typography |
+| `naming` / `classify` | `openai/gpt-oss-20b` | Answers one-liners in ~5s instead of reasoning for 30s |
+| `plan` | `nvidia/nemotron-3-ultra-550b` | Deepest reasoning, 1M context |
+| `code` | `qwen/qwen3-coder` | 1M context + tool calling — the best free coding model |
+
+Every task defines an **ordered chain**, not one model. Free OpenRouter endpoints
+rate-limit upstream without warning (HTTP 429 is routine, not exceptional), so a failed,
+truncated, or non-JSON reply drops to the next candidate automatically. A blueprint only
+fails if every model in the chain fails.
+
+### Free tier and paid escalation
+
+All primaries above are `:free`. The free tier allows 20 requests/minute and 50/day
+(1000/day once you have ever purchased $10 of credits). If the free tier is saturated:
+
+```bash
+OPENROUTER_ALLOW_PAID=true   # appends DeepSeek/Gemini/Qwen3-Coder as fallbacks
+```
+
+Paid fallbacks are cheap (DeepSeek is ~$0.20 per million input tokens) and are only
+reached after every free candidate has failed.
+
+`OPENROUTER_MODEL=<id>` pins one model for every action, bypassing routing — a debugging
+aid, not a normal setting.
+
+### A note on token budgets
+
+Most strong free models are *reasoning* models, and their reasoning tokens are billed
+against `max_tokens` before any answer is emitted. A 64-token budget for a 6-character app
+name returns `content: None` — the budget is gone before the model starts answering, and
+disabling reasoning via the API is advisory and widely ignored. The client therefore floors
+every request at 2048 output tokens and treats `finish_reason: "length"` as a failure worth
+retrying on the next model. Do not lower that floor to "save" tokens; free-tier output is
+free, and a starved request fails outright.
 
 ---
 
