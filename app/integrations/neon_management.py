@@ -24,16 +24,22 @@ def _checked_json(resp: httpx.Response, action: str) -> dict:
     return resp.json()
 
 
-async def create_project(api_key: str, *, name: str) -> dict:
+async def create_project(api_key: str, *, name: str, org_id: str | None = None) -> dict:
     """Provision a new Neon project. Response includes project id, default
     branch id, and a Postgres connection string (a real secret — never expose
     it to a generated client app, see app/build/workspace.py).
+
+    org_id is required by Neon for organization-scoped API keys (found on the
+    Neon console's organization settings page); personal keys may omit it.
     """
+    project: dict = {"name": name}
+    if org_id:
+        project["org_id"] = org_id
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
             f"{_API_BASE}/projects",
             headers={"Authorization": f"Bearer {api_key}"},
-            json={"project": {"name": name}},
+            json={"project": project},
         )
         return _checked_json(resp, "creating project")
 

@@ -830,7 +830,9 @@ async def connect_neon(
 
     project = await _get_owned(project_id, user.id, db)
 
-    created = await neon_management.create_project(settings.NEON_API_KEY, name=project.app_name)
+    created = await neon_management.create_project(
+        settings.NEON_API_KEY, name=project.app_name, org_id=settings.NEON_ORG_ID or None
+    )
     neon_project_id = created["project"]["id"]
     branch_id = created["branch"]["id"]
     database_name = created["databases"][0]["name"]

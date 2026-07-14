@@ -83,7 +83,10 @@ class Settings(BaseSettings):
 
     # Neon — embedded/project-per-user model: one platform-level API key,
     # no per-user OAuth. Projects are provisioned under Forgefy's own account.
+    # NEON_ORG_ID is required for organization-scoped API keys (Neon console →
+    # organization settings page, looks like "org-...").
     NEON_API_KEY: str = ""
+    NEON_ORG_ID: str = ""
 
     # Firebase OAuth App (Google Cloud OAuth client) — for linking a user's own
     # Google account so Forgefy can provision a Firebase/Firestore project under

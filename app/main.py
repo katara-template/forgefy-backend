@@ -1,11 +1,12 @@
 """FastAPI application factory."""
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
@@ -92,6 +93,23 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # ── Request timing ─────────────────────────────────────────────────────────
+    # Every response carries a Server-Timing header (visible per-request in the
+    # browser devtools Network tab) so slow endpoints can be spotted without
+    # extra tooling; anything over 1s is also logged server-side.
+    @app.middleware("http")
+    async def server_timing(request: Request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start) * 1000
+        response.headers["Server-Timing"] = f"app;dur={duration_ms:.1f}"
+        if duration_ms > 1000:
+            logger.warning(
+                "slow request: %s %s took %.0f ms",
+                request.method, request.url.path, duration_ms,
+            )
+        return response
+
     # ── Rate limiting (shared singleton from core.rate_limit) ─────────────────
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
@@ -137,8 +155,6 @@ def create_app() -> FastAPI:
         (Docker/Render health checks) can detect and recycle a container that's
         running but can't actually serve requests.
         """
-        import time
-
         cache = app.state.health_cache
         checks: dict[str, str] | None = None
         if time.monotonic() - cache["at"] < health_cache_ttl:
