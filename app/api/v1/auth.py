@@ -13,6 +13,7 @@ import logging
 import secrets
 import time
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime
 from urllib.parse import urlencode
 
@@ -22,7 +23,13 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import RedirectResponse
 from google.api_core.exceptions import ResourceExhausted
 
-from app.core.exceptions import ConflictError, RateLimitedError, UnauthorizedError
+from app.core.exceptions import (
+    ConflictError,
+    ExternalServiceError,
+    RateLimitedError,
+    UnauthorizedError,
+    ValidationError,
+)
 from app.core.login_guard import (
     check_not_locked_out,
     clear_failed_attempts,
@@ -33,7 +40,6 @@ from app.core.security import (
     create_access_token,
     create_refresh_token,
     decode_refresh_token,
-    hash_password,
     verify_password,
 )
 from app.deps import DBSession, RedisDep, SettingsDep
@@ -71,66 +77,86 @@ async def register(
     db: DBSession,
     settings: SettingsDep,
 ) -> TokenResponse:
-    """Create a new user account; return access + refresh tokens."""
+    """Create a new user account; return access + refresh tokens.
+
+    Credentials live in Firebase Auth — the password is never stored by
+    Forgefy. The users/{id} Firestore doc keeps the same shape as before,
+    minus the bcrypt hash, plus firebase_uid binding it to the Firebase
+    account.
+    """
+    logger.debug("Register request for email: %s", body.email)
+
+    # Check if email already exists in our user collection
     try:
-        logger.debug("Register request for email: %s", body.email)
-        
-        # Check if email already exists
-        try:
-            existing = await db.collection("users").where("email", "==", body.email).limit(1).get()
-            if existing:
-                logger.warning("Registration attempt with existing email: %s", body.email)
-                raise ConflictError(f"'{body.email}' is already registered")
-        except ConflictError:
-            raise
-        except Exception as e:
-            _raise_for_firestore_quota(e, context="checking whether the email already exists")
-            logger.error("Database query error during email check: %s", e, exc_info=True)
-            raise
-
-        # Generate user ID and timestamp
-        user_id = str(uuid.uuid4())
-        now = datetime.now(UTC)
-        
-        # Hash password
-        try:
-            hashed_pwd = hash_password(body.password)
-        except Exception as e:
-            logger.error("Password hashing failed: %s", e, exc_info=True)
-            raise
-
-        # Write user to Firestore
-        try:
-            await db.collection("users").document(user_id).set({
-                "email": body.email,
-                "hashed_password": hashed_pwd,
-                "tier": "free",
-                "created_at": now,
-                "updated_at": now,
-            })
-        except Exception as e:
-            logger.error("Firestore write error: %s", e, exc_info=True)
-            raise
-
-        # Generate tokens
-        try:
-            access_token = create_access_token(user_id, settings)
-            refresh_token = create_refresh_token(user_id, settings)
-        except Exception as e:
-            logger.error("Token generation failed: %s", e, exc_info=True)
-            raise
-
-        logger.info("User registered successfully: id=%s, email=%s", user_id, body.email)
-        return TokenResponse(
-            access_token=access_token,
-            refresh_token=refresh_token,
-        )
-    
-    except ConflictError:
-        raise
+        existing = await db.collection("users").where("email", "==", body.email).limit(1).get()
     except Exception as e:
-        logger.error("Unexpected error during registration for %s: %s", body.email, e, exc_info=True)
+        _raise_for_firestore_quota(e, context="checking whether the email already exists")
+        logger.error("Database query error during email check: %s", e, exc_info=True)
         raise
+    if existing:
+        logger.warning("Registration attempt with existing email: %s", body.email)
+        raise ConflictError(f"'{body.email}' is already registered")
+
+    user_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+
+    # Create the credential in Firebase Auth (uid == our Firestore doc id)
+    try:
+        firebase_admin.auth.create_user(uid=user_id, email=body.email, password=body.password)
+    except firebase_admin.auth.EmailAlreadyExistsError as e:
+        # Exists in Firebase but not in Firestore (e.g. console-created) —
+        # logging in will recreate the missing doc.
+        logger.warning("Registration for email already in Firebase Auth: %s", body.email)
+        raise ConflictError(f"'{body.email}' is already registered") from e
+    except ValueError as e:
+        raise ValidationError(str(e)) from e
+
+    # Write user to Firestore (hashed_password kept as "" for doc-shape compat)
+    try:
+        await db.collection("users").document(user_id).set({
+            "email": body.email,
+            "hashed_password": "",
+            "firebase_uid": user_id,
+            "tier": "free",
+            "created_at": now,
+            "updated_at": now,
+        })
+    except Exception as e:
+        logger.error("Firestore write error: %s", e, exc_info=True)
+        # Don't leave an orphaned Firebase credential the user can't re-register
+        with suppress(Exception):
+            firebase_admin.auth.delete_user(user_id)
+        raise
+
+    logger.info("User registered successfully: id=%s, email=%s", user_id, body.email)
+    return TokenResponse(
+        access_token=create_access_token(user_id, settings),
+        refresh_token=create_refresh_token(user_id, settings),
+    )
+
+
+async def _firebase_password_signin(api_key: str, email: str, password: str) -> str | None:
+    """Verify email+password against Firebase Auth; return the Firebase UID.
+
+    Returns None on bad credentials / unknown user. The Admin SDK can't check
+    passwords, so this goes through the Identity Toolkit REST API using the
+    public Web API key.
+    """
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword",
+            params={"key": api_key},
+            json={"email": email, "password": password, "returnSecureToken": True},
+        )
+    if resp.status_code == 200:
+        return resp.json().get("localId")
+    message = resp.json().get("error", {}).get("message", "")
+    if any(
+        code in message
+        for code in ("INVALID_LOGIN_CREDENTIALS", "EMAIL_NOT_FOUND", "INVALID_PASSWORD", "USER_DISABLED")
+    ):
+        return None
+    raise ExternalServiceError(f"Firebase Auth error during login (HTTP {resp.status_code}): {message[:200]}")
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -142,7 +168,15 @@ async def login(
     redis: RedisDep,
     settings: SettingsDep,
 ) -> TokenResponse:
-    """Authenticate with email + password; return access + refresh tokens."""
+    """Authenticate with email + password; return access + refresh tokens.
+
+    Passwords are verified by Firebase Auth. Accounts created before the
+    Firebase migration (bcrypt hash in Firestore, no Firebase credential yet)
+    are migrated lazily on their first successful login.
+    """
+    if not settings.FIREBASE_WEB_API_KEY:
+        raise ValidationError("Email/password login is not configured on this server.")
+
     await check_not_locked_out(redis, body.email)
 
     try:
@@ -155,16 +189,57 @@ async def login(
     user_doc = docs[0] if docs else None
     user_data = user_doc.to_dict() if user_doc else None
 
-    # Always verify to avoid timing-based user enumeration
-    if not user_data or not verify_password(body.password, user_data["hashed_password"]):
-        await record_failed_attempt(redis, body.email)
-        raise UnauthorizedError("Invalid email or password")
+    firebase_uid = await _firebase_password_signin(
+        settings.FIREBASE_WEB_API_KEY, body.email, body.password
+    )
+
+    if firebase_uid is None:
+        # Lazy migration: a pre-Firebase account still verified by its bcrypt
+        # hash gets its Firebase credential created on first successful login.
+        legacy_hash = (user_data or {}).get("hashed_password") or ""
+        if (
+            user_data
+            and not user_data.get("firebase_uid")
+            and legacy_hash.startswith("$2")
+            and verify_password(body.password, legacy_hash)
+        ):
+            firebase_uid = user_doc.id
+            try:
+                firebase_admin.auth.create_user(
+                    uid=firebase_uid, email=body.email, password=body.password
+                )
+            except firebase_admin.auth.UidAlreadyExistsError:
+                pass  # imported by scripts/migrate_users_to_firebase.py meanwhile
+            await user_doc.reference.set({"firebase_uid": firebase_uid}, merge=True)
+            logger.info("Lazily migrated user to Firebase Auth: id=%s", user_doc.id)
+        else:
+            await record_failed_attempt(redis, body.email)
+            raise UnauthorizedError("Invalid email or password")
+
+    # Bind/repair the Firestore doc for this Firebase account.
+    if user_doc is None:
+        # Credential exists in Firebase but doc is missing (e.g. console-created).
+        user_id = firebase_uid
+        now = datetime.now(UTC)
+        await db.collection("users").document(user_id).set({
+            "email": body.email,
+            "hashed_password": "",
+            "firebase_uid": firebase_uid,
+            "tier": "free",
+            "created_at": now,
+            "updated_at": now,
+        })
+        logger.info("Recreated missing user doc from Firebase Auth: id=%s", user_id)
+    else:
+        user_id = user_doc.id
+        if user_data.get("firebase_uid") != firebase_uid:
+            await user_doc.reference.set({"firebase_uid": firebase_uid}, merge=True)
 
     await clear_failed_attempts(redis, body.email)
-    logger.info("User logged in: id=%s", user_doc.id)
+    logger.info("User logged in: id=%s", user_id)
     return TokenResponse(
-        access_token=create_access_token(user_doc.id, settings),
-        refresh_token=create_refresh_token(user_doc.id, settings),
+        access_token=create_access_token(user_id, settings),
+        refresh_token=create_refresh_token(user_id, settings),
     )
 
 
@@ -192,11 +267,13 @@ async def oauth_auth(
     db: DBSession,
     settings: SettingsDep,
 ) -> TokenResponse:
-    """Authenticate via a Firebase OAuth provider (Google, GitHub, …).
+    """Authenticate via Firebase Auth (email/password, Google, GitHub, …).
 
     Verifies the Firebase ID token and creates the user on first sign-in.
-    Provider-agnostic: Firebase signs the token regardless of which provider
-    the user picked in the popup.
+    Provider-agnostic: Firebase signs the token regardless of how the user
+    authenticated. User docs are bound to their Firebase account by
+    firebase_uid; email matching is only used to link a Firebase identity to
+    a pre-Firebase account once.
     """
     try:
         decoded = firebase_admin.auth.verify_id_token(body.id_token)
@@ -204,17 +281,38 @@ async def oauth_auth(
         raise UnauthorizedError("Invalid sign-in token") from exc
 
     email: str | None = decoded.get("email")
-    if not email:
+    firebase_uid: str | None = decoded.get("uid") or decoded.get("sub")
+    if not email or not firebase_uid:
         raise UnauthorizedError("This account has no email we can use")
 
     provider: str = decoded.get("firebase", {}).get("sign_in_provider", "unknown")
+
+    # 1) Stable match: a user doc already bound to this Firebase account.
+    try:
+        docs = await db.collection("users").where("firebase_uid", "==", firebase_uid).limit(1).get()
+    except Exception as exc:
+        _raise_for_firestore_quota(exc, context="looking up the user record")
+        logger.error("Firestore lookup failure during sign-in for %s: %s", email, exc, exc_info=True)
+        raise
+
+    if docs:
+        user_id = docs[0].id
+        logger.info("Firebase user signed in: id=%s provider=%s", user_id, provider)
+        return TokenResponse(
+            access_token=create_access_token(user_id, settings),
+            refresh_token=create_refresh_token(user_id, settings),
+        )
+
+    # 2) First Firebase sign-in for this identity: link to an existing account
+    #    by email, or create a fresh one.
     try:
         docs = await db.collection("users").where("email", "==", email).limit(1).get()
     except Exception as exc:
-        _raise_for_firestore_quota(exc, context="looking up the OAuth user record")
-        logger.error("Firestore lookup failure during OAuth sign-in for %s: %s", email, exc, exc_info=True)
+        _raise_for_firestore_quota(exc, context="looking up the user record")
+        logger.error("Firestore lookup failure during sign-in for %s: %s", email, exc, exc_info=True)
         raise
 
+    now = datetime.now(UTC)
     if docs:
         # Only link into an existing account when the provider vouches for the
         # email — otherwise anyone could claim an unverified address on GitHub
@@ -222,22 +320,27 @@ async def oauth_auth(
         if decoded.get("email_verified") is False:
             raise UnauthorizedError(
                 f"An account for {email} already exists. Verify that email with "
-                "your sign-in provider first, or log in with your password."
+                "your sign-in provider first, then try again."
             )
         user_id = docs[0].id
+        await db.collection("users").document(user_id).update({
+            "firebase_uid": firebase_uid,
+            "updated_at": now,
+        })
+        logger.info("Firebase identity linked to existing user: id=%s provider=%s", user_id, provider)
     else:
         user_id = str(uuid.uuid4())
-        now = datetime.now(UTC)
         await db.collection("users").document(user_id).set({
             "email": email,
             "hashed_password": "",
+            "firebase_uid": firebase_uid,
             "tier": "free",
             "created_at": now,
             "updated_at": now,
         })
-        logger.info("OAuth user created: id=%s email=%s provider=%s", user_id, email, provider)
+        logger.info("Firebase user created: id=%s email=%s provider=%s", user_id, email, provider)
 
-    logger.info("OAuth user signed in: id=%s provider=%s", user_id, provider)
+    logger.info("Firebase user signed in: id=%s provider=%s", user_id, provider)
     return TokenResponse(
         access_token=create_access_token(user_id, settings),
         refresh_token=create_refresh_token(user_id, settings),

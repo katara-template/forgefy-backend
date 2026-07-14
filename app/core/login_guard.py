@@ -9,8 +9,8 @@ import redis.asyncio as aioredis
 
 from app.core.exceptions import RateLimitedError
 
-_MAX_ATTEMPTS = 5
-_LOCKOUT_SECONDS = 15 * 60
+_MAX_ATTEMPTS = 10
+_LOCKOUT_SECONDS = 30 * 60
 
 
 def _key(email: str) -> str:

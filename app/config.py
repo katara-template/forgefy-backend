@@ -93,6 +93,11 @@ class Settings(BaseSettings):
     FIREBASE_OAUTH_CLIENT_ID: str = ""
     FIREBASE_OAUTH_CLIENT_SECRET: str = ""
 
+    # Firebase Web API key (public-safe, from the Firebase console's project
+    # settings) — needed server-side to verify email/password logins against
+    # the Identity Toolkit REST API; the Admin SDK cannot check passwords.
+    FIREBASE_WEB_API_KEY: str = ""
+
     # Encryption key for secrets stored at rest (OAuth tokens, DB passwords).
     # Any string works — it's hashed into a Fernet key. Change in production.
     SECRETS_ENCRYPTION_KEY: str = "changeme-replace-with-a-real-secret"

@@ -129,6 +129,9 @@ async def client(
 
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_redis] = override_get_redis
+    # /health caches dependency checks briefly; reset so one test's healthy
+    # result doesn't mask another test's simulated outage.
+    app.state.health_cache = {"at": 0.0, "checks": None}
 
     with (
         patch("app.main.init_firebase", return_value=mock_db),
