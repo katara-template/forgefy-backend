@@ -41,6 +41,21 @@ class Settings(BaseSettings):
     OLLAMA_MODEL: str = "qwen3:8b"
     OLLAMA_TIMEOUT: int = 300
 
+    # OpenRouter — the hosted backend for the "Qwen3" setting. When
+    # OPENROUTER_API_KEY is set, BP_MODEL/BUILD_MODEL="Qwen3" routes each action
+    # to the model best suited to it (app/ai/openrouter.py) instead of hitting a
+    # local Ollama. Leave the key blank to keep using local Ollama.
+    OPENROUTER_API_KEY: str = ""
+    # Pin one model for every action, bypassing per-action routing. Mostly for
+    # debugging — e.g. "qwen/qwen3-coder:free".
+    OPENROUTER_MODEL: str = ""
+    # Allow paid models as fallbacks when the free tier is rate-limited.
+    OPENROUTER_ALLOW_PAID: bool = False
+    OPENROUTER_TIMEOUT: int = 180
+    # Optional attribution shown on OpenRouter's dashboard/leaderboards.
+    OPENROUTER_SITE_URL: str = "https://forgefy.app"
+    OPENROUTER_APP_NAME: str = "Forgefy"
+
     # Blueprint generation backend (extraction + synthesis): "claude" | "gemini" | "Qwen3"
     BP_MODEL: str = "claude"
     # App build backend (code generation): "claude" | "gemini" | "Qwen3" | "gpt"

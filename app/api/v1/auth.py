@@ -420,7 +420,9 @@ async def github_callback(
     db: DBSession = None,
     settings: SettingsDep = None,
 ) -> RedirectResponse:
-    """Exchange code for GitHub token, store on user, redirect to frontend."""
+    """Exchange code for GitHub token, store it (encrypted), redirect to frontend."""
+    from app.core.crypto import encrypt
+
     user_id = _verify_state(state, settings.SECRET_KEY)
     if not user_id:
         return RedirectResponse(f"{settings.FRONTEND_URL}/dashboard?github_error=invalid_state")
@@ -450,7 +452,7 @@ async def github_callback(
             github_username: str = user_resp.json().get("login", "")
 
         await db.collection("users").document(user_id).update({
-            "github_access_token": github_token,
+            "github_access_token": encrypt(github_token),
             "github_username": github_username,
         })
         logger.info("GitHub linked user=%s username=%s", user_id, github_username)
