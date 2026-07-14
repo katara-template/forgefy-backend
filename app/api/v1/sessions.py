@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, UploadFile
 from pydantic import BaseModel
 
+from app.core.dispatch import dispatch
 from app.core.exceptions import ValidationError
 from app.db.models.enums import Platform, SessionStatus
 from app.deps import CurrentUser, DBSession
@@ -93,7 +94,8 @@ async def upload_recording(
     session = await sm.transition(session_id, SessionStatus.PROCESSING)
 
     from app.workers.upload_worker import transcribe_upload
-    transcribe_upload.apply_async(
+    await dispatch(
+        transcribe_upload,
         args=[str(session_id), str(dest)],
         queue="meeting.audio",
     )

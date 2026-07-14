@@ -15,8 +15,10 @@ import time
 import uuid
 from contextlib import suppress
 from datetime import UTC, datetime
+from functools import partial
 from urllib.parse import urlencode
 
+import anyio
 import firebase_admin.auth
 import httpx
 from fastapi import APIRouter, Query, Request
@@ -100,9 +102,13 @@ async def register(
     user_id = str(uuid.uuid4())
     now = datetime.now(UTC)
 
-    # Create the credential in Firebase Auth (uid == our Firestore doc id)
+    # Create the credential in Firebase Auth (uid == our Firestore doc id).
+    # The Admin SDK's auth calls are synchronous REST requests — run them in a
+    # worker thread so they don't block the event loop.
     try:
-        firebase_admin.auth.create_user(uid=user_id, email=body.email, password=body.password)
+        await anyio.to_thread.run_sync(
+            partial(firebase_admin.auth.create_user, uid=user_id, email=body.email, password=body.password)
+        )
     except firebase_admin.auth.EmailAlreadyExistsError as e:
         # Exists in Firebase but not in Firestore (e.g. console-created) —
         # logging in will recreate the missing doc.
@@ -125,7 +131,7 @@ async def register(
         logger.error("Firestore write error: %s", e, exc_info=True)
         # Don't leave an orphaned Firebase credential the user can't re-register
         with suppress(Exception):
-            firebase_admin.auth.delete_user(user_id)
+            await anyio.to_thread.run_sync(firebase_admin.auth.delete_user, user_id)
         raise
 
     logger.info("User registered successfully: id=%s, email=%s", user_id, body.email)
@@ -201,12 +207,17 @@ async def login(
             user_data
             and not user_data.get("firebase_uid")
             and legacy_hash.startswith("$2")
-            and verify_password(body.password, legacy_hash)
+            # bcrypt is ~250ms of pure CPU — run it in a worker thread so it
+            # doesn't stall every other request on this event loop.
+            and await anyio.to_thread.run_sync(verify_password, body.password, legacy_hash)
         ):
             firebase_uid = user_doc.id
             try:
-                firebase_admin.auth.create_user(
-                    uid=firebase_uid, email=body.email, password=body.password
+                await anyio.to_thread.run_sync(
+                    partial(
+                        firebase_admin.auth.create_user,
+                        uid=firebase_uid, email=body.email, password=body.password,
+                    )
                 )
             except firebase_admin.auth.UidAlreadyExistsError:
                 pass  # imported by scripts/migrate_users_to_firebase.py meanwhile
@@ -276,7 +287,11 @@ async def oauth_auth(
     a pre-Firebase account once.
     """
     try:
-        decoded = firebase_admin.auth.verify_id_token(body.id_token)
+        # verify_id_token can fetch Google's signing certs over sync HTTP —
+        # keep it off the event loop.
+        decoded = await anyio.to_thread.run_sync(
+            firebase_admin.auth.verify_id_token, body.id_token
+        )
     except Exception as exc:
         raise UnauthorizedError("Invalid sign-in token") from exc
 

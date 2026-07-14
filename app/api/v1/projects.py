@@ -8,8 +8,10 @@ import uuid
 from contextlib import suppress
 from datetime import UTC, datetime
 
+import anyio
 from fastapi import APIRouter
 
+from app.core.dispatch import dispatch
 from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
 from app.deps import CurrentUser, DBSession, SettingsDep
 from app.schemas.project import (
@@ -88,7 +90,7 @@ async def _finalize_db_connect(project_id: uuid.UUID, project: ProjectOut, db) -
             "updated_at": datetime.now(UTC),
         })
         from app.workers.build_worker import run_build
-        run_build.apply_async(args=[str(project.session_id), str(project_id)], queue="build")
+        await dispatch(run_build, args=[str(project.session_id), str(project_id)], queue="build")
         return {"build_queued": True}
 
     return {"prompt_wire_in": True}
@@ -132,7 +134,8 @@ async def stop_project(
     from app.build.cancel import request_cancel
     from app.config import get_settings
     settings = get_settings()
-    request_cancel(settings.REDIS_URL, str(project_id))
+    # request_cancel opens a sync Redis connection — keep it off the event loop.
+    await anyio.to_thread.run_sync(request_cancel, settings.REDIS_URL, str(project_id))
 
     # Immediately mark as not-updating so the UI unblocks
     from datetime import datetime
@@ -330,7 +333,8 @@ async def update_project(
         raise ValidationError("A build or update is already in progress.")
 
     from app.workers.update_worker import apply_update
-    apply_update.apply_async(
+    await dispatch(
+        apply_update,
         args=[str(project_id), body.prompt, str(user.id)],
         queue="build",
     )
@@ -394,7 +398,8 @@ async def chat_with_project(
             )
         log_fn("started", f"Preparing update for {project.app_name}…")
         from app.workers.update_worker import apply_update
-        apply_update.apply_async(
+        await dispatch(
+            apply_update,
             args=[str(project_id), message, str(user.id)],
             queue="build",
         )
@@ -653,7 +658,8 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
             )
         log_fn("started", f"Preparing update for {project.app_name}…")
         from app.workers.update_worker import apply_update
-        apply_update.apply_async(
+        await dispatch(
+            apply_update,
             args=[str(project_id), message, str(user.id)],
             queue="build",
         )
@@ -695,7 +701,8 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
 
         log_fn("started", f"Preparing update for {project.app_name}…")
         from app.workers.update_worker import apply_update
-        apply_update.apply_async(
+        await dispatch(
+            apply_update,
             args=[str(project_id), update_prompt, str(user.id)],
             queue="build",
         )
@@ -752,7 +759,8 @@ async def trigger_preview_build(
         raise ValidationError("Project has no GitHub repository yet — wait for the initial build to finish.")
 
     from app.workers.build_worker import build_preview
-    build_preview.apply_async(
+    await dispatch(
+        build_preview,
         args=[str(project_id), str(user.id)],
         queue="build",
     )
@@ -942,7 +950,7 @@ async def skip_database(
     })
 
     from app.workers.build_worker import run_build
-    run_build.apply_async(args=[str(project.session_id), str(project_id)], queue="build")
+    await dispatch(run_build, args=[str(project.session_id), str(project_id)], queue="build")
     return {"status": "queued"}
 
 
@@ -979,5 +987,5 @@ async def wire_database(
     )
 
     from app.workers.update_worker import apply_update
-    apply_update.apply_async(args=[str(project_id), prompt, str(user.id)], queue="build")
+    await dispatch(apply_update, args=[str(project_id), prompt, str(user.id)], queue="build")
     return {"status": "queued"}
