@@ -123,6 +123,12 @@ def create_app() -> FastAPI:
         return {"message": "Forgefy backend is up and running!"}
     
     # ── Ops endpoints ─────────────────────────────────────────────────────────
+    # Orchestrators probe /health every few seconds; cache the dependency
+    # checks briefly so probes don't consume Firestore read quota all day.
+    # Kept on app.state so tests can reset it between cases.
+    app.state.health_cache = {"at": 0.0, "checks": None}
+    health_cache_ttl = 25.0
+
     @app.get("/health", tags=["ops"], summary="Liveness + dependency readiness probe")
     async def health(db: DBSession, redis: RedisDep) -> Response:
         """Return service status, including Redis and Firestore reachability.
@@ -131,19 +137,29 @@ def create_app() -> FastAPI:
         (Docker/Render health checks) can detect and recycle a container that's
         running but can't actually serve requests.
         """
-        checks: dict[str, str] = {}
+        import time
 
-        try:
-            await redis.ping()
-            checks["redis"] = "ok"
-        except Exception as exc:
-            checks["redis"] = f"error: {exc}"
+        cache = app.state.health_cache
+        checks: dict[str, str] | None = None
+        if time.monotonic() - cache["at"] < health_cache_ttl:
+            checks = cache["checks"]
 
-        try:
-            await db.collection("system").document("healthcheck").get()
-            checks["firestore"] = "ok"
-        except Exception as exc:
-            checks["firestore"] = f"error: {exc}"
+        if checks is None:
+            checks = {}
+            try:
+                await redis.ping()
+                checks["redis"] = "ok"
+            except Exception as exc:
+                checks["redis"] = f"error: {exc}"
+
+            try:
+                await db.collection("system").document("healthcheck").get()
+                checks["firestore"] = "ok"
+            except Exception as exc:
+                checks["firestore"] = f"error: {exc}"
+
+            cache["at"] = time.monotonic()
+            cache["checks"] = checks
 
         healthy = all(v == "ok" for v in checks.values())
         return JSONResponse(

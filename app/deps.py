@@ -64,7 +64,7 @@ async def get_current_user(
     return User(
         id=uid,
         email=data["email"],
-        hashed_password=data["hashed_password"],
+        hashed_password=data.get("hashed_password", ""),
         created_at=data["created_at"],
         updated_at=data["updated_at"],
         tier=data.get("tier", "free"),
