@@ -70,6 +70,13 @@ COPY . .
 EXPOSE 8000
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Shell form so the platform can tune via env without an image rebuild:
+#   WEB_CONCURRENCY — worker processes (default 4; match the instance's CPU count)
+#   PORT            — listen port (Render/Railway inject this; defaults to 8000)
+# --proxy-headers trusts X-Forwarded-For from the platform's load balancer so
+# rate limiting sees real client IPs instead of the proxy's.
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} \
+    --workers ${WEB_CONCURRENCY:-4} \
+    --proxy-headers --forwarded-allow-ips="*"

@@ -25,6 +25,7 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from app.config import get_settings
+from app.core.dispatch import dispatch
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -135,7 +136,8 @@ async def _handle_transcript(data: dict, settings) -> None:
 
     if is_final:
         from app.workers.extraction_worker import extract_requirements
-        extract_requirements.apply_async(
+        await dispatch(
+            extract_requirements,
             args=[session_id, text],
             queue="meeting.transcribe",
         )
@@ -178,7 +180,8 @@ async def _handle_status_change(event_type: str, data: dict, settings) -> None:
             DELETE_MEDIA_COUNTDOWN_SECONDS,
             recall_delete_media,
         )
-        recall_delete_media.apply_async(
+        await dispatch(
+            recall_delete_media,
             args=[bot_id],
             countdown=DELETE_MEDIA_COUNTDOWN_SECONDS,
             queue="meeting.audio",

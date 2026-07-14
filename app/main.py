@@ -2,7 +2,7 @@
 import logging
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import redis.asyncio as aioredis
@@ -57,6 +57,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     firestore_client = init_firebase()
     app.state.firestore = firestore_client
+
+    # Absorb the first-call gRPC channel setup (~3s measured) at startup so it
+    # doesn't land on the first user request after a deploy or scale-up.
+    with suppress(Exception):
+        await firestore_client.collection("system").document("healthcheck").get()
 
     # Strip any ssl_cert_reqs query param from rediss:// URLs — redis-py
     # handles TLS via the scheme; the query param causes issues on newer versions.

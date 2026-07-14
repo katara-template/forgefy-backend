@@ -13,6 +13,7 @@ from fastapi import APIRouter
 from google.cloud.firestore import AsyncClient
 from pydantic import BaseModel
 
+from app.core.dispatch import dispatch
 from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
 from app.db.models.blueprint import Blueprint
 from app.db.models.enums import SessionStatus
@@ -231,7 +232,7 @@ async def approve_blueprint(
         )
     else:
         from app.workers.build_worker import run_build
-        run_build.apply_async(args=[str(blueprint.session_id), project_id], queue="build")
+        await dispatch(run_build, args=[str(blueprint.session_id), project_id], queue="build")
         logger.info("Build dispatched session=%s blueprint=%s project=%s", blueprint.session_id, blueprint_id, project_id)
 
     return BlueprintOut.model_validate(blueprint)
