@@ -191,26 +191,45 @@ async def get_overview(db: DBSession, user: AdminUser) -> OverviewOut:
     projects = db.collection("projects")
     users = db.collection("users")
 
-    apps_by_framework = {
-        label: await _count(projects.where("template_key", "==", key))
-        for key, label in TEMPLATE_LABELS.items()
-    }
-
-    recent_docs = await projects.order_by("updated_at", direction="DESCENDING").limit(10).get()
+    # Every count is independent, so run them all concurrently — one
+    # round-trip's worth of latency instead of a dozen sequential ones.
+    (
+        framework_counts,
+        recent_docs,
+        meetings_all_time,
+        meetings_this_month,
+        apps_total,
+        active_users,
+        new_signups_week,
+        meetings_in_progress,
+        apps_building,
+        apps_shipped,
+    ) = await asyncio.gather(
+        asyncio.gather(
+            *(_count(projects.where("template_key", "==", key)) for key in TEMPLATE_LABELS)
+        ),
+        projects.order_by("updated_at", direction="DESCENDING").limit(10).get(),
+        _count(sessions),
+        _count(sessions.where("created_at", ">=", month_start)),
+        _count(projects),
+        _count(users),
+        _count(users.where("created_at", ">=", week_ago)),
+        _count(sessions.where("status", "in", _IN_PROGRESS_SESSION_STATUSES)),
+        _count(projects.where("is_updating", "==", True)),
+        _count(projects.where("preview_url", "!=", None)),
+    )
 
     stats = OverviewStats(
-        meetings_all_time=await _count(sessions),
-        meetings_this_month=await _count(sessions.where("created_at", ">=", month_start)),
-        apps_total=await _count(projects),
-        apps_by_framework=apps_by_framework,
-        active_users=await _count(users),
-        new_signups_week=await _count(users.where("created_at", ">=", week_ago)),
+        meetings_all_time=meetings_all_time,
+        meetings_this_month=meetings_this_month,
+        apps_total=apps_total,
+        apps_by_framework=dict(zip(TEMPLATE_LABELS.values(), framework_counts)),
+        active_users=active_users,
+        new_signups_week=new_signups_week,
         pipeline=PipelineStats(
-            meetings_in_progress=await _count(
-                sessions.where("status", "in", _IN_PROGRESS_SESSION_STATUSES)
-            ),
-            apps_building=await _count(projects.where("is_updating", "==", True)),
-            apps_shipped=await _count(projects.where("preview_url", "!=", None)),
+            meetings_in_progress=meetings_in_progress,
+            apps_building=apps_building,
+            apps_shipped=apps_shipped,
         ),
     )
 
@@ -259,30 +278,52 @@ async def get_meetings_stats(db: DBSession, user: AdminUser) -> MeetingsStatsOut
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     sessions = db.collection("sessions")
 
-    by_platform = {
-        platform: await _count(sessions.where("platform", "==", platform))
-        for platform in _PLATFORMS
-    }
+    day_starts = [
+        (now - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
+        for i in range(29, -1, -1)
+    ]
 
-    per_day: list[DailyCount] = []
-    for i in range(29, -1, -1):
-        day_start = (now - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = day_start + timedelta(days=1)
-        count = await _count(
-            sessions.where("created_at", ">=", day_start).where("created_at", "<", day_end)
-        )
-        per_day.append(DailyCount(date=day_start.date().isoformat(), count=count))
+    # All counts (30 daily buckets, per-platform, per-status, totals) are
+    # independent aggregations — run them concurrently rather than as ~40
+    # sequential round trips.
+    (
+        platform_counts,
+        day_counts,
+        total,
+        this_month,
+        processed,
+        pending,
+        failed,
+    ) = await asyncio.gather(
+        asyncio.gather(
+            *(_count(sessions.where("platform", "==", platform)) for platform in _PLATFORMS)
+        ),
+        asyncio.gather(
+            *(
+                _count(
+                    sessions
+                    .where("created_at", ">=", day_start)
+                    .where("created_at", "<", day_start + timedelta(days=1))
+                )
+                for day_start in day_starts
+            )
+        ),
+        _count(sessions),
+        _count(sessions.where("created_at", ">=", month_start)),
+        _count(sessions.where("status", "in", _PROCESSED_SESSION_STATUSES)),
+        _count(sessions.where("status", "in", _PENDING_SESSION_STATUSES)),
+        _count(sessions.where("status", "in", _FAILED_SESSION_STATUSES)),
+    )
 
     return MeetingsStatsOut(
-        total=await _count(sessions),
-        this_month=await _count(sessions.where("created_at", ">=", month_start)),
-        by_status=MeetingsByStatus(
-            processed=await _count(sessions.where("status", "in", _PROCESSED_SESSION_STATUSES)),
-            pending=await _count(sessions.where("status", "in", _PENDING_SESSION_STATUSES)),
-            failed=await _count(sessions.where("status", "in", _FAILED_SESSION_STATUSES)),
-        ),
-        by_platform=by_platform,
-        per_day=per_day,
+        total=total,
+        this_month=this_month,
+        by_status=MeetingsByStatus(processed=processed, pending=pending, failed=failed),
+        by_platform=dict(zip(_PLATFORMS, platform_counts)),
+        per_day=[
+            DailyCount(date=day_start.date().isoformat(), count=count)
+            for day_start, count in zip(day_starts, day_counts)
+        ],
     )
 
 
@@ -306,22 +347,31 @@ async def list_builds(db: DBSession, user: AdminUser, limit: int = 200) -> list[
         .limit(limit)
         .get()
     )
+    dicts = [doc.to_dict() for doc in docs]
 
-    results: list[BuildOut] = []
-    for doc in docs:
-        d = doc.to_dict()
-        description = ""
-        blueprint_id = d.get("blueprint_id")
-        if blueprint_id:
-            bp_doc = await db.collection("blueprints").document(blueprint_id).get()
+    # Batch-fetch all linked blueprints in one get_all call instead of one
+    # sequential point read per project.
+    blueprint_refs = {
+        bid: db.collection("blueprints").document(bid)
+        for d in dicts
+        if (bid := d.get("blueprint_id"))
+    }
+    descriptions: dict[str, str] = {}
+    if blueprint_refs:
+        async for bp_doc in db.get_all(list(blueprint_refs.values())):
             if bp_doc.exists:
-                description = (bp_doc.to_dict().get("json_output") or {}).get("app_description", "")
-        results.append(BuildOut(
+                descriptions[bp_doc.id] = (
+                    (bp_doc.to_dict().get("json_output") or {}).get("app_description", "")
+                )
+
+    return [
+        BuildOut(
             name=d.get("app_name", ""),
-            description=description,
+            description=descriptions.get(d.get("blueprint_id", ""), ""),
             artifact_url=d.get("artifact_url"),
-        ))
-    return results
+        )
+        for d in dicts
+    ]
 
 
 class UserOut(BaseModel):

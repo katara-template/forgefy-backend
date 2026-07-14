@@ -48,11 +48,16 @@ class TestListBuilds:
 
             blueprints_col = MagicMock()
             wire_firestore_chain(blueprints_col)
-            blueprints_col.document.return_value.get.return_value = make_doc_snapshot(
+            bp_snapshot = make_doc_snapshot(
                 {"json_output": {"app_description": "An inventory tracking app"}},
                 doc_id=bp_id,
             )
 
+            # list_builds batch-fetches blueprints via db.get_all(refs).
+            async def _get_all(refs):
+                yield bp_snapshot
+
+            mock_db.get_all = _get_all
             mock_db.collection.side_effect = lambda name: {
                 "projects": projects_col,
                 "blueprints": blueprints_col,
