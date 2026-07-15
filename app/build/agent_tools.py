@@ -1,11 +1,14 @@
 """File-system tools for the build agent — sandboxed to the workspace root."""
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -401,7 +404,29 @@ def execute_tool(
     workspace: Path,
     log_fn=None,
 ) -> str:
-    """Dispatch a tool call and return the result as a string."""
+    """Dispatch a tool call and return the result as a string.
+
+    Any exception from a tool — a wrong path type, a missing argument, an I/O
+    error — is converted into an "ERROR: …" string rather than raised, so one bad
+    tool call is fed back to the model to self-correct instead of crashing the
+    whole build loop. Applies to every backend (Claude/Gemini/OpenAI/Ollama/
+    OpenRouter), all of which call execute_tool and treat the return as context.
+    """
+    try:
+        return _dispatch_tool(name, inputs, workspace, log_fn)
+    except KeyError as exc:
+        return f"ERROR: tool {name!r} is missing required argument {exc}"
+    except Exception as exc:  # noqa: BLE001 — surface to the model, never crash the build
+        logger.warning("Tool %r failed on input %s: %s", name, inputs, exc)
+        return f"ERROR: tool {name!r} failed: {exc}"
+
+
+def _dispatch_tool(
+    name: str,
+    inputs: dict[str, Any],
+    workspace: Path,
+    log_fn=None,
+) -> str:
     match name:
         case "read_file":
             p = _safe(workspace, inputs["path"])
@@ -419,6 +444,11 @@ def execute_tool(
             p = _safe(workspace, inputs["path"])
             if not p.exists():
                 return f"ERROR: {inputs['path']} not found"
+            if not p.is_dir():
+                # The model sometimes points list_files at a file (e.g. a route
+                # file). os.listdir would raise NotADirectoryError — steer it to
+                # read_file instead of crashing the build loop.
+                return f"ERROR: {inputs['path']} is a file, not a directory. Use read_file to read it."
             entries = sorted(os.listdir(p))
             if not entries:
                 return "(empty)"

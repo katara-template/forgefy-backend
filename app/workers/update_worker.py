@@ -35,7 +35,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
     from app.build.build_agent import run_update_agent
     from app.build.cancel import clear_cancel, is_cancelled
     from app.build.workspace import EditWorkspace
-    from app.core.usage import get_user_tier, is_over_limit, record_usage
+    from app.core.usage import record_usage
     from app.db.firebase import refresh_async_firestore_client
 
     settings = get_settings()
@@ -60,27 +60,38 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
     github_token = await get_valid_github_token(user_id, settings.GITHUB_TOKEN)
     push_url = f"https://{github_token}@github.com/{repo_full_name}.git"
 
-    # Check token quota before doing any expensive work
-    user_tier = await get_user_tier(db, user_id)
-    if await is_over_limit(db, user_id, user_tier):
-        from app.build.build_logger import publish_user_event
-        from app.core.tiers import get_tier
-        tier = get_tier(user_tier)
-        error_msg = (
-            f"You've used all {tier.monthly_tokens:,} tokens in your {tier.name} plan this month. "
-            "Upgrade to continue."
-        )
+    # Check token quota before doing any expensive work. Free users over budget
+    # are blocked; paid users are downgraded to the free model and keep going
+    # (see app/core/usage.py evaluate_quota). quota_forced_model, when set,
+    # overrides the resolved build_model below.
+    from app.build.build_logger import publish_user_event
+    from app.core.tiers import get_tier
+    from app.core.usage import evaluate_quota
+    quota = await evaluate_quota(db, settings, user_id)
+    tier = get_tier(quota.tier_key)
+    quota_forced_model: str | None = None
+    if quota.action == "block":
         await _patch_project(project_id, {
-            "build_error": error_msg,
+            "build_error": quota.message,
             "build_error_action": "support",
             "updated_at": datetime.now(UTC),
         })
         publish_user_event(
-            settings.REDIS_URL, user_id, "quota_exceeded", error_msg,
-            tier=user_tier, limit=tier.monthly_tokens,
+            settings.REDIS_URL, user_id, "quota_exceeded", quota.message,
+            tier=quota.tier_key, limit=tier.monthly_tokens,
         )
-        logger.warning("Update blocked — token limit reached user=%s tier=%s", user_id, user_tier)
+        logger.warning("Update blocked — token limit reached user=%s tier=%s", user_id, quota.tier_key)
         return {"blocked": "token_limit"}
+    if quota.action == "downgrade":
+        quota_forced_model = quota.forced_model
+        publish_user_event(
+            settings.REDIS_URL, user_id, "quota_downgrade", quota.message,
+            tier=quota.tier_key, limit=tier.monthly_tokens, forced_model=quota.forced_model,
+        )
+        logger.info(
+            "Update over quota — downgraded to free model=%s user=%s tier=%s",
+            quota.forced_model, user_id, quota.tier_key,
+        )
 
     await _patch_project(project_id, {"is_updating": True})
 
@@ -88,6 +99,8 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
 
     from app.build.build_logger import make_log_publisher
     log_fn = make_log_publisher(project_id, settings.REDIS_URL)
+    if quota_forced_model:
+        log_fn("warning", quota.message)
     log_fn("started", f"Applying update to {app_name}…")
 
     try:
@@ -96,6 +109,9 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
 
         from app.core.build_model import get_effective_build_model
         build_model = await get_effective_build_model(db, settings, user_id=user_id)
+        # A paid user over quota is downgraded to the free model for this update.
+        if quota_forced_model:
+            build_model = quota_forced_model
 
         # Build a condensed history of previous requests + what was done so the
         # agent understands what already exists and doesn't repeat or contradict it.
@@ -129,19 +145,33 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
             pass  # non-fatal — fall back to the bare prompt
 
         if build_model == "Qwen3":
-            from app.build.build_agent import run_update_agent_ollama
-            summary, tokens_used = run_update_agent_ollama(
-                workspace=workspace.path,
-                prompt=contextual_prompt,
-                blueprint=blueprint_context,
-                app_name=app_name,
-                template_key=template_key,
-                base_url=settings.OLLAMA_URL,
-                model=settings.OLLAMA_MODEL,
-                timeout=settings.OLLAMA_TIMEOUT,
-                log_fn=log_fn,
-                cancel_fn=cancel_fn,
-            )
+            from app.ai.qwen import using_openrouter
+
+            if using_openrouter():
+                from app.build.build_agent import run_update_agent_openrouter
+                summary, tokens_used = run_update_agent_openrouter(
+                    workspace=workspace.path,
+                    prompt=contextual_prompt,
+                    blueprint=blueprint_context,
+                    app_name=app_name,
+                    template_key=template_key,
+                    log_fn=log_fn,
+                    cancel_fn=cancel_fn,
+                )
+            else:
+                from app.build.build_agent import run_update_agent_ollama
+                summary, tokens_used = run_update_agent_ollama(
+                    workspace=workspace.path,
+                    prompt=contextual_prompt,
+                    blueprint=blueprint_context,
+                    app_name=app_name,
+                    template_key=template_key,
+                    base_url=settings.OLLAMA_URL,
+                    model=settings.OLLAMA_MODEL,
+                    timeout=settings.OLLAMA_TIMEOUT,
+                    log_fn=log_fn,
+                    cancel_fn=cancel_fn,
+                )
         elif build_model == "gemini":
             from app.build.build_agent import run_update_agent_gemini
             summary, tokens_used = run_update_agent_gemini(
