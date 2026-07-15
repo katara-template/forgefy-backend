@@ -50,7 +50,7 @@ _PATTERNS: list[tuple[re.Pattern, str, str]] = [
 
     # Rate limits / overload (transient — retry is sensible)
     (re.compile(r"rate.?limit|too.?many.?requests|overloaded|capacity|quota.?exceeded", re.I),
-     "The AI service is busy right now. Please try again in a few minutes.",
+     "We're a bit busy — please try again shortly.",
      "retry"),
 
     # Generic HTTP 5xx / transient AI provider errors

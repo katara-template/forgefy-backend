@@ -10,6 +10,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+# The worker runs as --uid=nobody (see CMD) but the image is built as root, so
+# $HOME=/root/.npm is unwritable to nobody → `npm install` fails with EACCES.
+# Point npm/npx at a world-writable cache and create it up front.
+ENV npm_config_cache=/tmp/.npm
+RUN mkdir -p /tmp/.npm && chmod 777 /tmp/.npm
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openjdk-21-jdk-headless \
     && rm -rf /var/lib/apt/lists/*

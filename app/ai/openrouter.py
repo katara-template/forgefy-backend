@@ -24,6 +24,9 @@ import requests
 logger = logging.getLogger(__name__)
 
 _CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Base URL for the OpenAI-compatible SDK (the agent tool-loops point the OpenAI
+# client here so they talk to OpenRouter instead of api.openai.com).
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 class OpenRouterError(RuntimeError):
@@ -151,6 +154,16 @@ def resolve_models(task: str) -> list[str]:
     if settings.OPENROUTER_ALLOW_PAID:
         chain += [m for m in _PAID_ROUTES.get(task, []) if m not in chain]
     return chain
+
+
+def code_models() -> list[str]:
+    """Ordered, tool-calling-capable model chain for the agentic build/fix loops.
+
+    Every model here supports OpenAI-style tool calling — a hard requirement for
+    the executor, which drives read_file/write_file/etc. The build agent walks
+    this chain when a free endpoint rate-limits mid-build (see _openai_loop).
+    """
+    return resolve_models(CODE)
 
 
 def _extract_json(raw: str) -> dict:

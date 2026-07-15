@@ -637,6 +637,22 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
             raw = ai_resp.content[0].text.strip() if ai_resp.content else ""
     except Exception as exc:
         logger.error("Chat classifier failed project=%s: %s", project_id, exc, exc_info=True)
+        # Surface the real reason to operators (not the user): push a scrubbed
+        # alert to the admin portal so a missing key, rate limit, or provider
+        # outage is diagnosable. sanitize_build_error maps it to a safe title;
+        # record_operator_alert scrubs keys/URLs from raw_detail.
+        try:
+            from app.core.alerts import record_operator_alert
+            from app.core.build_errors import sanitize_build_error
+            await record_operator_alert(
+                db,
+                title=f"Chat classifier failed: {sanitize_build_error(exc).message}",
+                raw_detail=str(exc),
+                source="chat_classifier",
+                project_id=str(project_id),
+            )
+        except Exception:  # never let alerting failure mask the original error
+            logger.exception("Failed to record operator alert for chat classifier")
         return ChatResponse(type="chat", response="I'm having trouble processing that right now. Please try again in a moment.")
 
     # Strip <think>...</think> blocks that Qwen3 prepends

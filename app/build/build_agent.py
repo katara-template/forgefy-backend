@@ -992,7 +992,9 @@ def _build_planner_msg(
         "react_native": "React Native / TypeScript / Expo",
     }.get(template_key, template_key)
     try:
-        file_tree = execute_tool("list_files", {"path": "."}, workspace)
+        # The project map (paths + key symbols) lets the planner target real
+        # files by name/symbol instead of guessing from a bare directory listing.
+        file_tree = _build_project_map(workspace)
     except Exception:
         file_tree = "(unavailable)"
     bp_excerpt = json.dumps({
@@ -1012,7 +1014,7 @@ def _build_planner_msg(
         f"App: {app_name}\n"
         f"Framework: {framework}\n\n"
         f"Blueprint excerpt:\n{bp_excerpt}\n\n"
-        f"Current workspace files:\n{file_tree[:1200]}\n\n"
+        f"Project map (path: key symbols):\n{file_tree[:3000]}\n\n"
         f"Change request:\n{planner_prompt}"
     )
 
@@ -1659,7 +1661,11 @@ def _ollama_loop(
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
 ) -> tuple[str, int]:
-    """Ollama tool-use agent loop. Returns (summary, 0) — Ollama doesn't expose token counts."""
+    """Ollama tool-use agent loop. Returns (summary, total_tokens).
+
+    Token counts come from each response's final chunk (prompt_eval_count +
+    eval_count), so local Ollama builds/updates are billed like the other backends.
+    """
     import requests as _req
 
     # Keep tool results short so the context doesn't balloon across iterations.
@@ -1678,6 +1684,7 @@ def _ollama_loop(
     history: list[dict[str, Any]] = []  # assistant + tool messages, pruned each turn
     last_text = ""
     write_calls = 0  # track whether the agent actually wrote any files
+    total_tokens = 0
 
     def _trimmed_messages() -> list[dict[str, Any]]:
         """Return anchor + the last _HISTORY_PAIRS*2 history messages."""
@@ -1687,7 +1694,7 @@ def _ollama_loop(
         if cancel_fn and cancel_fn():
             if log_fn:
                 log_fn("warning", "Agent stopped by user.")
-            return "Stopped by user.", 0
+            return "Stopped by user.", total_tokens
         warn_at = max(1, max_iterations - 10)
         if iteration == warn_at and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
@@ -1759,6 +1766,8 @@ def _ollama_loop(
 
                     if chunk.get("done"):
                         tool_calls = msg.get("tool_calls") or []
+                        # Final chunk carries token counts for this turn.
+                        total_tokens += chunk.get("prompt_eval_count", 0) + chunk.get("eval_count", 0)
                         if log_fn:
                             if think_buf.strip():
                                 log_fn("thinking", think_buf.strip())
@@ -1795,7 +1804,7 @@ def _ollama_loop(
                     })
                     continue
                 # Don't emit done here — update_worker will use the returned summary
-                return content_text, 0
+                return content_text, total_tokens
 
         if not tool_calls:
             if write_calls == 0 and last_text:
@@ -1812,7 +1821,7 @@ def _ollama_loop(
                 })
                 continue
             # Don't emit done here — update_worker will use the returned summary
-            return last_text or "Done.", 0
+            return last_text or "Done.", total_tokens
 
         for call in tool_calls:
             func = call.get("function", {})
@@ -1838,7 +1847,7 @@ def _ollama_loop(
 
     if log_fn:
         log_fn("warning", "Agent reached iteration limit.")
-    return "Agent reached iteration limit.", 0
+    return "Agent reached iteration limit.", total_tokens
 
 
 def run_build_agent_ollama(
@@ -1851,7 +1860,7 @@ def run_build_agent_ollama(
     timeout: int = 300,
     log_fn: Callable[[str, str], None] | None = None,
 ) -> tuple[str, int]:
-    """Run the build agent using local Ollama with tool calls; return (summary, 0)."""
+    """Run the build agent using local Ollama with tool calls; return (summary, total_tokens)."""
     system = _build_system(template_key)
     user_msg = (
         f"App name: {app_name}\n"
@@ -1937,6 +1946,96 @@ def _scan_workspace(workspace: Path, max_files: int = 300) -> str:
     return "\n".join(lines) if lines else "(empty workspace)"
 
 
+# ── Project map ──────────────────────────────────────────────────────────────
+# A flat path list tells the agent WHICH files exist but not what's in them, so
+# it reads file-by-file to locate code. The project map adds each source file's
+# top-level symbols (classes, widgets, components, functions, hooks) via cheap
+# regex — no LLM calls — so the agent can jump straight to the right file.
+_MAP_SOURCE_EXTS = frozenset({".dart", ".ts", ".tsx", ".js", ".jsx"})
+_MAP_MAX_FILES = 250
+_MAP_MAX_CHARS = 8000
+_MAP_MAX_SYMBOLS = 8
+
+# Dart: classes/mixins/enums (widgets, blocs, states, models) + top-level funcs.
+_DART_TYPE_RE = re.compile(r"^\s*(?:abstract\s+)?(?:class|mixin|enum)\s+(\w+)", re.M)
+_DART_FUNC_RE = re.compile(
+    r"^\s*(?:Future<[^>]*>|Stream<[^>]*>|List<[^>]*>|void|Widget|String|int|bool|double)\s+(\w+)\s*\(",
+    re.M,
+)
+# TS/JS: exported functions/classes/consts/interfaces/types/enums (React
+# components, hooks, services, prop types) — exports are the public surface.
+_TS_EXPORT_RE = re.compile(
+    r"^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|interface|type|enum)\s+(\w+)",
+    re.M,
+)
+
+
+def _extract_symbols(path: Path, text: str) -> list[str]:
+    """Return up to _MAP_MAX_SYMBOLS top-level symbol names declared in a file."""
+    ext = path.suffix.lower()
+    names: list[str] = []
+    if ext == ".dart":
+        names += _DART_TYPE_RE.findall(text)
+        names += _DART_FUNC_RE.findall(text)
+    elif ext in (".ts", ".tsx", ".js", ".jsx"):
+        names += _TS_EXPORT_RE.findall(text)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+        if len(out) >= _MAP_MAX_SYMBOLS:
+            break
+    return out
+
+
+def _build_project_map(workspace: Path) -> str:
+    """Return `path: symbol, symbol, …` lines for source files, `path` otherwise.
+
+    Lets the agent locate code by symbol without reading every file. Capped by
+    file count and total chars so it stays within the context budget; non-source
+    files still appear (path only) so the dedup guidance keeps working.
+    """
+    lines: list[str] = []
+    total = 0
+    count = 0
+    try:
+        for p in sorted(workspace.rglob("*")):
+            if count >= _MAP_MAX_FILES:
+                lines.append(f"… (truncated at {_MAP_MAX_FILES} files)")
+                break
+            rel_parts = p.parts[len(workspace.parts):]
+            if any(part.startswith(".") or part in _SCAN_SKIP_DIRS for part in rel_parts):
+                continue
+            if not p.is_file():
+                continue
+            suffix = p.suffix.lower()
+            if suffix in _SCAN_SKIP_EXTS:
+                continue
+
+            rel = p.relative_to(workspace).as_posix()  # forward slashes, matches write_file paths
+            if suffix in _MAP_SOURCE_EXTS:
+                try:
+                    symbols = _extract_symbols(p, p.read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    symbols = []
+                line = f"{rel}: {', '.join(symbols)}" if symbols else rel
+            else:
+                line = rel
+
+            if total + len(line) + 1 > _MAP_MAX_CHARS:
+                lines.append("… (truncated — map size limit reached)")
+                break
+            lines.append(line)
+            total += len(line) + 1
+            count += 1
+    except Exception:
+        pass
+    return "\n".join(lines) if lines else "(empty workspace)"
+
+
 def _get_installed_packages(workspace: Path) -> str:
     """Read pubspec.yaml or package.json and return the installed dependency names.
 
@@ -2007,7 +2106,7 @@ def _update_user_msg(
 
     file_listing = ""
     if workspace is not None:
-        scan = _scan_workspace(workspace)
+        scan = _build_project_map(workspace)
         git_log = _get_git_log(workspace)
         recent_files = _get_recent_changed_files(workspace)
         installed_pkgs = _get_installed_packages(workspace)
@@ -2042,16 +2141,19 @@ def _update_user_msg(
             git_section
             + pkg_section
             + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "EXISTING PROJECT FILES — read before creating anything\n"
+            "PROJECT MAP — every file and its key symbols\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Before calling write_file for any new file:\n"
-            "  1. Search this list for any file with the SAME NAME.\n"
-            "  2. Search for any file that serves the SAME PURPOSE\n"
+            "Each line is `path: symbols` — the classes, widgets, components, functions and\n"
+            "hooks defined in that file. USE THIS MAP to find the right file to change. Do\n"
+            "NOT read files one by one to discover where things are — the map already tells\n"
+            "you. Only call read_file when you need a specific file's full contents to edit\n"
+            "it, and prefer reading the 1–3 files the map shows are relevant.\n\n"
+            "Before calling write_file for a NEW file:\n"
+            "  1. Scan the map for a file with the SAME NAME or SAME PURPOSE\n"
             "     (e.g. auth_service.dart ≈ authentication_service.dart,\n"
             "      home_screen.dart ≈ home_page.dart, userApi.ts ≈ user_service.ts).\n"
-            "  3. If found → read it first, then WRITE YOUR CHANGES TO THAT EXISTING PATH.\n"
-            "  4. Only create a brand-new path if you confirm nothing similar already exists.\n"
-            "  NEVER create a second file that does the same job as an existing one.\n\n"
+            "  2. If found → edit THAT existing path. NEVER create a second file that does\n"
+            "     the same job as an existing one.\n\n"
             + scan + "\n"
             + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         )
@@ -2419,19 +2521,20 @@ def _gemini_loop(
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
 ) -> tuple[str, int]:
-    """Gemini tool-use agent loop via REST API. Returns (summary, 0)."""
+    """Gemini tool-use agent loop via REST API. Returns (summary, total_tokens)."""
     url = _GEMINI_URL.format(model=model)
     gemini_tools = _tools_to_gemini_format(TOOLS)
     contents: list[dict[str, Any]] = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
     last_text = ""
     write_calls = 0
     pushback_sent = False
+    total_tokens = 0
 
     for iteration in range(max_iterations):
         if cancel_fn and cancel_fn():
             if log_fn:
                 log_fn("warning", "Agent stopped by user.")
-            return "Stopped by user.", 0
+            return "Stopped by user.", total_tokens
         warn_at = max(1, max_iterations - 10)
         if iteration == warn_at and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
@@ -2448,6 +2551,9 @@ def _gemini_loop(
             timeout=120,
             log_fn=log_fn,
         )
+
+        # Gemini reports usage in usageMetadata.totalTokenCount (input + output).
+        total_tokens += (data.get("usageMetadata") or {}).get("totalTokenCount", 0)
 
         candidates = data.get("candidates", [])
         if not candidates:
@@ -2482,7 +2588,7 @@ def _gemini_loop(
                     "Implement the changes now using write_file."
                 )}]})
                 continue
-            return done_text, 0
+            return done_text, total_tokens
 
         if finish_reason in ("STOP", "MAX_TOKENS") and not tool_calls:
             if write_calls == 0 and not pushback_sent:
@@ -2493,7 +2599,7 @@ def _gemini_loop(
                     "You haven't written any files yet. Use write_file to implement the changes."
                 )}]})
                 continue
-            return last_text or "Done.", 0
+            return last_text or "Done.", total_tokens
 
         tool_responses: list[dict] = []
         for call in tool_calls:
@@ -2515,7 +2621,7 @@ def _gemini_loop(
 
     if log_fn:
         log_fn("warning", "Agent reached iteration limit.")
-    return "Agent reached iteration limit.", 0
+    return "Agent reached iteration limit.", total_tokens
 
 
 def run_build_agent_gemini(
@@ -2917,6 +3023,351 @@ def run_fix_agent_openai(
 ) -> tuple[str, int]:
     """Executor-only fix pass using OpenAI/GPT."""
     return _openai_loop(api_key, model, _UPDATE_SYSTEM, workspace, prompt, log_fn, cancel_fn, max_iterations=_ITERS_FIX)
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter agent loop (the hosted "Qwen3" build backend)
+#
+# Self-contained on purpose: it shares no code with the OpenAI/"gpt" loop above,
+# so the two backends can never affect each other. OpenRouter speaks the OpenAI
+# wire protocol, so we use the `openai` SDK purely as an HTTP client, pointed at
+# OpenRouter's base URL — no OpenAI/ChatGPT service or key is involved. Requests
+# run Qwen3-Coder (and the tool-capable fallbacks in app/ai/openrouter.py's CODE
+# chain) with real tool calling.
+# ---------------------------------------------------------------------------
+
+# HTTP conditions worth retrying — free OpenRouter endpoints 429 routinely.
+_OPENROUTER_RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
+
+# Weaker free models sometimes read/list files turn after turn without ever
+# committing an edit. After this many consecutive exploration-only turns, nudge
+# the agent to start writing; give up nudging after _MAX_WRITE_NUDGES so a
+# genuinely read-only task (e.g. a security review) isn't harassed forever.
+_READONLY_STREAK_LIMIT = 8
+_MAX_WRITE_NUDGES = 2
+
+# The OpenRouter loop is non-streaming, so there's a silent gap while each turn's
+# model call is in flight. Emit a rotating status verb (rendered with the
+# "thinking" spinner in the UI) so the build always looks alive. "Forging" nods
+# to the product name.
+_STATUS_VERBS = ("Forging", "Thinking", "Analyzing", "Reasoning", "Working", "Crafting", "Building")
+
+
+def _openrouter_chat_turn(
+    client: Any,
+    chain: list[str],
+    messages: list[dict[str, Any]],
+    tools: list[dict],
+    log_fn: Callable[[str, str], None] | None,
+) -> Any:
+    """One chat turn against the CODE model chain, resilient to rate limits.
+
+    Tries each model in `chain`, retrying a retryable failure once with backoff
+    before moving on. On success, promotes the winning model to the front of
+    `chain` (mutated in place) so the next turn starts with a model that just
+    worked rather than re-hitting a rate-limited free endpoint. Raises
+    RuntimeError only when every model in the chain fails.
+    """
+    last_exc: Exception | None = None
+    for idx, mdl in enumerate(list(chain)):
+        for attempt in range(2):
+            try:
+                resp = client.chat.completions.create(
+                    model=mdl,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    max_tokens=8096,  # headroom: reasoning tokens are billed here too
+                )
+                if idx > 0:
+                    chain.insert(0, chain.pop(idx))
+                    if log_fn:
+                        log_fn("info", f"Switched to fallback model: {mdl}")
+                return resp
+            except Exception as exc:  # noqa: BLE001 — inspect status, then decide
+                last_exc = exc
+                status = getattr(exc, "status_code", None)
+                if status in _OPENROUTER_RETRYABLE_STATUS and attempt == 0:
+                    time.sleep(3)
+                    continue
+                break  # non-retryable, or already retried — try the next model
+    raise RuntimeError(f"OpenRouter build agent request failed: {last_exc}")
+
+
+def _openrouter_loop(
+    system: str,
+    workspace: Path,
+    initial_user_msg: str,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+    max_iterations: int = _MAX_ITERATIONS,
+) -> tuple[str, int]:
+    """Tool-use agent loop for the hosted Qwen3 backend (OpenRouter).
+
+    Mirrors the other backends' loops (DONE detection, write pushback, tool-result
+    truncation) but drives the OpenRouter CODE model chain with mid-build failover.
+    """
+    from openai import OpenAI
+
+    from app.ai.openrouter import OPENROUTER_BASE_URL, code_models
+    from app.config import get_settings
+
+    settings = get_settings()
+    api_key = (settings.OPENROUTER_API_KEY or "").strip()
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set — cannot run the Qwen3/OpenRouter build agent.")
+
+    client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+    chain = code_models()  # ordered, tool-capable; mutated in place by failover
+    openrouter_tools = _tools_to_ollama_format(TOOLS)  # OpenAI-compatible schema
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": initial_user_msg},
+    ]
+    last_text = ""
+    write_calls = 0
+    pushback_sent = False
+    readonly_streak = 0  # consecutive turns that used tools but wrote nothing
+    write_nudges = 0
+    total_tokens = 0
+
+    for iteration in range(max_iterations):
+        if cancel_fn and cancel_fn():
+            if log_fn:
+                log_fn("warning", "Agent stopped by user.")
+            return "Stopped by user.", total_tokens
+        warn_at = max(1, max_iterations - 10)
+        if iteration == warn_at and log_fn:
+            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
+
+        # Heartbeat while the (non-streaming) model call is in flight.
+        if log_fn:
+            log_fn("thinking", f"{_STATUS_VERBS[iteration % len(_STATUS_VERBS)]}…")
+
+        response = _openrouter_chat_turn(client, chain, messages, openrouter_tools, log_fn)
+
+        # OpenRouter returns OpenAI-style usage — accumulate so builds/updates are
+        # billed and count toward the user's monthly quota (see core/usage.py).
+        usage = getattr(response, "usage", None)
+        if usage and getattr(usage, "total_tokens", None):
+            total_tokens += usage.total_tokens
+
+        msg = response.choices[0].message
+        messages.append({"role": "assistant", "content": msg.content or "", **({"tool_calls": [
+            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+            for tc in (msg.tool_calls or [])
+        ]} if msg.tool_calls else {})})
+
+        # Reasoning models return their chain-of-thought in a `reasoning` field —
+        # surface a trimmed slice as real "thinking" when it's there.
+        if log_fn:
+            try:
+                reasoning = (getattr(msg, "reasoning", None) or "").strip()
+            except Exception:
+                reasoning = ""
+            if reasoning:
+                log_fn("thinking", reasoning[:200])
+
+        tool_calls = msg.tool_calls or []
+        text = msg.content or ""
+        done_text: str | None = None
+
+        if text:
+            last_text = text
+            if log_fn and text.strip():
+                log_fn("text", text.strip()[:160])
+            if "DONE" in text.upper():
+                done_text = text
+
+        if done_text is not None and not tool_calls:
+            if write_calls == 0 and not pushback_sent:
+                pushback_sent = True
+                if log_fn:
+                    log_fn("info", "Agent said DONE without writing files — asking it to implement…")
+                messages.append({"role": "user", "content": (
+                    "You said you were done but haven't called write_file yet. "
+                    "Implement the changes now using write_file."
+                )})
+                continue
+            return done_text, total_tokens
+
+        finish_reason = response.choices[0].finish_reason
+        if finish_reason == "stop" and not tool_calls:
+            if write_calls == 0 and not pushback_sent:
+                pushback_sent = True
+                if log_fn:
+                    log_fn("info", "No files written yet — asking agent to write the code…")
+                messages.append({"role": "user", "content": (
+                    "You haven't written any files yet. Use write_file to implement the changes."
+                )})
+                continue
+            return last_text or "Done.", total_tokens
+
+        wrote_this_turn = False
+        for tc in tool_calls:
+            tool_name = tc.function.name
+            try:
+                tool_input = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                tool_input = {}
+            if tool_name == "write_file":
+                write_calls += 1
+                wrote_this_turn = True
+                if log_fn:
+                    log_fn("file_written", tool_input.get("path", ""))
+            if log_fn:
+                log_fn("tool", tool_message(tool_name, tool_input))
+            result = execute_tool(tool_name, tool_input, workspace, log_fn)
+            if len(result) > _TOOL_RESULT_LIMIT:
+                result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+        # Break read-only stalls: if the agent has explored for many turns without
+        # writing, tell it explicitly to start editing (see _READONLY_STREAK_LIMIT).
+        readonly_streak = 0 if wrote_this_turn else readonly_streak + 1
+        if readonly_streak >= _READONLY_STREAK_LIMIT and write_nudges < _MAX_WRITE_NUDGES:
+            write_nudges += 1
+            readonly_streak = 0
+            if log_fn:
+                log_fn("info", "Agent has only been reading files — nudging it to start writing…")
+            messages.append({"role": "user", "content": (
+                "You have spent several steps only reading files without editing any. "
+                "You have enough context now — stop exploring and call write_file to "
+                "implement the changes. Produce real code edits, not more reads."
+            )})
+
+    if log_fn:
+        log_fn("warning", "Agent reached iteration limit.")
+    return "Agent reached iteration limit.", total_tokens
+
+
+def run_build_agent_openrouter(
+    workspace: Path,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    """Full build via the hosted Qwen3 backend (OpenRouter)."""
+    system = _build_system(template_key)
+    user_msg = (
+        f"App name: {app_name}\nTemplate: {template_key}\n\n"
+        f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
+        "Build this application now following the phases in your instructions. "
+        "Narrate each step. When finished, write DONE: <summary of what was built>."
+    )
+    return _openrouter_loop(system, workspace, user_msg, log_fn)
+
+
+def run_fix_agent_openrouter(
+    workspace: Path,
+    prompt: str,
+    app_name: str,
+    template_key: str,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+) -> tuple[str, int]:
+    """Executor-only compile-fix pass via the hosted Qwen3 backend (OpenRouter)."""
+    return _openrouter_loop(_UPDATE_SYSTEM, workspace, prompt, log_fn, cancel_fn, max_iterations=_ITERS_FIX)
+
+
+def run_update_agent_openrouter(
+    workspace: Path,
+    prompt: str,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+) -> tuple[str, int]:
+    """Plan → design? → execute → validate → security? via the hosted Qwen3 backend.
+
+    The planner routes through app/ai/openrouter.py's PLAN chain (backend="Qwen3"
+    resolves to OpenRouter when a key is set); every tool-using phase runs on the
+    CODE chain via _openrouter_loop.
+    """
+    if log_fn:
+        log_fn("thinking", "Planning changes…")
+    plan = _call_planner(
+        _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
+        backend="Qwen3",
+    )
+    _log_plan(plan, log_fn)
+    # Sum usage across every phase so the update is billed for its full cost
+    # (see core/usage.py). Note: the planner call above routes through
+    # chat_openrouter, which doesn't surface usage — its (small) tokens aren't
+    # counted here; the tool-loop phases below are the bulk of the cost.
+    total_tokens = 0
+
+    if cancel_fn and cancel_fn():
+        return "Stopped by user.", total_tokens
+
+    design_summary = ""
+    if not _should_skip_design(plan):
+        if log_fn:
+            log_fn("info", "━━━ Design system phase ━━━")
+            log_fn("thinking", "Preparing design system…")
+        design_summary, design_tokens = _openrouter_loop(
+            _DESIGN_AGENT_SYSTEM, workspace,
+            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
+            log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+        )
+        total_tokens += design_tokens
+        if cancel_fn and cancel_fn():
+            return design_summary or "Stopped by user.", total_tokens
+    elif log_fn:
+        log_fn("info", "Design phase skipped — no new components or theme changes.")
+
+    if log_fn:
+        log_fn("info", "━━━ Execution phase ━━━")
+    exec_summary, exec_tokens = _openrouter_loop(
+        _UPDATE_SYSTEM, workspace,
+        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
+        log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
+    )
+    total_tokens += exec_tokens
+    if cancel_fn and cancel_fn():
+        return exec_summary or "Stopped by user.", total_tokens
+
+    if log_fn:
+        log_fn("info", "━━━ Validation phase ━━━")
+        log_fn("thinking", "Validating implementation…")
+    val_summary, val_tokens = _openrouter_loop(
+        _VALIDATOR_SYSTEM, workspace,
+        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
+        log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
+    )
+    total_tokens += val_tokens
+    if cancel_fn and cancel_fn():
+        return val_summary or exec_summary, total_tokens
+
+    if _validation_needs_fix_pass(val_summary):
+        if log_fn:
+            log_fn("info", "━━━ Post-validation fix pass ━━━")
+            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
+        fix_summary, fix_tokens = _openrouter_loop(
+            _UPDATE_SYSTEM, workspace,
+            _make_fix_prompt(val_summary), log_fn, cancel_fn, max_iterations=_ITERS_FIX,
+        )
+        total_tokens += fix_tokens
+        val_summary = fix_summary
+        if cancel_fn and cancel_fn():
+            return val_summary or exec_summary, total_tokens
+
+    if not _should_skip_security(plan):
+        if log_fn:
+            log_fn("info", "━━━ Security review phase ━━━")
+            log_fn("thinking", "Reviewing for security issues…")
+        _sec_summary, sec_tokens = _openrouter_loop(
+            _SECURITY_SYSTEM, workspace,
+            _security_user_msg(app_name, template_key, plan, prompt, workspace),
+            log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
+        )
+        total_tokens += sec_tokens
+    elif log_fn:
+        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
+
+    return val_summary or exec_summary, total_tokens
 
 
 # ---------------------------------------------------------------------------

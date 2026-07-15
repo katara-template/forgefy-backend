@@ -123,17 +123,28 @@ def _run_agent_fix(
     fix_prompt = _make_fix_prompt_with_hint(error_msg, template_key, retry_hint)
 
     if settings.BUILD_MODEL == "Qwen3":
-        from app.build.build_agent import run_fix_agent_ollama
-        summary, _ = run_fix_agent_ollama(
-            workspace=workspace_path,
-            prompt=fix_prompt,
-            app_name=app_name,
-            template_key=template_key,
-            base_url=settings.OLLAMA_URL,
-            model=settings.OLLAMA_MODEL,
-            timeout=settings.OLLAMA_TIMEOUT,
-            log_fn=log_fn,
-        )
+        from app.ai.qwen import using_openrouter
+        from app.build.build_agent import run_fix_agent_ollama, run_fix_agent_openrouter
+
+        if using_openrouter():
+            summary, _ = run_fix_agent_openrouter(
+                workspace=workspace_path,
+                prompt=fix_prompt,
+                app_name=app_name,
+                template_key=template_key,
+                log_fn=log_fn,
+            )
+        else:
+            summary, _ = run_fix_agent_ollama(
+                workspace=workspace_path,
+                prompt=fix_prompt,
+                app_name=app_name,
+                template_key=template_key,
+                base_url=settings.OLLAMA_URL,
+                model=settings.OLLAMA_MODEL,
+                timeout=settings.OLLAMA_TIMEOUT,
+                log_fn=log_fn,
+            )
     elif settings.BUILD_MODEL == "gemini":
         from app.build.build_agent import run_fix_agent_gemini
         summary, _ = run_fix_agent_gemini(
@@ -180,14 +191,7 @@ def _cf_project_name(name: str) -> str:
     slug = re.sub(r"[^a-z0-9-]", "-", name.lower())
     slug = re.sub(r"-+", "-", slug).strip("-")
     return (slug or "forgefy-app")[:28].rstrip("-")
-
 def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
-    """Deploy to Cloudflare Pages. Returns the preview URL on success.
-
-    Returns None (silently) only when credentials are not configured — that is a
-    soft skip, not a failure. Raises RuntimeError for all actual deploy failures
-    so the caller can surface the real error to the user.
-    """
     import os
     import subprocess
 
@@ -203,55 +207,127 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
     env["CI"] = "true"
     env["WRANGLER_SEND_METRICS"] = "false"
 
-    # Step 1: Ensure the project exists (create if missing — ignore failure,
-    # project likely already exists)
-    create_result = subprocess.run(
-        [
-            "npx", "--yes", "wrangler@3", "pages", "project", "create", cf_name,
-            "--production-branch", "main",
-        ],
-        capture_output=True, text=True, env=env, timeout=30,
-    )
-    if create_result.returncode == 0:
-        logger.info("Cloudflare Pages project '%s' created", cf_name)
-    else:
-        logger.info(
-            "Cloudflare Pages project '%s' may already exist: %s",
-            cf_name, (create_result.stdout + create_result.stderr)[-300:],
-        )
-
-    # Step 2: Deploy
     try:
+        # Step 1: Ensure the project exists (create if missing)
+        create_result = subprocess.run(
+            [
+                "npx", "--yes", "wrangler@3", "pages", "project", "create", cf_name,
+                "--production-branch", "main",
+            ],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        create_output = create_result.stdout + create_result.stderr
+        if create_result.returncode == 0:
+            logger.info("Cloudflare Pages project '%s' created", cf_name)
+        else:
+            logger.info("Cloudflare Pages project '%s' may already exist: %s", cf_name, create_output[-300:])
+
+        # Step 2: Deploy as preview (non-production branch)
         result = subprocess.run(
             [
                 "npx", "--yes", "wrangler@3", "pages", "deploy", str(build_dir),
                 "--project-name", cf_name,
-                "--branch", "main",
+                "--branch", "preview",
                 "--commit-dirty", "true",
             ],
             capture_output=True, text=True, env=env, timeout=180,
         )
+        output = result.stdout + result.stderr
+        logger.info("Wrangler output (rc=%d):\n%s", result.returncode, output[-1500:])
+
+        match = re.search(r"https://[^\s]+\.pages\.dev[^\s]*", output)
+        if match:
+            url = match.group(0).rstrip(".")
+            logger.info("Cloudflare Pages preview deployed → %s", url)
+            return url
+
+        if result.returncode != 0:
+            print(f"Wrangler deploy failed with code {result.returncode}:\n{output}")
+            logger.warning("Wrangler exited with code %d — deploy failed", result.returncode)
+        else:
+            print(f"Wrangler deploy succeeded but no pages.dev URL found:\n{output}")
+            logger.warning("Wrangler succeeded but no pages.dev URL found in output")
+        return None
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Cloudflare Pages deploy timed out after 180 s — try again or check your Cloudflare dashboard.") from exc
+        print(f"Wrangler deploy timed out: {exc}")
+        logger.warning("Cloudflare Pages deploy timed out")
+        return None
+    except Exception as exc:
+        print(f"Wrangler deploy failed: {exc}")
+        logger.warning("Cloudflare Pages deploy failed (non-fatal): %s", exc)
+        return None
 
-    output = (result.stdout + result.stderr).strip()
-    logger.info("Wrangler output (rc=%d):\n%s", result.returncode, output[-1500:])
+# def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
+#     """Deploy to Cloudflare Pages. Returns the preview URL on success.
 
-    match = re.search(r"https://[^\s]+\.pages\.dev[^\s]*", output)
-    if match:
-        url = match.group(0).rstrip(".")
-        logger.info("Cloudflare Pages deployed → %s", url)
-        return url
+#     Returns None (silently) only when credentials are not configured — that is a
+#     soft skip, not a failure. Raises RuntimeError for all actual deploy failures
+#     so the caller can surface the real error to the user.
+#     """
+#     import os
+#     import subprocess
 
-    # No URL found — surface the real wrangler output as the error
-    snippet = output[-800:] if len(output) > 800 else output
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Cloudflare Pages deploy failed (exit {result.returncode}):\n{snippet}"
-        )
-    raise RuntimeError(
-        f"Cloudflare Pages deploy succeeded but no pages.dev URL was returned:\n{snippet}"
-    )
+#     settings = get_settings()
+#     if not settings.CLOUDFLARE_ACCOUNT_ID or not settings.CLOUDFLARE_API_TOKEN:
+#         logger.warning("Cloudflare Pages skipped — CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_API_TOKEN not set")
+#         return None
+
+#     cf_name = _cf_project_name(project_name)
+#     env = os.environ.copy()
+#     env["CLOUDFLARE_ACCOUNT_ID"] = settings.CLOUDFLARE_ACCOUNT_ID
+#     env["CLOUDFLARE_API_TOKEN"] = settings.CLOUDFLARE_API_TOKEN
+#     env["CI"] = "true"
+#     env["WRANGLER_SEND_METRICS"] = "false"
+
+#     # Step 1: Ensure the project exists (create if missing — ignore failure,
+#     # project likely already exists)
+#     create_result = subprocess.run(
+#         [
+#             "npx", "--yes", "wrangler@3", "pages", "project", "create", cf_name,
+#             "--production-branch", "main",
+#         ],
+#         capture_output=True, text=True, env=env, timeout=30,
+#     )
+#     if create_result.returncode == 0:
+#         logger.info("Cloudflare Pages project '%s' created", cf_name)
+#     else:
+#         logger.info(
+#             "Cloudflare Pages project '%s' may already exist: %s",
+#             cf_name, (create_result.stdout + create_result.stderr)[-300:],
+#         )
+
+#     # Step 2: Deploy
+#     try:
+#         result = subprocess.run(
+#             [
+#                 "npx", "--yes", "wrangler@3", "pages", "deploy", str(build_dir),
+#                 "--project-name", cf_name,
+#                 "--branch", "preview",
+#                 "--commit-dirty", "true",
+#             ],
+#             capture_output=True, text=True, env=env, timeout=180,
+#         )
+#     except subprocess.TimeoutExpired as exc:
+#         raise RuntimeError("Cloudflare Pages deploy timed out after 180 s — try again or check your Cloudflare dashboard.") from exc
+
+#     output = (result.stdout + result.stderr).strip()
+#     logger.info("Wrangler output (rc=%d):\n%s", result.returncode, output[-1500:])
+
+#     match = re.search(r"https://[^\s]+\.pages\.dev[^\s]*", output)
+#     if match:
+#         url = match.group(0).rstrip(".")
+#         logger.info("Cloudflare Pages deployed → %s", url)
+#         return url
+
+#     # No URL found — surface the real wrangler output as the error
+#     snippet = output[-800:] if len(output) > 800 else output
+#     if result.returncode != 0:
+#         raise RuntimeError(
+#             f"Cloudflare Pages deploy failed (exit {result.returncode}):\n{snippet}"
+#         )
+#     raise RuntimeError(
+#         f"Cloudflare Pages deploy succeeded but no pages.dev URL was returned:\n{snippet}"
+#     )
 
 
 # def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
@@ -500,17 +576,16 @@ async def _run(session_id: str, project_id: str) -> dict:
     # True when user hasn't connected their GitHub — repo lands on the platform account
     using_platform_github: bool = github_token == settings.GITHUB_TOKEN
 
-    # 5. Check the user's token quota before doing any expensive work
-    from app.core.usage import get_user_tier, is_over_limit
-    user_tier = await get_user_tier(db, owner_id)
-    if await is_over_limit(db, owner_id, user_tier):
-        from app.build.build_logger import publish_user_event
-        from app.core.tiers import get_tier
-        tier = get_tier(user_tier)
-        error_msg = (
-            f"You've used all {tier.monthly_tokens:,} tokens in your {tier.name} plan this month. "
-            "Upgrade to continue building."
-        )
+    # 5. Check the user's token quota before doing any expensive work.
+    # Free users over budget are blocked; paid users are downgraded to the free
+    # model and keep building (see app/core/usage.py evaluate_quota).
+    from app.build.build_logger import publish_user_event
+    from app.core.tiers import get_tier
+    from app.core.usage import evaluate_quota
+    quota = await evaluate_quota(db, settings, owner_id)
+    tier = get_tier(quota.tier_key)
+    quota_downgrade_notice: str | None = None
+    if quota.action == "block":
         now = datetime.now(UTC)
         await db.collection("projects").document(project_id).set({
             "owner_id": owner_id,
@@ -524,18 +599,29 @@ async def _run(session_id: str, project_id: str) -> dict:
             "preview_url": None,
             "artifact_url": None,
             "is_updating": False,
-            "build_error": error_msg,
+            "build_error": quota.message,
             "build_error_action": "support",
             "blueprint_context": json_output,
             "created_at": now,
             "updated_at": now,
         })
         publish_user_event(
-            settings.REDIS_URL, owner_id, "quota_exceeded", error_msg,
-            tier=user_tier, limit=tier.monthly_tokens,
+            settings.REDIS_URL, owner_id, "quota_exceeded", quota.message,
+            tier=quota.tier_key, limit=tier.monthly_tokens,
         )
-        logger.warning("Build blocked — token limit reached user=%s tier=%s", owner_id, user_tier)
+        logger.warning("Build blocked — token limit reached user=%s tier=%s", owner_id, quota.tier_key)
         return {"project_id": project_id, "blocked": "token_limit"}
+    if quota.action == "downgrade":
+        settings = settings.model_copy(update={"BUILD_MODEL": quota.forced_model})
+        quota_downgrade_notice = quota.message  # shown in the build log once it opens
+        publish_user_event(
+            settings.REDIS_URL, owner_id, "quota_downgrade", quota.message,
+            tier=quota.tier_key, limit=tier.monthly_tokens, forced_model=quota.forced_model,
+        )
+        logger.info(
+            "Build over quota — downgraded to free model=%s user=%s tier=%s",
+            quota.forced_model, owner_id, quota.tier_key,
+        )
 
     # 6. Transition to BUILDING
     sm = MeetingStateMachine(db)
@@ -564,6 +650,8 @@ async def _run(session_id: str, project_id: str) -> dict:
     logger.info("Project stub created project=%s", project_id)
 
     log_fn = make_log_publisher(project_id, settings.REDIS_URL)
+    if quota_downgrade_notice:
+        log_fn("warning", quota_downgrade_notice)
     log_fn("started", f"Starting build for {app_name} ({template_key})")
 
     # Log the feature plan so users immediately see what will be built
@@ -628,17 +716,28 @@ async def _run(session_id: str, project_id: str) -> dict:
 
         # 9. Run build agent — model selected by BUILD_MODEL (independent of BP_MODEL)
         if settings.BUILD_MODEL == "Qwen3":
-            from app.build.build_agent import run_build_agent_ollama
-            summary, tokens_used = run_build_agent_ollama(
-                workspace=workspace.path,
-                blueprint=json_output,
-                app_name=app_name,
-                template_key=template_key,
-                base_url=settings.OLLAMA_URL,
-                model=settings.OLLAMA_MODEL,
-                timeout=settings.OLLAMA_TIMEOUT,
-                log_fn=log_fn,
-            )
+            from app.ai.qwen import using_openrouter
+            from app.build.build_agent import run_build_agent_ollama, run_build_agent_openrouter
+
+            if using_openrouter():
+                summary, tokens_used = run_build_agent_openrouter(
+                    workspace=workspace.path,
+                    blueprint=json_output,
+                    app_name=app_name,
+                    template_key=template_key,
+                    log_fn=log_fn,
+                )
+            else:
+                summary, tokens_used = run_build_agent_ollama(
+                    workspace=workspace.path,
+                    blueprint=json_output,
+                    app_name=app_name,
+                    template_key=template_key,
+                    base_url=settings.OLLAMA_URL,
+                    model=settings.OLLAMA_MODEL,
+                    timeout=settings.OLLAMA_TIMEOUT,
+                    log_fn=log_fn,
+                )
         elif settings.BUILD_MODEL == "gemini":
             from app.build.build_agent import run_build_agent_gemini
             summary, tokens_used = run_build_agent_gemini(
