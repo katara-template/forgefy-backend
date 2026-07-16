@@ -1,6 +1,6 @@
 """LangGraph extraction pipeline.
 
-All four agent nodes run in parallel (fan-out from START → all nodes → END).
+All agent nodes run in parallel (fan-out from START → all nodes → END).
 They share no state dependencies so there is no reason to run them sequentially.
 LangGraph executes independent nodes in separate threads automatically.
 
@@ -9,11 +9,17 @@ Graph topology (parallel fan-out):
           ──→ question_detector     ──→ END
           ──→ conflict_detector     ──→ END
           ──→ action_item_extractor ──→ END
+
+Two entry points:
+  run_pipeline    — events only; used by the meeting extraction worker.
+  run_extraction  — events + per-request token usage, with optional extractor
+                    subsetting; used by the developer extract API.
 """
 from __future__ import annotations
 
 import logging
 import operator
+from collections.abc import Iterable
 from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -27,6 +33,38 @@ from app.ai.agents import (
 
 logger = logging.getLogger(__name__)
 
+# Public extractor names (as exposed by the developer API) → graph node names.
+EXTRACTORS: dict[str, str] = {
+    "features": "feature_extractor",
+    "questions": "question_detector",
+    "conflicts": "conflict_detector",
+    "action_items": "action_item_extractor",
+}
+
+# Event sub_state → public extractor/group name (the inverse mapping, used to
+# shape API responses).
+SUB_STATE_TO_GROUP: dict[str, str] = {
+    "FEATURE_FOUND": "features",
+    "QUESTION_FOUND": "questions",
+    "CONFLICT_FOUND": "conflicts",
+    "ACTION_ITEM_FOUND": "action_items",
+}
+
+
+def group_events(events: Iterable[dict], requested: Iterable[str] | None = None) -> dict:
+    """Group extraction events by public extractor name, dropping unrequested ones.
+
+    Returns ``{"features": [...], "questions": [...], ...}`` — always all four
+    keys, empty lists for groups with no events or not in ``requested``.
+    """
+    wanted = set(requested) if requested is not None else set(EXTRACTORS)
+    groups: dict[str, list[dict]] = {name: [] for name in EXTRACTORS}
+    for event in events:
+        group = SUB_STATE_TO_GROUP.get(event.get("sub_state", ""))
+        if group in wanted:
+            groups[group].append(event.get("payload", {}))
+    return groups
+
 
 # ── State schema ──────────────────────────────────────────────────────────────
 
@@ -38,90 +76,91 @@ class PipelineState(TypedDict):
     # operator.add merges lists from parallel nodes without conflict.
     events: Annotated[list[dict], operator.add]
     errors: Annotated[list[str], operator.add]
+    usage: Annotated[list[dict], operator.add]
 
 
 # ── Node functions ────────────────────────────────────────────────────────────
 
 
-def _node_feature_extractor(state: PipelineState) -> dict:
-    try:
-        result = feature_extractor.run(state["transcript"], state["api_key"], state["model"])
-        events = [
-            {"sub_state": "FEATURE_FOUND", "payload": f}
-            for f in result.get("features", [])
-        ]
-        return {"events": events, "errors": []}
-    except Exception as exc:
-        logger.warning("feature_extractor failed: %s", exc)
-        return {"events": [], "errors": [f"feature_extractor: {exc}"]}
+def _make_node(agent, result_key: str, sub_state: str, name: str):
+    """Build a graph node that runs one agent and normalizes its output."""
+
+    def _node(state: PipelineState) -> dict:
+        usage: list[dict] = []
+        try:
+            result = agent.run(
+                state["transcript"], state["api_key"], state["model"], usage=usage
+            )
+            events = [
+                {"sub_state": sub_state, "payload": item}
+                for item in result.get(result_key, [])
+            ]
+            return {"events": events, "errors": [], "usage": usage}
+        except Exception as exc:
+            logger.warning("%s failed: %s", name, exc)
+            return {"events": [], "errors": [f"{name}: {exc}"], "usage": usage}
+
+    return _node
 
 
-def _node_question_detector(state: PipelineState) -> dict:
-    try:
-        result = question_detector.run(state["transcript"], state["api_key"], state["model"])
-        events = [
-            {"sub_state": "QUESTION_FOUND", "payload": q}
-            for q in result.get("questions", [])
-        ]
-        return {"events": events, "errors": []}
-    except Exception as exc:
-        logger.warning("question_detector failed: %s", exc)
-        return {"events": [], "errors": [f"question_detector: {exc}"]}
-
-
-def _node_conflict_detector(state: PipelineState) -> dict:
-    try:
-        result = conflict_detector.run(state["transcript"], state["api_key"], state["model"])
-        events = [
-            {"sub_state": "CONFLICT_FOUND", "payload": c}
-            for c in result.get("conflicts", [])
-        ]
-        return {"events": events, "errors": []}
-    except Exception as exc:
-        logger.warning("conflict_detector failed: %s", exc)
-        return {"events": [], "errors": [f"conflict_detector: {exc}"]}
-
-
-def _node_action_item_extractor(state: PipelineState) -> dict:
-    try:
-        result = action_item_extractor.run(state["transcript"], state["api_key"], state["model"])
-        events = [
-            {"sub_state": "ACTION_ITEM_FOUND", "payload": a}
-            for a in result.get("action_items", [])
-        ]
-        return {"events": events, "errors": []}
-    except Exception as exc:
-        logger.warning("action_item_extractor failed: %s", exc)
-        return {"events": [], "errors": [f"action_item_extractor: {exc}"]}
+_NODES = {
+    "feature_extractor": _make_node(
+        feature_extractor, "features", "FEATURE_FOUND", "feature_extractor"
+    ),
+    "question_detector": _make_node(
+        question_detector, "questions", "QUESTION_FOUND", "question_detector"
+    ),
+    "conflict_detector": _make_node(
+        conflict_detector, "conflicts", "CONFLICT_FOUND", "conflict_detector"
+    ),
+    "action_item_extractor": _make_node(
+        action_item_extractor, "action_items", "ACTION_ITEM_FOUND", "action_item_extractor"
+    ),
+}
 
 
 # ── Graph construction ────────────────────────────────────────────────────────
 
 
-def build_pipeline() -> Any:
-    """Compile and return the LangGraph extraction pipeline (parallel fan-out)."""
+def build_pipeline(extractors: Iterable[str] | None = None) -> Any:
+    """Compile and return the LangGraph extraction pipeline (parallel fan-out).
+
+    ``extractors`` takes public names from EXTRACTORS (e.g. ["features"]);
+    None means all four.
+    """
+    if extractors is None:
+        node_names = list(_NODES)
+    else:
+        node_names = [EXTRACTORS[e] for e in extractors]
+        if not node_names:
+            raise ValueError("extractors must not be empty")
+
     graph: StateGraph = StateGraph(PipelineState)
 
-    graph.add_node("feature_extractor", _node_feature_extractor)
-    graph.add_node("question_detector", _node_question_detector)
-    graph.add_node("conflict_detector", _node_conflict_detector)
-    graph.add_node("action_item_extractor", _node_action_item_extractor)
-
-    # Fan-out: all four nodes start from START and finish at END independently.
-    # LangGraph runs nodes that share the same predecessor in parallel threads.
-    for node in ("feature_extractor", "question_detector", "conflict_detector", "action_item_extractor"):
-        graph.add_edge(START, node)
-        graph.add_edge(node, END)
+    # Fan-out: all requested nodes start from START and finish at END
+    # independently. LangGraph runs nodes that share the same predecessor in
+    # parallel threads.
+    for name in node_names:
+        graph.add_node(name, _NODES[name])
+        graph.add_edge(START, name)
+        graph.add_edge(name, END)
 
     return graph.compile()
 
 
-def run_pipeline(transcript: str, api_key: str, model: str) -> list[dict]:
-    """Run the extraction pipeline and return a list of extraction events.
+def run_extraction(
+    transcript: str,
+    api_key: str,
+    model: str,
+    extractors: Iterable[str] | None = None,
+) -> dict:
+    """Run the pipeline and return events, aggregate token usage, and errors.
 
-    Each event has ``sub_state`` (one of the four FOUND types) and ``payload``.
+    Returns ``{"events": [...], "usage": {"input_tokens", "output_tokens"},
+    "errors": [...]}``. Each event has ``sub_state`` (one of the four FOUND
+    types) and ``payload``.
     """
-    pipeline = build_pipeline()
+    pipeline = build_pipeline(extractors)
     final_state = pipeline.invoke(
         {
             "transcript": transcript,
@@ -129,11 +168,30 @@ def run_pipeline(transcript: str, api_key: str, model: str) -> list[dict]:
             "model": model,
             "events": [],
             "errors": [],
+            "usage": [],
         }
     )
     if not final_state:
-        return []
+        return {"events": [], "usage": {"input_tokens": 0, "output_tokens": 0}, "errors": []}
+
     errors = final_state.get("errors", [])
     if errors:
         logger.error("Pipeline agent errors: %s", errors)
-    return final_state.get("events", [])
+
+    usage_entries = final_state.get("usage", [])
+    return {
+        "events": final_state.get("events", []),
+        "usage": {
+            "input_tokens": sum(u.get("input_tokens", 0) for u in usage_entries),
+            "output_tokens": sum(u.get("output_tokens", 0) for u in usage_entries),
+        },
+        "errors": errors,
+    }
+
+
+def run_pipeline(transcript: str, api_key: str, model: str) -> list[dict]:
+    """Run the extraction pipeline and return a list of extraction events.
+
+    Each event has ``sub_state`` (one of the four FOUND types) and ``payload``.
+    """
+    return run_extraction(transcript, api_key, model)["events"]

@@ -2488,12 +2488,15 @@ def _gemini_post_with_retry(
             )
 
         if attempt < _GEMINI_MAX_RETRIES:
-            if log_fn:
-                log_fn(
-                    "warning",
-                    f"Gemini API busy — retrying in {delay:.0f}s "
-                    f"(attempt {attempt + 1}/{_GEMINI_MAX_RETRIES})…",
-                )
+            # Tell the user once, in plain words — not one warning per attempt.
+            # The retry mechanics (attempt count, backoff seconds) belong in the
+            # server log, not the user's build feed; the frontend spinner on the
+            # last line already shows something is in progress.
+            if log_fn and attempt == 0:
+                log_fn("thinking", "High demand right now — taking a short pause, hang tight…")
+            logger.info(
+                "Gemini busy — retry %d/%d in %.0fs", attempt + 1, _GEMINI_MAX_RETRIES, delay
+            )
             time.sleep(delay)
             delay *= 2
 

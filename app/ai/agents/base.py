@@ -24,8 +24,13 @@ def call_claude(
     *,
     max_tokens: int = 1024,
     timeout: float = 120.0,
+    usage: list[dict] | None = None,
 ) -> dict:
     """Call Claude and return the parsed JSON response.
+
+    When ``usage`` is given, a ``{"input_tokens", "output_tokens"}`` dict is
+    appended to it — callers that meter consumption (the developer extract
+    API) pass a list; everyone else ignores it.
 
     Raises ValueError if the response cannot be parsed as JSON.
     """
@@ -36,6 +41,11 @@ def call_claude(
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
     )
+    if usage is not None:
+        usage.append({
+            "input_tokens": int(getattr(message.usage, "input_tokens", 0) or 0),
+            "output_tokens": int(getattr(message.usage, "output_tokens", 0) or 0),
+        })
     raw = message.content[0].text.strip()
     try:
         return json.loads(raw)

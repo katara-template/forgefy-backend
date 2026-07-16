@@ -8,12 +8,29 @@ instances — per-process memory would multiply every limit by the number of
 workers. If Redis is unreachable the limiter falls back to per-process memory
 rather than failing requests.
 """
+import hashlib
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from starlette.requests import Request
 
 from app.config import get_settings
+
+
+def api_key_ident(request: Request) -> str:
+    """Rate-limit key for developer-API routes: the API key, not the client IP.
+
+    Many of a developer's users can sit behind one NAT IP, and one developer
+    can spread across many IPs — the key is the fair unit. Hashed so raw keys
+    never reach the limiter's Redis storage. Falls back to the IP when the
+    header isn't an API key (the request will 401 anyway, but the limiter
+    still throttles credential-stuffing bursts per source).
+    """
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer fgy_"):
+        return hashlib.sha256(auth.encode()).hexdigest()
+    return get_remote_address(request)
 
 
 def _storage_uri() -> str:

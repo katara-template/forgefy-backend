@@ -6,6 +6,6 @@ from app.ai.agents.base import _load_prompt, call_claude
 _SYSTEM = _load_prompt("feature_extractor")
 
 
-def run(transcript: str, api_key: str, model: str) -> dict:
+def run(transcript: str, api_key: str, model: str, *, usage: list[dict] | None = None) -> dict:
     """Return extracted features from a transcript segment."""
-    return call_claude(_SYSTEM, transcript, api_key, model)
+    return call_claude(_SYSTEM, transcript, api_key, model, usage=usage)
