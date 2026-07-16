@@ -1,18 +1,30 @@
 """Shared FastAPI dependencies."""
+import logging
 import time
 import uuid
 import weakref
+from contextlib import suppress
+from datetime import UTC, datetime
 from typing import Annotated
 
 import redis.asyncio as aioredis
-from fastapi import Depends, Request
+from fastapi import Depends, Header, Request
 from fastapi.security import OAuth2PasswordBearer
 from google.cloud.firestore import AsyncClient
 
 from app.config import Settings, get_settings
+from app.core.api_keys import hash_api_key, looks_like_api_key
 from app.core.exceptions import ForbiddenError, UnauthorizedError
 from app.core.security import decode_access_token
+from app.db.models.api_key import ApiKey
 from app.db.models.user import User
+
+try:  # optional — set_tag on an uninitialized SDK is a no-op
+    import sentry_sdk
+except ImportError:  # pragma: no cover
+    sentry_sdk = None
+
+logger = logging.getLogger(__name__)
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -116,3 +128,90 @@ async def get_admin_user(user: CurrentUser) -> User:
 
 
 AdminUser = Annotated[User, Depends(get_admin_user)]
+
+
+# ── API key auth (developer API) ──────────────────────────────────────────────
+
+# Same shape and rationale as the user cache above: keep the per-request
+# api_keys read off the hot path; revocation takes up to the TTL to be seen.
+_API_KEY_CACHE_TTL_SECONDS = 30.0
+_API_KEY_CACHE_MAX_ENTRIES = 10_000
+
+_api_key_caches: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _tag_sentry(api_key: ApiKey) -> None:
+    """Tag the current Sentry scope so errors are debuggable per customer.
+
+    The prefix is the displayable, non-secret part of the key — never the
+    hash, never the key itself.
+    """
+    if sentry_sdk is not None:
+        with suppress(Exception):
+            sentry_sdk.set_tag("api_key_prefix", api_key.prefix)
+
+
+def _api_key_from_doc(doc) -> ApiKey:
+    data = doc.to_dict()
+    return ApiKey(
+        id=uuid.UUID(doc.id),
+        owner_user_id=uuid.UUID(data["owner_user_id"]),
+        name=data.get("name", ""),
+        prefix=data.get("prefix", ""),
+        key_hash=data["key_hash"],
+        created_at=data["created_at"],
+        last_used_at=data.get("last_used_at"),
+        revoked_at=data.get("revoked_at"),
+    )
+
+
+async def get_api_key(
+    db: DBSession,
+    authorization: Annotated[str | None, Header()] = None,
+) -> ApiKey:
+    """Validate an `Authorization: Bearer fgy_live_…` header and return the ApiKey.
+
+    Machine auth for the developer API — parallel to get_current_user's JWT
+    auth for dashboard users. Resolved keys are cached briefly per Firestore
+    client; last_used_at is stamped on cache misses only, which throttles the
+    extra write to at most once per TTL per process.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise UnauthorizedError("Missing API key")
+    token = authorization.removeprefix("Bearer ").strip()
+    if not looks_like_api_key(token):
+        raise UnauthorizedError("Invalid API key")
+
+    digest = hash_api_key(token)
+
+    cache: dict[str, tuple[ApiKey, float]] | None = _api_key_caches.get(db)
+    if cache is None:
+        cache = {}
+        _api_key_caches[db] = cache
+    now = time.monotonic()
+    cached = cache.get(digest)
+    if cached and now - cached[1] < _API_KEY_CACHE_TTL_SECONDS:
+        _tag_sentry(cached[0])
+        return cached[0]
+
+    docs = await db.collection("api_keys").where("key_hash", "==", digest).limit(1).get()
+    if not docs:
+        cache.pop(digest, None)
+        raise UnauthorizedError("Invalid API key")
+
+    api_key = _api_key_from_doc(docs[0])
+    if api_key.revoked:
+        cache.pop(digest, None)
+        raise UnauthorizedError("API key has been revoked")
+
+    with suppress(Exception):  # telemetry only — never fail the request over it
+        await docs[0].reference.set({"last_used_at": datetime.now(UTC)}, merge=True)
+
+    if len(cache) >= _API_KEY_CACHE_MAX_ENTRIES:
+        cache.clear()
+    cache[digest] = (api_key, now)
+    _tag_sentry(api_key)
+    return api_key
+
+
+ApiKeyDep = Annotated[ApiKey, Depends(get_api_key)]

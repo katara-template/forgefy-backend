@@ -396,6 +396,54 @@ All endpoints except `/health` and `/api/v1/auth/*` require a Bearer token.
 | `GET` | `/api/v1/voxa/blueprint/{id}` | Get generated blueprint |
 | `POST` | `/api/v1/voxa/blueprint/{id}/approve` | Approve blueprint, transition → APPROVED |
 
+### Developer API — API keys
+
+Key management is JWT-authed (dashboard users). The raw key is returned once
+at creation and never again — only its SHA-256 hash is stored.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/keys` | Create an API key (max 10 active per user) |
+| `GET` | `/api/v1/keys` | List your keys (prefixes only, newest first) |
+| `DELETE` | `/api/v1/keys/{id}` | Revoke a key (idempotent; propagates within ~30s) |
+
+### Developer API — Extract
+
+Machine-authed with `Authorization: Bearer fgy_live_…`. Runs the same agent
+pipeline the meeting workers use, synchronously.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/extract` | Synchronous — transcript (≤50k chars) → features / questions / conflicts / action items |
+| `POST` | `/api/v1/extract/jobs` | Async — transcript up to 200k chars; returns `202 {job_id}` |
+| `GET` | `/api/v1/extract/jobs/{id}` | Poll job status; `result` present once `status == "done"` |
+| `GET` | `/api/v1/usage` | Key owner's tier, monthly token budget, consumption, reset date |
+
+```json
+{
+  "transcript": "…up to 50k chars…",
+  "extractors": ["features", "questions"],   // optional — default all four
+  "model_tier": "standard"                    // "standard" (Claude) | "economy" (Qwen3)
+}
+```
+
+Response groups extracted items by type and reports `usage`
+(`input_tokens`/`output_tokens`, metered against the key owner's monthly
+budget). Quota policy matches builds: free-tier owners over budget get a 402;
+paid owners are transparently served by the economy tier instead.
+
+Async jobs additionally accept:
+
+- `webhook_url` (https) — the finished job is POSTed there, signed with
+  `X-Forgefy-Signature: sha256=<HMAC-SHA256 hex>` using the `webhook_secret`
+  returned at creation. Delivery is retried 3× with backoff, independently of
+  extraction.
+- An `Idempotency-Key` header — replaying the same key returns the existing
+  job instead of running a second one.
+
+Jobs run on the `meeting.transcribe` Celery queue and are deleted 30 days
+after creation by a daily beat task.
+
 ### WebSocket
 
 ```
@@ -438,7 +486,7 @@ LISTENING sub-states (emitted as `featureDetected` WS events):
 ## Running Tests
 
 ```bash
-# All 105 tests
+# All tests
 pytest tests/ -q
 
 # Specific suite

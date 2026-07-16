@@ -16,6 +16,7 @@ celery_app = Celery(
         "app.workers.transcription_worker",
         "app.workers.upload_worker",
         "app.workers.extraction_worker",
+        "app.workers.extract_api_worker",
         "app.workers.blueprint_worker",
         "app.workers.build_worker",
         "app.workers.update_worker",
@@ -35,6 +36,7 @@ celery_app.conf.update(
         "app.workers.transcription_worker.*": {"queue": "meeting.audio"},
         "app.workers.upload_worker.*": {"queue": "meeting.audio"},
         "app.workers.extraction_worker.*": {"queue": "meeting.transcribe"},
+        "app.workers.extract_api_worker.*": {"queue": "meeting.transcribe"},
         "app.workers.blueprint_worker.*": {"queue": "meeting.extract"},
         "app.workers.build_worker.*": {"queue": "build"},
         "app.workers.update_worker.*": {"queue": "build"},
@@ -43,6 +45,10 @@ celery_app.conf.update(
     beat_schedule={
         "cleanup-workspaces-daily": {
             "task": "app.workers.cleanup_worker.cleanup_workspaces",
+            "schedule": 86400.0,  # every 24 hours
+        },
+        "cleanup-extract-jobs-daily": {
+            "task": "app.workers.extract_api_worker.cleanup_extract_jobs",
             "schedule": 86400.0,  # every 24 hours
         },
     },
