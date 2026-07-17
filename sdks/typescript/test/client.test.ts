@@ -210,6 +210,29 @@ describe("jobs", () => {
   });
 });
 
+describe("default fetch binding", () => {
+  it("calls the global fetch with global `this` (no Illegal invocation in browsers)", async () => {
+    // Reproduces the browser bug: a fetch impl that throws unless invoked with
+    // `this === globalThis`, exactly as window.fetch does in Chrome.
+    const globalFetch = function (this: unknown) {
+      if (this !== globalThis) {
+        throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");
+      }
+      return Promise.resolve(jsonResponse(200, EXTRACT_OK));
+    };
+    const original = globalThis.fetch;
+    (globalThis as { fetch: unknown }).fetch = globalFetch;
+    try {
+      // No `fetch` option → SDK must use (and correctly bind) the global.
+      const client = new Forgefy({ apiKey: "fgy_live_test", baseUrl: BASE, retryDelayMs: 1 });
+      const result = await client.extract({ transcript: "t" });
+      expect(result.id).toBe("e1");
+    } finally {
+      (globalThis as { fetch: unknown }).fetch = original;
+    }
+  });
+});
+
 describe("usage", () => {
   it("fetches the quota snapshot", async () => {
     const fetchMock = vi.fn(async () =>

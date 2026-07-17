@@ -60,12 +60,22 @@ export class Forgefy {
     this.baseUrl = (
       options.baseUrl ??
       globalThis.process?.env?.FORGEFY_API_URL ??
-      "http://localhost:8000"
+      "https://forgefy.onrender.com"
     ).replace(/\/$/, "");
     this.maxRetries = options.maxRetries ?? 2;
     this.timeoutMs = options.timeoutMs ?? 120_000;
     this.retryDelayMs = options.retryDelayMs ?? 500;
-    this.fetchFn = options.fetch ?? globalThis.fetch;
+    // Bind to the global object: browsers throw "Illegal invocation" if
+    // window.fetch is called with any other `this` (as it would be when
+    // stored on and invoked from this instance). A caller-supplied fetch is
+    // used as-is — they're responsible for its binding.
+    const resolvedFetch = options.fetch ?? globalThis.fetch;
+    if (!resolvedFetch) {
+      throw new Error(
+        "Forgefy: no fetch available — pass options.fetch (Node <18 or a non-fetch environment)",
+      );
+    }
+    this.fetchFn = options.fetch ? resolvedFetch : resolvedFetch.bind(globalThis);
     this.jobs = new Jobs(this);
   }
 
@@ -125,7 +135,7 @@ export class Forgefy {
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
           "Content-Type": "application/json",
-          "User-Agent": "forgefy-sdk-ts/0.1.0",
+          "User-Agent": "forgefy-sdk-ts/0.1.1",
           ...opts.headers,
         },
         body: opts.body === undefined ? undefined : JSON.stringify(opts.body),

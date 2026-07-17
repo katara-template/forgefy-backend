@@ -25,10 +25,10 @@ effect within ~30 seconds.
 Typed clients with retries, RFC 7807 error mapping, auto idempotency keys,
 `waitFor`/`wait_for` job polling, and webhook signature verification built in:
 
-| Language | Package | Source |
+| Language | Install | Full guide |
 |---|---|---|
-| TypeScript (Node 18+) | `@forgefy/sdk` | [`sdks/typescript`](../sdks/typescript) |
-| Python 3.10+ | `forgefy` | [`sdks/python`](../sdks/python) |
+| TypeScript (Node 18+) | `npm install @forgefy/sdk` | [`sdks/typescript/README.md`](../sdks/typescript/README.md) |
+| Python 3.10+ | `pip install forgefy` | [`sdks/python/README.md`](../sdks/python/README.md) |
 
 ```ts
 import Forgefy from "@forgefy/sdk";
@@ -42,7 +42,10 @@ client = Forgefy(api_key=os.environ["FORGEFY_API_KEY"])
 result = client.extract(transcript, extractors=["features"])
 ```
 
-Every endpoint also works over plain HTTP — the rest of this document shows
+Each SDK README covers the full surface — async jobs + `waitFor`/`wait_for`,
+webhook signature verification, the typed error hierarchy, and retry
+semantics. Every endpoint also works over plain HTTP — the rest of this
+document shows
 raw examples in more languages.
 
 ## Quickstart — synchronous extraction

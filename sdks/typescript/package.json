@@ -1,6 +1,6 @@
 {
   "name": "@forgefy/sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Official TypeScript SDK for the Forgefy Developer API — transcripts in, structured product requirements out.",
   "license": "MIT",
   "type": "module",
