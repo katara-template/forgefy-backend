@@ -20,6 +20,34 @@ Authorization: Bearer fgy_live_...
 Keys can be listed (prefixes only) and revoked at any time; revocation takes
 effect within ~30 seconds.
 
+## Official SDKs
+
+Typed clients with retries, RFC 7807 error mapping, auto idempotency keys,
+`waitFor`/`wait_for` job polling, and webhook signature verification built in:
+
+| Language | Install | Full guide |
+|---|---|---|
+| TypeScript (Node 18+) | `npm install @forgefy/sdk` | [`sdks/typescript/README.md`](../sdks/typescript/README.md) |
+| Python 3.10+ | `pip install forgefy` | [`sdks/python/README.md`](../sdks/python/README.md) |
+
+```ts
+import Forgefy from "@forgefy/sdk";
+const forgefy = new Forgefy({ apiKey: process.env.FORGEFY_API_KEY! });
+const result = await forgefy.extract({ transcript, extractors: ["features"] });
+```
+
+```python
+from forgefy import Forgefy
+client = Forgefy(api_key=os.environ["FORGEFY_API_KEY"])
+result = client.extract(transcript, extractors=["features"])
+```
+
+Each SDK README covers the full surface — async jobs + `waitFor`/`wait_for`,
+webhook signature verification, the typed error hierarchy, and retry
+semantics. Every endpoint also works over plain HTTP — the rest of this
+document shows
+raw examples in more languages.
+
 ## Quickstart — synchronous extraction
 
 Transcripts up to 50,000 characters return in one request. The four
