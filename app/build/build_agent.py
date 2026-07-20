@@ -32,6 +32,50 @@ data/repositories/{feature}_repository_impl.dart calls only the datasource — n
 the SDK directly. Business/validation logic lives in domain/usecases/, not in the
 datasource or repository. presentation/bloc never imports a datasource or the SDK.
 
+FORGEFY CLIENT SDK — use it when the connected database is Supabase or Neon:
+Use the first-party `forgefy_client` package for ALL database reads/writes and
+auth. Do NOT hand-roll api_client.dart for the DB and do NOT add supabase_flutter
+— forgefy_client already ships the retry / error / session layer.
+  • pubspec.yaml → add  forgefy_client: ^0.1.0
+  • lib/core/network/forgefy_client.dart — build ONE ForgefyClient from env
+    (SUPABASE_URL + SUPABASE_ANON_KEY; or ForgefyConfig(provider:
+    ForgefyProvider.neon, url: NEON_DATA_API_URL, anonKey: ...)) with a
+    SessionStore backed by shared_preferences so logins survive restarts.
+    Register it as a lazy singleton in lib/core/injection.dart and inject it
+    into the datasources. This file REPLACES api_client.dart for Supabase/Neon.
+  • {feature}_remote_datasource.dart calls client.from('table')… ; auth
+    datasources call client.auth.signInWithPassword(...) / signUp(...) — never
+    raw http or a provider SDK. Read the result, THEN cast (precedence matters):
+        final result = await client
+            .from('todos').select().eq('done', false)
+            .order('created_at', ascending: false);
+        final rows = result as List;
+  • On startup (main.dart) call client.auth.restoreSession() before runApp.
+  FIREBASE apps keep using the firebase_* SDKs — forgefy_client does not cover
+  Firebase yet. A plain external REST API (not the DB) still uses api_client.dart.
+
+COMPONENT LIBRARY — shadcn_ui (the house control kit for Flutter):
+Use shadcn_ui's Shad* widgets for interactive controls in place of raw Material
+widgets, hand-rolled ones, AND the design system's AppButton/AppTextField — this
+SUPERSEDES the "use AppTextField/AppButton" note for CONTROL widgets. Widgets:
+ShadButton, ShadInput / ShadInputFormField, ShadCard, ShadDialog (showShadDialog)
+/ ShadSheet, ShadSelect, ShadCheckbox, ShadSwitch, ShadTabs, ShadBadge,
+ShadTooltip, ShadForm (+ validation).
+  • pubspec.yaml → add  shadcn_ui: ^0.55.0
+  • ROOT (lib/main.dart): a ShadTheme must be in the tree for Shad* to render.
+    This template uses MaterialApp.router + GoRouter, so use ShadApp.router(
+    routerConfig: appRouter, …) — it provides BOTH the Material theme and the
+    ShadTheme — and keep the existing AppTheme via its materialThemeBuilder. Build
+    the ShadThemeData colorScheme FROM AppColors (light + dark) so the two match; do
+    NOT introduce a second, clashing palette.
+  • Icons: LucideIcons (shadcn_ui bundles lucide).
+COEXISTENCE — additive, not a rewrite:
+  • TOKENS stay the design system's — colors via AppColors, text via AppTextStyles,
+    spacing from the theme. Shad* controls are themed FROM those tokens, never
+    hardcoded.
+  • LAYOUT stays forgefy_ui / sliver-first (VStack/Grid/SliverScreen/…) when the
+    Forgefy UI package is enabled; otherwise standard Flutter layout widgets.
+
 EXACT FOLDER STRUCTURE — call create_directory for every path below before writing any files:
 
   lib/core/error/
@@ -63,6 +107,8 @@ CANONICAL FILE NAMES — use these exact names, no variations:
   lib/core/error/exceptions.dart        — AppException subclasses
   lib/core/error/failures.dart          — Failure sealed class / subclasses
   lib/core/network/api_client.dart      — Dio/http base client with interceptors
+                                          (external REST API only; for a Supabase/Neon
+                                          DB use lib/core/network/forgefy_client.dart)
   lib/core/network/network_info.dart    — connectivity check
   lib/core/usecases/usecase.dart        — abstract UseCase<Type, Params> interface
   lib/core/utils/constants.dart         — API base URL, timeout durations, string keys
@@ -81,13 +127,18 @@ CANONICAL FILE NAMES — use these exact names, no variations:
   lib/features/{feature}/presentation/pages/{feature}_page.dart
   lib/features/{feature}/presentation/widgets/{feature}_form.dart  (or _card, _tile, etc.)
 
-ROOT FILES (mandatory — do NOT rename these):
-  lib/injection_container.dart  — GetIt registering all blocs, repos, usecases, datasources
-  lib/app.dart                  — MaterialApp with theme, BlocProviders, named routes
-  lib/main.dart                 — runApp, WidgetsFlutterBinding, init injection_container
+ROOT FILES (these already EXIST in the template — extend them, do NOT create lib/app.dart):
+  lib/core/injection.dart       — GetIt registering all blocs, repos, usecases, datasources
+  lib/router/app_router.dart    — GoRouter route definitions (add new routes here)
+  lib/main.dart                 — runApp + MaterialApp.router(routerConfig: appRouter,
+                                  theme: AppTheme.light/dark), wrapped in the BlocProviders,
+                                  DI initialised before runApp. There is NO lib/app.dart —
+                                  the root MaterialApp lives in main.dart.
 
 pubspec.yaml — add: flutter_bloc, equatable, get_it, dartz, dio, shared_preferences,
-               connectivity_plus, and any feature-specific packages (firebase_*, etc.)
+               connectivity_plus, shadcn_ui (^0.55.0 — the control kit),
+               forgefy_client (^0.1.0, when the DB is Supabase/Neon),
+               and any feature-specific packages (firebase_*, etc.)
 
 BUILD ORDER (strictly follow):
   1. core/ files first (error, network, utils, theme)
@@ -96,8 +147,8 @@ BUILD ORDER (strictly follow):
   4. presentation/widgets/ for every feature (reusable sub-widgets)
   5. presentation/bloc/ for every feature
   6. presentation/pages/ for every feature
-  7. injection_container.dart (wire everything together)
-  8. app.dart, main.dart
+  7. lib/core/injection.dart (wire everything together)
+  8. lib/router/app_router.dart (routes) + lib/main.dart (root MaterialApp.router)
   9. Generate all image/video assets, declare in pubspec.yaml
   10. pubspec.yaml — finalize all dependencies
 """
@@ -118,6 +169,45 @@ for public-safe values like a Supabase anon key or Firebase client config — th
 database client/SDK is initialized and queried ONLY inside lib/db.ts and
 lib/services/*.ts, and lib/services/*.ts is imported ONLY by app/api/** route
 handlers, NEVER by a "use client" component.
+
+FORGEFY CLIENT SDK — use it when the connected database is Supabase or Neon:
+Use `@forgefy/client` for ALL database reads/writes and auth. Do NOT add
+@supabase/supabase-js and do NOT hand-roll a fetch wrapper for the DB — the
+package ships the retry / error / session layer and runs on the edge runtime.
+  • package.json → add  "@forgefy/client": "^0.1.0"
+  • lib/db.ts — export a factory that builds a ForgefyClient from
+    NEXT_PUBLIC_SUPABASE_URL + NEXT_PUBLIC_SUPABASE_ANON_KEY (or provider: 'neon'
+    with NEXT_PUBLIC_NEON_DATA_API_URL). In a route handler, forward the caller's
+    JWT so queries run as that user (RLS applies):
+        const token = req.headers.get('authorization')?.replace('Bearer ', '');
+        return new ForgefyClient({ url, anonKey, accessToken: token });
+  • lib/services/{entity}.ts calls db.from<T>('table').select()… / .insert(…),
+    and auth services call db.auth.signInWithPassword(...) — imported ONLY by
+    app/api/** route handlers, never a "use client" component.
+  FIREBASE apps keep using the firebase SDK — forgefy_client does not cover
+  Firebase yet.
+
+COMPONENT LIBRARY — components/ui (rich custom kit + shadcn/ui primitives):
+The template ships a rich custom component kit AND real shadcn/Radix primitives
+(new-york style). Reuse them — do NOT hand-roll buttons, inputs, cards, dialogs,
+menus, etc.
+  • Rich custom controls — import from the barrel "@/components/ui": Button
+    (variants + isLoading + leading/trailingIcon), Card (+ CardHeader/CardTitle/…),
+    TextField (label/hint/error + password toggle), Chip, EmptyState, Modal, Avatar,
+    Skeleton, SignatureWidget. PREFER these for buttons, text inputs, and cards —
+    they are richer than the shadcn defaults.
+  • shadcn/Radix primitives — import from "@/components/ui/<name>": Dialog, Select,
+    DropdownMenu, Tabs, Tooltip, Popover, Sheet, Separator, Label. Use these for
+    overlays, menus, selects, tabs, tooltips.
+  • Class-merge helper: import { cn } from "@/lib/utils". Icons: "lucide-react".
+  • Need another shadcn component (accordion, command, checkbox, …)? Write it from
+    the official shadcn (new-york) source at components/ui/<name>.tsx (you cannot run
+    the shadcn CLI) and add its @radix-ui/react-<primitive> dep to package.json.
+  • Colors/spacing use the design-system Tailwind tokens (bg-primary, bg-surface,
+    text-on-surface, text-muted-foreground, border-border) — never hardcode hex.
+    The shadcn primitives already map to these tokens.
+Components live in components/ui; lay them out with Tailwind flex/grid (or the
+@forgefy/ui/web layout primitives when enabled).
 
 EXACT FOLDER STRUCTURE — call create_directory for EVERY path before writing files:
 
@@ -146,7 +236,8 @@ EXACT FOLDER STRUCTURE — call create_directory for EVERY path before writing f
     components/{feature}/       — feature-specific reusable components
 
   ── Server utilities (imported only by app/api/**) ──
-  lib/db.ts                     — database client singleton (Prisma / Supabase / mongoose)
+  lib/db.ts                     — database client (ForgefyClient factory for Supabase/Neon —
+                                   see FORGEFY CLIENT SDK above; else Prisma / mongoose / firebase)
   For each entity/feature that needs persistence:
     lib/services/{entity}.ts    — the ONLY place with queries for this entity: getX/listX,
                                    createX, updateX, deleteX — imported only by app/api/**
@@ -257,66 +348,111 @@ TYPESCRIPT RULES — follow exactly to avoid build errors:
 """
 
 _RN_STRUCTURE = """
-ARCHITECTURE: Feature-Sliced Design with Redux Toolkit.
+ARCHITECTURE: Expo Router (file-based routing) + feature modules + Zustand + React Query.
+Routes live in app/ (expo-router — the filename IS the route). Shared code in src/core/.
+Feature logic in src/features/{feature}/. Client state via Zustand; server data via
+@tanstack/react-query. This template is NOT React Navigation and NOT Redux — do not add
+@react-navigation/* or @reduxjs/toolkit.
+
+FORGEFY CLIENT SDK — use it when the connected database is Supabase or Neon:
+Use `@forgefy/client` for ALL database reads/writes and auth. Do NOT add
+@supabase/supabase-js — the package ships the retry / error / session layer.
+  • package.json → add  "@forgefy/client": "^0.1.0"
+  • src/services/forgefyClient.ts — build ONE ForgefyClient from
+    EXPO_PUBLIC_SUPABASE_URL + EXPO_PUBLIC_SUPABASE_ANON_KEY (or provider: 'neon'
+    with EXPO_PUBLIC_NEON_DATA_API_URL), with a persistent session store backed by
+    expo-secure-store or react-native-mmkv (wrap it to match persistentSessionStore's
+    getItem/setItem/removeItem — this template has NO AsyncStorage). Call
+    forgefy.auth.restoreSession() on app start (in app/_layout.tsx).
+  • src/services/db/{entity}.ts calls forgefy.from('table')… and auth calls
+    forgefy.auth.signInWithPassword(...) — never a provider SDK from a route,
+    component, store, or hook.
+  FIREBASE apps keep using the firebase SDK — forgefy_client does not cover
+  Firebase yet. src/services/httpClient.ts stays for a plain external REST API.
+
+COMPONENT LIBRARY — react-native-reusables (the shadcn kit for React Native):
+react-native-reusables (RNR) is the RN shadcn port — NativeWind (Tailwind
+classNames) + @rn-primitives/* + class-variance-authority + cn(). Components are
+copied in under components/ui/.
+  • USE IT ONLY WHEN the template already has NativeWind configured — a global.css
+    with the theme CSS variables, a tailwind.config.js RNR preset, the NativeWind
+    babel/metro setup, and cn() in lib/utils. Then compose controls from
+    components/ui/* (Button, Input, Card, Dialog, Select, Text, Badge, …) instead of
+    raw react-native controls or hand-rolled ones. Icons: lucide-react-native.
+  • If a needed RNR component isn't in components/ui/, WRITE it from the official RNR
+    source (you cannot run the RNR CLI) and add its deps to package.json: the matching
+    @rn-primitives/<name>, plus class-variance-authority, clsx, tailwind-merge (and
+    nativewind, tailwindcss, tailwindcss-animate if not already present).
+  • DO NOT introduce NativeWind mid-build if the template does not already use it —
+    the babel/metro/global.css changes break the build if imperfect. In that case use
+    the pre-built src/core/components/ instead.
+COEXISTENCE: RNR = controls; design TOKENS stay src/core/theme's; LAYOUT stays
+@forgefy/ui/native (VStack/Grid/List/…) when enabled. NativeWind className and RN
+style props coexist, so forgefy_ui (style-based) works alongside RNR (className).
 
 EXACT FOLDER STRUCTURE — call create_directory for every path before writing files:
 
-  src/app/                      — Redux store root
+  ── Routes (expo-router; the filename IS the route. _layout.tsx files already exist) ──
+  app/_layout.tsx               — root Stack + global providers (EXISTS — extend, don't recreate)
+  app/(tabs)/_layout.tsx        — bottom Tabs navigator (EXISTS)
+  app/(tabs)/{name}.tsx         — a tab screen (index.tsx = Home)
+  For each feature that needs its own route(s):
+    app/{feature}/_layout.tsx   — nested Stack (only if the feature has sub-screens)
+    app/{feature}/index.tsx     — feature home/list route
+    app/{feature}/[id].tsx      — feature detail route (dynamic segment)
+  [AUTH ONLY] app/(auth)/_layout.tsx, app/(auth)/login.tsx, app/(auth)/register.tsx
+
+  ── Feature modules (src/features/{feature}/) ──
   For each feature from the blueprint:
-    src/features/{feature}/api/
-    src/features/{feature}/components/
-    src/features/{feature}/screens/
-    src/features/{feature}/slice/
-    src/features/{feature}/types/
-    src/features/{feature}/hooks/
+    src/features/{feature}/components/   — feature UI (built on src/core + src/components/ui)
+    src/features/{feature}/hooks/        — use{Feature}.ts (React Query + Zustand)
+    src/features/{feature}/store.ts      — Zustand store (only if the feature has client state)
+    src/features/{feature}/api.ts        — React Query queries/mutations
+    src/features/{feature}/types.ts      — TypeScript interfaces for this feature
 
-  NOTE: if a feature is "auth" (login / register / session), create it ONLY if
-  auth decision is YES. If auth decision is NO, do not create the auth feature,
-  no login/register screens, no auth slice or auth API calls — skip entirely.
+  NOTE: if a feature is "auth" (login / register / session), create it ONLY if auth
+  decision is YES. If auth decision is NO, do not create the auth routes, store, or API.
 
-  src/navigation/               — navigator files
-  src/services/                 — shared HTTP client
+  ── Shared (already scaffolded — do NOT recreate) ──
+  src/core/components/          — custom control kit (AppButton, AppCard, AppTextField, …)
+  src/components/ui/            — react-native-reusables components (when NativeWind is set up)
+  src/core/theme/               — ThemeProvider, tokens.ts, useTheme (useAppTheme())
+  src/core/utils/               — formatters, haptics, helpers
+  src/core/types/               — shared types
   For each entity that needs persistence:
-    src/services/db/{entity}Service.ts   — the ONLY place that calls Supabase/Neon/Firebase
-                                            SDKs for this entity — never call them from a
-                                            screen, component, hook, or slice directly
-  src/hooks/                    — shared app-level hooks
-  src/styles/                   — shared style constants
-  src/utils/                    — constants, helpers
+    src/services/db/{entity}.ts — the ONLY place that reads/writes the connected DB —
+                                   never call the DB/SDK from a route, component, hook, or store
   assets/images/                — AI-generated assets
 
-CANONICAL FILE NAMES — use these exact names, no variations:
+CANONICAL NAMES / RULES:
+  • Routes are files under app/ — filename = URL segment. Groups use (parens), layouts
+    are _layout.tsx, dynamic segments are [id].tsx. Add a tab by creating the file AND a
+    <Tabs.Screen name="..."/> in app/(tabs)/_layout.tsx.
+  • Navigation: import { router, useRouter, Link } from 'expo-router' — router.push('/x/1').
+    Do NOT import @react-navigation directly.
+  • Client state: Zustand — create() a store in src/features/{feature}/store.ts (or src/core
+    for global). Do NOT use Redux / @reduxjs/toolkit / configureStore / createSlice.
+  • Server data: @tanstack/react-query (useQuery / useMutation) in feature api.ts / hooks.
+  • Theme: read colors/spacing via useAppTheme() from src/core/theme — never hardcode hex.
+  • Persistent storage: react-native-mmkv (fast KV) or expo-secure-store (secrets).
+    Do NOT use @react-native-async-storage/async-storage.
+  • Path aliases (tsconfig): @core/* → src/core/*, @features/* → src/features/*,
+    ~/* → src/*  (react-native-reusables), @assets/* → assets/*.
 
-  src/app/store.ts                                   — configureStore with all slice reducers
-  src/app/rootReducer.ts                             — combineReducers
-  src/features/{feature}/api/{feature}Api.ts         — RTK Query or axios calls
-  src/features/{feature}/components/{Feature}Form.tsx — reusable UI (no navigation logic)
-  src/features/{feature}/screens/{Feature}Screen.tsx  — full screen, connects store
-  src/features/{feature}/slice/{feature}Slice.ts     — createSlice actions/reducers/selectors
-  src/features/{feature}/types/{feature}.types.ts    — TypeScript interfaces for this feature
-  src/features/{feature}/hooks/use{Feature}.ts       — hook encapsulating dispatch + selectors
-  src/navigation/AppNavigator.tsx                    — root Stack/Tab navigator (DO NOT rename)
-  src/services/httpClient.ts                         — axios instance with interceptors (remote API, not a database)
-  src/services/db/{entity}Service.ts                 — database reads/writes for this entity (if a database is connected)
-  src/hooks/useAppDispatch.ts                        — typed dispatch hook
-  src/styles/tailwind.config.js                      — NativeWind / StyleSheet tokens
-  src/utils/constants.ts                             — API_URL, storage keys, etc.
-  src/App.tsx                                        — Provider + NavigationContainer root
+ROOT (already exists — EXTEND, do NOT recreate):
+  app/_layout.tsx — root Stack wrapped in QueryClientProvider + ThemeProvider +
+    GestureHandlerRootView + BottomSheetModalProvider. Add new global providers here.
 
-BUILD ORDER (strictly follow; skip auth feature steps if auth decision is NO):
-  1. src/utils/constants.ts and src/services/httpClient.ts
-  2. src/services/db/{entity}Service.ts for every entity that needs persistence (if a database is connected)
-  3. types files for every feature  (skip auth feature if auth decision is NO)
-  4. slice files for every feature  (skip auth slice if auth decision is NO)
-  5. src/app/store.ts + rootReducer.ts (import all slices)
-  6. api files for every feature    (skip auth API if auth decision is NO) — call src/services/db/*Service.ts, never the SDK directly
-  7. hooks for every feature + src/hooks/useAppDispatch.ts
-  8. feature components/ (reusable, no screens yet)
-  9. feature screens/               (skip login/register screens if auth decision is NO)
-  10. src/navigation/AppNavigator.tsx — if auth YES: include auth stack; if NO: go straight to main stack
-  11. src/App.tsx
-  12. Generate all image assets, reference in screens
-  13. package.json / app.json — finalize dependencies
+BUILD ORDER (strictly follow; skip [AUTH ONLY] steps if auth decision is NO):
+  1. src/features/{feature}/types.ts for every feature
+  2. src/services/db/{entity}.ts for every entity that needs persistence (if a DB is connected)
+  3. src/features/{feature}/api.ts (React Query) + store.ts (Zustand) per feature
+  4. src/features/{feature}/hooks/use{Feature}.ts
+  5. src/features/{feature}/components/ (feature UI using core + ui components)
+  6. app/ route files per feature (thin — render feature components); add <Tabs.Screen> entries
+  7. [AUTH ONLY] app/(auth)/* routes + session handling
+  8. Generate image assets, reference them in the routes
+  9. app.json + package.json — finalize app name and dependencies
 """
 
 _STRUCTURE_MAP = {
@@ -352,8 +488,8 @@ FLUTTER FOLDER STRUCTURE — every file you create MUST follow this layout:
   lib/features/{feature}/presentation/pages/{feature}_page.dart
   lib/features/{feature}/presentation/widgets/{feature}_*.dart
 
-  Root (mandatory, do NOT rename):
-  lib/injection_container.dart   lib/app.dart   lib/main.dart
+  Root (already exist — extend, do NOT create lib/app.dart):
+  lib/core/injection.dart   lib/router/app_router.dart (GoRouter)   lib/main.dart (root MaterialApp.router)
 
 RULES:
   • Pages go in presentation/pages/ ONLY. Never at lib/ root or lib/screens/.
@@ -363,38 +499,61 @@ RULES:
     queried ONLY inside data/datasources/{feature}_remote_datasource.dart — the
     repository_impl calls only the datasource, business/validation logic lives in
     domain/usecases/, and presentation/bloc never touches the datasource or SDK directly.
+    For Supabase/Neon that SDK is `forgefy_client`. Build ONE ForgefyClient in
+    lib/core/network/forgefy_client.dart from SUPABASE_URL + SUPABASE_ANON_KEY (or
+    ForgefyProvider.neon + NEON_DATA_API_URL) with a shared_preferences SessionStore,
+    register it in lib/core/injection.dart, and add forgefy_client: ^0.1.0 to
+    pubspec.yaml. Datasources call client.from('table').select()… ; auth calls
+    client.auth.signInWithPassword(...). Read the result THEN cast (precedence):
+        final r = await client.from('t').select().eq('done', false); final rows = r as List;
+    Firebase apps keep the firebase_* SDKs.
+  • COMPONENTS: use shadcn_ui's Shad* widgets (ShadButton/ShadInput/ShadCard/
+    ShadDialog/ShadSelect/…) for controls instead of raw Material or AppButton/
+    AppTextField. Add shadcn_ui: ^0.55.0; a ShadTheme must be at the root — this
+    template uses MaterialApp.router, so ShadApp.router in lib/main.dart, colorScheme
+    built from AppColors. Tokens still come from AppColors/AppTextStyles.
   • If you add a new feature, create ALL sub-folders listed above.
-  • If you add a new screen, register it in lib/app.dart (GoRouter or named routes).
+  • If you add a new screen, add its route to lib/router/app_router.dart (GoRouter).
 """,
     "react_native": """\
-REACT NATIVE FOLDER STRUCTURE — every file you create MUST follow this layout:
+REACT NATIVE STRUCTURE (Expo Router + Zustand + React Query) — every file MUST follow this:
 
-  src/app/store.ts               src/app/rootReducer.ts
-  src/navigation/AppNavigator.tsx   ← only navigator file, do NOT rename
-  src/services/httpClient.ts        ← remote API HTTP client, NOT a database
-  src/services/db/{entity}Service.ts  ← ONE per entity that needs persistence — the
-                                        ONLY place that calls Supabase/Neon/Firebase SDKs
-  src/hooks/useAppDispatch.ts
-  src/styles/tailwind.config.js
-  src/utils/constants.ts
-  src/App.tsx                       ← root entry, do NOT rename
+  Routes live in app/ (expo-router — filename = route; _layout.tsx already exist):
+  app/_layout.tsx                   ← root Stack + providers (EXISTS — extend, don't recreate)
+  app/(tabs)/_layout.tsx            ← bottom Tabs (add <Tabs.Screen> to register a tab)
+  app/(tabs)/{name}.tsx             ← a tab screen (index.tsx = Home)
+  app/{feature}/index.tsx  app/{feature}/[id].tsx   ← feature routes (dynamic = [id].tsx)
 
-  For each feature → ALL sub-folders are mandatory:
-  src/features/{feature}/api/{feature}Api.ts
-  src/features/{feature}/components/{Feature}Form.tsx   (or Card, List, etc.)
-  src/features/{feature}/screens/{Feature}Screen.tsx
-  src/features/{feature}/slice/{feature}Slice.ts
-  src/features/{feature}/types/{feature}.types.ts
-  src/features/{feature}/hooks/use{Feature}.ts
+  Feature logic in src/features/{feature}/:
+  src/features/{feature}/components/    src/features/{feature}/hooks/use{Feature}.ts
+  src/features/{feature}/store.ts (Zustand)   src/features/{feature}/api.ts (React Query)
+  src/features/{feature}/types.ts
+
+  Shared (already scaffolded — do NOT recreate):
+  src/core/components/ (AppButton/AppCard/… custom kit)   src/components/ui/ (RNR, if NativeWind)
+  src/core/theme/ (useAppTheme())   src/core/utils/   src/core/types/
+  src/services/db/{entity}.ts   ← ONE per entity — the ONLY place that reads/writes the DB
 
 RULES:
-  • Screens go in features/{feature}/screens/ ONLY. Never in src/screens/ or root.
-  • Components go in features/{feature}/components/ ONLY.
-  • Slice files go in features/{feature}/slice/ ONLY.
-  • If a database is connected, ALL reads/writes go through src/services/db/{entity}Service.ts
-    — screens/components/slices never call Supabase/Neon/Firebase SDKs directly.
-  • If you add a new screen, register it in src/navigation/AppNavigator.tsx.
-  • If you add a new slice, add it to src/app/store.ts and rootReducer.ts.
+  • Routes go in app/ ONLY (expo-router). Add a screen by creating its file; register a tab
+    with <Tabs.Screen name="..."/> in app/(tabs)/_layout.tsx. Navigate via
+    import { router } from 'expo-router'. Do NOT use @react-navigation directly.
+  • This template is Zustand + React Query — NOT Redux. No store.ts/rootReducer/createSlice/
+    useAppDispatch. Client state → Zustand create() in src/features/{feature}/store.ts;
+    server data → React Query in api.ts/hooks. Theme via useAppTheme(); storage via
+    react-native-mmkv / expo-secure-store (NOT AsyncStorage).
+  • If a database is connected, ALL reads/writes go through src/services/db/{entity}.ts
+    — routes/components/hooks/stores never call Supabase/Neon/Firebase SDKs directly.
+    For Supabase/Neon that SDK is `@forgefy/client`. Build ONE ForgefyClient in
+    src/services/forgefyClient.ts from EXPO_PUBLIC_SUPABASE_URL + EXPO_PUBLIC_SUPABASE_ANON_KEY
+    (or provider:'neon' + EXPO_PUBLIC_NEON_DATA_API_URL) with a session store backed by
+    expo-secure-store/mmkv; call forgefy.auth.restoreSession() in app/_layout.tsx. Add
+    "@forgefy/client": "^0.1.0" to package.json. Firebase apps keep the firebase SDK.
+  • COMPONENTS: if the template uses NativeWind, use react-native-reusables from
+    src/components/ui/* (Button/Input/Card/Dialog/Select/…) for controls instead of raw
+    RN or hand-rolled ones; write a missing RNR component from source and add its
+    @rn-primitives/* dep (+ cva/clsx/tailwind-merge). If the template does NOT use
+    NativeWind, do NOT add it mid-build — use src/core/components/. Icons: lucide-react-native.
 """,
     "next": """\
 NEXT.JS FOLDER STRUCTURE — every file you create MUST follow this layout:
@@ -415,10 +574,20 @@ RULES:
   • If a database is connected (Supabase/Neon/Firebase), ALL reads/writes go through
     lib/services/{entity}.ts — route handlers call these functions, never inline
     queries against lib/db.ts or a provider SDK directly, and never from a
-    "use client" component.
+    "use client" component. For Supabase/Neon that SDK is `@forgefy/client`: build the
+    ForgefyClient in lib/db.ts from NEXT_PUBLIC_SUPABASE_URL + NEXT_PUBLIC_SUPABASE_ANON_KEY
+    (or provider:'neon' + NEXT_PUBLIC_NEON_DATA_API_URL); in a route handler forward the
+    caller's JWT — new ForgefyClient({ url, anonKey, accessToken }) — so RLS applies.
+    lib/services/{entity}.ts calls db.from<T>('table')… / db.auth. Add
+    "@forgefy/client": "^0.1.0" to package.json. Firebase apps keep the firebase SDK.
   • New pages go in app/(app)/{feature}/page.tsx.
   • Add a nav link in components/layout/ when adding a new page.
   • All shared types in types/index.ts — do not scatter them across files.
+  • COMPONENTS: use shadcn/ui from @/components/ui/* (new-york style, lucide icons,
+    cn() from @/lib/utils) — never hand-roll buttons/inputs/cards/dialogs. If a
+    needed component isn't in components/ui/, write it from the shadcn source and add
+    its @radix-ui/react-* dep (plus class-variance-authority/clsx/tailwind-merge/
+    lucide-react). Colors via Tailwind tokens (bg-background/text-primary), not hex.
 
 TYPESCRIPT — follow exactly to avoid build failures:
   • Props: define an interface, use plain function — NOT React.FC<>
@@ -454,10 +623,17 @@ HARDCODED VALUES ARE FORBIDDEN:
 ✗  backgroundColor: '#6366F1'      → ✓  backgroundColor: colors.primary (RN)
 ✗  color: '#6366F1'                → ✓  color: var(--color-primary) (Next.js)
 
-REUSE CORE COMPONENTS FIRST:
-Before creating any UI widget/component, check if one already exists in
-lib/core/widgets/ (Flutter), src/core/components/ (RN), or components/ui/ (Next.js).
-Reuse and extend it — do NOT duplicate.
+REUSE COMPONENTS FIRST — do NOT hand-roll standard controls or duplicate:
+Standard controls (buttons, inputs, cards, dialogs, selects, tabs, badges, …) come
+from the platform component kit, NOT from custom code:
+  • Flutter  → shadcn_ui Shad* widgets (ShadButton, ShadInput, ShadCard, …).
+  • Next.js  → shadcn/ui in components/ui/ (imported via @/components/ui/*).
+  • RN       → react-native-reusables (components/ui/) when NativeWind is set up,
+               else the pre-built components in src/core/components/.
+For anything app-SPECIFIC (a composite card, an empty state, the signature element),
+check lib/core/widgets/ (Flutter) / components/{feature}/ (Next) / feature components
+(RN) and reuse/extend rather than duplicate. On Flutter, lib/core/widgets/ holds
+composites built ON TOP OF Shad* — not re-implementations of basic controls.
 
 THE SIGNATURE ELEMENT:
 The blueprint contains a `signature_element` — one distinctive, domain-specific
@@ -513,9 +689,12 @@ PHASE 0 · Auth Decision  ← do this BEFORE anything else
     — treat every build-order step marked [AUTH ONLY] as N/A.
     — build the app as a fully public application with no login wall.
 
-PHASE 0 (auth) — if auth IS needed: the login/register screens MUST use the pre-built
-  AppTextField and AppButton core components. No custom text fields. Include a branded
-  header using the display_font. Password field has show/hide toggle.
+PHASE 0 (auth) — if auth IS needed: the login/register screens MUST use the platform
+  control kit — Flutter: shadcn_ui ShadInputFormField + ShadButton (inside a ShadForm);
+  Next.js: shadcn/ui Input + Button; RN: react-native-reusables (if NativeWind) else core
+  controls. No custom/hand-rolled
+  text fields or buttons. Include a branded header using the display_font. Password field
+  has a show/hide toggle.
 
 PHASE 1 · Explore
   • list_files on '.' to see the existing template
@@ -536,10 +715,11 @@ PHASE 2 · Scaffold directories
     This sentence appears in the user's live build log.
 
 PHASE 3 · Reusable components / widgets  ← DO THIS BEFORE SCREENS
-  • Core components are PRE-BUILT in lib/core/widgets/ (Flutter),
-    src/core/components/ (RN), or components/ui/ (Next.js).
-  • Only write FEATURE-SPECIFIC components here. Each must import from core — never
-    redefine base styles.
+  • Standard controls come from the component kit — Flutter: shadcn_ui Shad*;
+    Next.js: shadcn/ui in components/ui/; RN: react-native-reusables (if NativeWind)
+    else pre-built src/core/components/. Do not re-implement them.
+  • Only write FEATURE-SPECIFIC components here (composites built ON TOP OF the kit).
+    Each must use the kit + design tokens — never redefine base styles.
   • Write at minimum: a feature-specific card, a feature-specific list item, and
     the signature_widget integrated where contextually relevant.
 
@@ -593,7 +773,10 @@ ADDITIONAL REQUIREMENTS
   the services/datasource layer described above for this platform (lib/services/*.ts
   for Next.js, src/services/db/*Service.ts for React Native, data/datasources/* for
   Flutter) — never scatter raw provider SDK/query calls inside pages, screens, or
-  widgets/components directly.
+  widgets/components directly. When that database is Supabase or Neon, that layer uses
+  the Forgefy client SDK (forgefy_client for Flutter, @forgefy/client for Next.js and
+  React Native) for both data and auth — see the "FORGEFY CLIENT SDK" note in the
+  structure section above. Firebase-backed apps keep using the Firebase SDK.
 • Implement EVERY feature listed in the blueprint — nothing optional
 • Handle loading states, empty states, and basic error states in every screen
 • Add input validation where the app collects user data
@@ -683,9 +866,131 @@ ADDITIONAL REQUIREMENTS
 """
 
 
+# ---------------------------------------------------------------------------
+# Forgefy UI SDK guidance (feature-flagged)
+# ---------------------------------------------------------------------------
+# forgefy_ui (Flutter) and @forgefy/ui (React web + native) give generated apps
+# layout + animation primitives. This guidance is injected ONLY when
+# FORGEFY_UI_ENABLED is truthy: until the packages are published to pub.dev / npm,
+# every build's pub-get / npm-install would fail on the missing dependency — and
+# unlike the DB SDK this applies to EVERY app, so it stays off by default. Flip
+# the env var after publishing.
+
+
+def _ui_enabled() -> bool:
+    from app.config import get_settings
+    return get_settings().FORGEFY_UI_ENABLED
+
+
+_FLUTTER_UI_GUIDANCE = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORGEFY UI — layout, animation, SLIVER-FIRST screens
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use the `forgefy_ui` package for structure and motion instead of hand-writing
+Column/Row/SizedBox or AnimationController.
+  • pubspec.yaml → add  forgefy_ui: ^0.1.0
+  • Import in UI files (Spacer/Wrap overlap Flutter's — hide them):
+      import 'package:flutter/material.dart' hide Spacer, Wrap;
+      import 'package:forgefy_ui/forgefy_ui.dart';
+
+SLIVER-FIRST SCREENS — build EVERY scrolling page this way, NOT
+Scaffold + SingleChildScrollView + Column:
+  SliverScreen(
+    gutter: 16,
+    appBar: SliverHeader(title: Text(...), pinned: true),
+    slivers: [
+      SliverGap(12),
+      SliverStagger(itemCount: items.length, itemBuilder: (c, i) => ItemCard(items[i])),  // lists
+      // grid:           SliverGridView(columns: n, itemCount: .., itemBuilder: ..)
+      // fixed section:  SliverBox(child: VStack(spacing: 12, children: [...]))
+      // empty/error/loading: SliverFill(child: <state widget>)
+    ],
+  )
+
+LAYOUT inside boxes: VStack/HStack(spacing:), Grid(columns:), Wrap, Spacer, and
+Responsive.value(context, mobile: .., tablet: .., desktop: ..) for adaptive
+column counts.
+ANIMATION: FadeIn / SlideIn / ScaleIn (entrances), Stagger / SliverStagger
+(lists), AnimatedVisibility (show/hide) — prefer these over raw AnimationController.
+
+forgefy_ui owns STRUCTURE + MOTION; the design system still owns VALUES — colors
+via AppColors, text via AppTextStyles, spacing from the theme. Never hardcode
+colors/sizes into forgefy_ui widgets.
+"""
+
+_NEXT_UI_GUIDANCE = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORGEFY UI — layout & animation
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use `@forgefy/ui/web` for layout/animation instead of hand-rolled flex divs.
+  • package.json → add  "@forgefy/ui": "^0.1.0"
+  • import { VStack, HStack, Grid, Wrap, Spacer, Scroll, List, Fill, Stagger,
+      FadeIn, SlideIn, useResponsiveValue } from "@forgefy/ui/web";
+  • Stacks with spacing → <VStack gap={16}> / <HStack gap={8}>.
+  • Grid → <Grid columns={useResponsiveValue({ mobile: 1, tablet: 2, desktop: 3 })} gap={12}>.
+  • Empty / error / loading → <Fill><EmptyState/></Fill>.
+  • Animated lists → <Stagger>…</Stagger>; entrances → <FadeIn>/<SlideIn>.
+These use hooks → the files that render them need 'use client'. Tailwind/design
+tokens still own color & typography; forgefy_ui owns layout structure.
+"""
+
+_RN_UI_GUIDANCE = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORGEFY UI — layout & animation
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use `@forgefy/ui/native` instead of hand-written StyleSheet flex layout.
+  • package.json → add  "@forgefy/ui": "^0.1.0"
+  • import { VStack, HStack, Grid, Spacer, List, Fill, Stagger, FadeIn, SlideIn,
+      useResponsiveValue } from "@forgefy/ui/native";
+  • Screens: VStack/HStack(gap), Grid(columns), Spacer.
+  • Long lists → <List data={..} gap={12} renderItem={(item) => <Card .../>} />  (FlatList under the hood).
+  • Empty / error / loading → <Fill><EmptyState/></Fill>. Animated lists → <Stagger>.
+  • Adaptive values → useResponsiveValue({ mobile, tablet, desktop }).
+"""
+
+_UI_GUIDANCE_MAP = {
+    "flutter": _FLUTTER_UI_GUIDANCE,
+    "next": _NEXT_UI_GUIDANCE,
+    "react_native": _RN_UI_GUIDANCE,
+}
+
+_UPDATE_UI_RULES = {
+    "flutter": """
+FORGEFY UI (layout/animation, sliver-first):
+  • Use forgefy_ui; build scrolling screens as SliverScreen (CustomScrollView) —
+    SliverListView/SliverStagger for lists, SliverGridView for grids, SliverFill
+    for empty states, SliverBox(child: VStack(...)) for fixed sections, SliverGap
+    for spacing. Inside boxes use VStack/HStack(spacing:)/Grid/Wrap/Spacer and
+    Responsive.value(...). Entrances via FadeIn/SlideIn/ScaleIn/Stagger.
+  • Add forgefy_ui: ^0.1.0. Import material with `hide Spacer, Wrap;`. Colors/text
+    still come from AppColors/AppTextStyles, never hardcoded into forgefy_ui.
+""",
+    "next": """
+FORGEFY UI (layout/animation):
+  • Use @forgefy/ui/web — VStack/HStack/Grid/Wrap/Spacer/Scroll/List/Fill/Stagger,
+    useResponsiveValue — instead of hand-rolled flex divs. Add "@forgefy/ui": "^0.1.0".
+    Files that render them need 'use client'.
+""",
+    "react_native": """
+FORGEFY UI (layout/animation):
+  • Use @forgefy/ui/native — VStack/HStack/Grid/Spacer/List/Fill/Stagger,
+    useResponsiveValue — instead of StyleSheet flex. Long lists → <List/>; empty
+    states → <Fill/>. Add "@forgefy/ui": "^0.1.0".
+""",
+}
+
+
+def _update_structure_rules(template_key: str) -> str:
+    rules = _UPDATE_STRUCTURE_RULES.get(template_key, "")
+    if _ui_enabled():
+        rules += _UPDATE_UI_RULES.get(template_key, "")
+    return rules
+
+
 def _build_system(template_key: str) -> str:
     structure = _STRUCTURE_MAP.get(template_key, _NEXT_STRUCTURE)
-    return _DESIGN_MANDATE + _BUILD_PREAMBLE + structure + _BUILD_SUFFIX
+    ui = _UI_GUIDANCE_MAP.get(template_key, "") if _ui_enabled() else ""
+    return _DESIGN_MANDATE + _BUILD_PREAMBLE + structure + ui + _BUILD_SUFFIX
 
 
 # ---------------------------------------------------------------------------
@@ -708,9 +1013,11 @@ HARDCODED VALUES ARE FORBIDDEN in any file you write:
   ✗ padding: 16     →  ✓ AppSpacing.md / spacing.md / var(--space-md)
   ✗ '#6366F1'       →  ✓ colors.primary / var(--color-primary)
 
-REUSE CORE COMPONENTS — check before creating anything new:
-  lib/core/widgets/ (Flutter) | src/core/components/ (RN) | components/ui/ (Next.js)
-  If a matching component exists there, use it — do not create a duplicate.
+USE THE COMPONENT KIT — do not hand-roll standard controls:
+  Flutter → shadcn_ui Shad* widgets | Next.js → shadcn/ui in components/ui/ |
+  RN → react-native-reusables (components/ui/) if NativeWind, else src/core/components/.
+  App-specific composites live in lib/core/widgets/ (Flutter) / components/{feature}/
+  (Next) — reuse an existing one before creating a duplicate.
 
 Every user action (tap, submit, toggle) must produce visible feedback.
 Use built-in component states (loading, pressed) — don't add extra animation libraries.
@@ -745,7 +1052,7 @@ CRITICAL RULES
 - Never output "." or a single word as your response — always write code.
 - Never say DONE without having written at least one file.
 - If a new screen is added, also update the navigator/router to include it.
-- Narrate briefly before each tool call: "Reading AppNavigator…", "Writing OnboardingPage…"
+- Narrate briefly before each tool call: "Reading the router/layout…", "Writing OnboardingScreen…"
 - If you see a file in the git history that was already correctly implemented,
   skip it and move on to what is still missing.
 - If your change adds a new third-party service, update all three env files:
@@ -779,6 +1086,12 @@ React Native / Expo: read package.json, add to "dependencies", write package.jso
 Flutter: read pubspec.yaml, add under "dependencies:", write pubspec.yaml.
 
 Common packages you must add when you use them:
+  shadcn_ui          → shadcn_ui: ^0.55.0            (Flutter control kit — pubspec.yaml)
+  nativewind         → "nativewind": "^4.2.0"        (RN — required by react-native-reusables)
+  @rn-primitives/*   → "@rn-primitives/<name>": "^1.5.0"  (RN — react-native-reusables primitives)
+  lucide-react-native → "lucide-react-native": "^1.25.0"  (RN icons for react-native-reusables)
+  @forgefy/client    → "@forgefy/client": "^0.1.0"   (Supabase/Neon DB + auth; Next.js & React Native)
+  forgefy_client     → forgefy_client: ^0.1.0        (Supabase/Neon DB + auth; Flutter — pubspec.yaml)
   next-themes        → "next-themes": "^0.3.0"
   framer-motion      → "framer-motion": "^11.0.0"
   lucide-react       → "lucide-react": "^0.400.0"
@@ -808,7 +1121,7 @@ Onboarding screen:
   File: lib/features/onboarding/presentation/pages/onboarding_page.dart
   Use PageView with individual step widgets (icon, title, body, skip/next).
   Store completion in SharedPreferences; check in main.dart to decide initial route.
-  Register route in lib/app.dart.
+  Register the route in lib/router/app_router.dart (GoRouter).
 
 Animations:
   Entrance: AnimatedOpacity + SlideTransition triggered in initState via AnimationController.
@@ -821,7 +1134,7 @@ Dark mode:
 
 New screen:
   Create in lib/features/{feature}/presentation/pages/.
-  Add named route to lib/app.dart routes map or GoRouter.
+  Add the route to lib/router/app_router.dart (GoRouter).
 
 ══════════════════════════════════════════
 NEXT.JS PATTERNS
@@ -859,9 +1172,9 @@ New page:
 REACT NATIVE PATTERNS
 ══════════════════════════════════════════
 Onboarding screen:
-  File: src/features/onboarding/screens/OnboardingScreen.tsx
-  Use FlatList or ScrollView with pagingEnabled. Store completion in AsyncStorage.
-  Add to AppNavigator.tsx as the initial screen when not completed.
+  Route file: app/onboarding.tsx (expo-router). Use FlatList or ScrollView with
+  pagingEnabled. Persist completion with react-native-mmkv or expo-secure-store.
+  Redirect from app/index.tsx (or app/_layout.tsx) to /onboarding when not completed.
 
 Animations:
   Entrance: Animated.timing with useRef(new Animated.Value(0)).
@@ -869,8 +1182,9 @@ Animations:
   Layout: LayoutAnimation.configureNext before state changes.
 
 New screen:
-  Create in src/features/{feature}/screens/.
-  Add to Stack.Navigator in src/navigation/AppNavigator.tsx.
+  Create a route file under app/ (expo-router) — e.g. app/{feature}/index.tsx; register a
+  tab with <Tabs.Screen name="..."/> in app/(tabs)/_layout.tsx. Put feature UI/logic in
+  src/features/{feature}/ and render it from the thin route file.
 
 ══════════════════════════════════════════
 IMPORT & SYNTAX RULES — READ BEFORE WRITING ANY FILE
@@ -916,11 +1230,13 @@ RULE 5 — TYPESCRIPT/NEXT.JS COMMON MISTAKES:
   ✗  API route missing runtime declaration → ✓  add export const runtime = 'edge'; at top of every app/api/*.ts file
   ✗  import fs from 'fs' in API route    → NOT available on Cloudflare edge — use fetch() or Web APIs only
 
-RULE 6 — REACT NATIVE COMMON MISTAKES:
+RULE 6 — REACT NATIVE COMMON MISTAKES (this template = Expo Router + Zustand + React Query):
   ✗  import { View } from 'react-native-web'  → ✓  from 'react-native'
-  ✗  StyleSheet.create({ x: { color: '#fff' } }) → ✓  use tokens: colors.xxx
-  ✗  navigation.navigate('Screen', params)  → type must match the Navigator's param list
-  ✗  AsyncStorage from 'react-native'  → ✓  from '@react-native-async-storage/async-storage'"""
+  ✗  StyleSheet.create({ x: { color: '#fff' } }) → ✓  use tokens: useAppTheme().colors.xxx
+  ✗  import { NavigationContainer } / @react-navigation/*  → ✓  expo-router (routes in app/);
+       navigate via import { router } from 'expo-router'
+  ✗  configureStore / createSlice / useDispatch (Redux)  → ✓  Zustand create() stores + React Query
+  ✗  @react-native-async-storage/async-storage  → ✓  react-native-mmkv or expo-secure-store"""
 
 
 # ---------------------------------------------------------------------------
@@ -1138,10 +1454,18 @@ For each screen/page file in the plan:
   • Does it handle empty state?   If not — add AppEmptyState/EmptyState.
   • Does AppBar/header exist?     If not — add it.
 
-PASS 3 — Core component reuse check
-Search for any custom button, text field, or card implementation that duplicates a
-core component in lib/core/widgets/ / src/core/components/ / components/ui/.
-If duplicates exist: merge into the canonical path, delete_file the duplicate.
+PASS 3 — Component-kit reuse check
+Standard controls must come from the platform kit, NOT custom code:
+  • Flutter → shadcn_ui Shad* widgets (ShadButton/ShadInput/ShadCard/…). A
+    hand-rolled or raw-Material button/input/card, or a custom AppButton/AppTextField
+    used for a standard control, is a violation — replace it with the Shad* widget.
+  • Next.js → shadcn/ui components in components/ui/ (@/components/ui/*).
+  • RN → react-native-reusables (components/ui/) when NativeWind is set up, else the
+    pre-built components in src/core/components/.
+Shad* widgets and @/components/ui/* are the canonical components — do NOT flag them as
+duplicates or "merge" them into a custom widget. Only genuine app-SPECIFIC composites
+belong in lib/core/widgets/ / components/{feature}/; if two of THOSE duplicate each
+other, merge into the canonical path and delete_file the duplicate.
 
 Output after design audit:
   "DESIGN AUDIT: Fixed N token violations, N quality floor gaps, N duplicate components"
@@ -1161,18 +1485,22 @@ MANDATORY WORKFLOW
       Are all imports valid and present in pubspec.yaml or package.json?
       Are all referenced classes/functions/widgets actually defined?
 4. Check integration points:
-   - Flutter: new screens must be registered in lib/app.dart (GoRouter or named routes)
+   - Flutter: new screens must be registered in lib/router/app_router.dart (GoRouter)
    - Next.js: new pages must have a link in components/layout/; new packages in package.json
-   - React Native: new screens must be in src/navigation/AppNavigator.tsx
+   - React Native: new screens are route files in app/ (expo-router); a new tab is
+     registered with <Tabs.Screen> in app/(tabs)/_layout.tsx
 5. ── STRUCTURE CHECK (see FOLDER STRUCTURE RULES in your task) ──
    a. For Flutter: verify every new feature has ALL required sub-folders:
       data/datasources/, data/models/, data/repositories/,
       domain/entities/, domain/repositories/, domain/usecases/,
       presentation/bloc/, presentation/pages/, presentation/widgets/
-      And that lib/injection_container.dart, lib/app.dart, lib/main.dart exist.
-   b. For React Native: verify every new feature has ALL required sub-folders:
-      api/, components/, screens/, slice/, types/, hooks/
-      And that src/App.tsx, src/navigation/AppNavigator.tsx exist.
+      And that lib/core/injection.dart, lib/router/app_router.dart, lib/main.dart exist
+      (there is NO lib/app.dart — the root MaterialApp.router is in main.dart).
+   b. For React Native (Expo Router): verify each feature's route files exist under app/
+      (e.g. app/{feature}/index.tsx, [id].tsx) and its logic under
+      src/features/{feature}/ (components/, hooks/, store.ts [Zustand], api.ts [React Query],
+      types.ts). Confirm app/_layout.tsx and app/(tabs)/_layout.tsx exist. There is NO
+      src/App.tsx, src/navigation/, Redux store, or slices — flag those if introduced.
    c. For Next.js: verify pages are in app/(app)/, API routes in app/api/, shared
       components in components/ui/ or components/layout/.
    d. If ANY file is in the WRONG location — move it with write_file to the correct
@@ -1248,7 +1576,7 @@ def _validator_user_msg(
             + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         )
 
-    structure_rules = _UPDATE_STRUCTURE_RULES.get(template_key, "")
+    structure_rules = _update_structure_rules(template_key)
     structure_section = (
         "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "FOLDER STRUCTURE RULES — validate all files are in the right place\n"
@@ -2095,7 +2423,7 @@ def _update_user_msg(
     prefix = _plan_prefix(plan) if plan else ""
 
     # Inject the canonical folder structure so the agent puts files in the right place
-    structure_rules = _UPDATE_STRUCTURE_RULES.get(template_key, "")
+    structure_rules = _update_structure_rules(template_key)
     structure_section = (
         "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "MANDATORY FOLDER STRUCTURE — all new files must follow this\n"

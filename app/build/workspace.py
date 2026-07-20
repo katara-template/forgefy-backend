@@ -197,6 +197,7 @@ def inject_supabase_env(path: Path, template_key: str, url: str, anon_key: str) 
     """
     url_var, key_var = SUPABASE_ENV_VAR_NAMES.get(template_key, SUPABASE_ENV_VAR_NAMES["next"])
     _inject_env_values(path, {url_var: url, key_var: anon_key})
+    ensure_forgefy_sdk_dependency(path, template_key)
 
 
 def inject_neon_env(path: Path, template_key: str, data_api_url: str) -> None:
@@ -207,6 +208,7 @@ def inject_neon_env(path: Path, template_key: str, data_api_url: str) -> None:
     """
     url_var = NEON_ENV_VAR_NAMES.get(template_key, NEON_ENV_VAR_NAMES["next"])
     _inject_env_values(path, {url_var: data_api_url})
+    ensure_forgefy_sdk_dependency(path, template_key)
 
 
 def inject_firebase_env(path: Path, template_key: str, config: dict) -> None:
@@ -223,6 +225,112 @@ def inject_firebase_env(path: Path, template_key: str, config: dict) -> None:
         if config.get(key) is not None
     }
     _inject_env_values(path, values)
+
+
+# ---------------------------------------------------------------------------
+# Forgefy client SDK — deterministic manifest backstop
+# ---------------------------------------------------------------------------
+# The build/update agent is *instructed* to add the Forgefy client SDK whenever
+# a Supabase/Neon database is connected (see app/build/build_agent.py). This is
+# the safety net so a build never breaks because the agent forgot: every time we
+# inject real Supabase/Neon env values we also guarantee the dependency is in
+# the manifest. Scoped to Supabase/Neon only — the SDK does not cover Firebase,
+# so inject_firebase_env deliberately does NOT call this.
+
+_FORGEFY_DART_DEP = ("forgefy_client", "^0.1.0")
+_FORGEFY_NPM_DEP = ("@forgefy/client", "^0.1.0")
+
+
+def ensure_forgefy_sdk_dependency(path: Path, template_key: str) -> None:
+    """Guarantee the Forgefy client SDK is present in the app's manifest.
+
+    Idempotent, and never overrides a version the agent already pinned. Best
+    effort: any failure is logged, never raised, so it can't block a build.
+    """
+    try:
+        if template_key == "flutter":
+            _ensure_pubspec_dependency(path, *_FORGEFY_DART_DEP)
+        else:  # next, react_native — both use package.json
+            _ensure_package_json_dependency(_find_package_root(path), *_FORGEFY_NPM_DEP)
+    except Exception as exc:  # a manifest tweak must never fail the build
+        logger.warning("ensure_forgefy_sdk_dependency(%s) failed: %s", template_key, exc)
+
+
+def _ensure_package_json_dependency(root: Path, pkg: str, version: str) -> None:
+    import json
+
+    manifest = root / "package.json"
+    if not manifest.exists():
+        logger.warning("No package.json under %s — cannot ensure %s", root, pkg)
+        return
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    deps = data.setdefault("dependencies", {})
+    if pkg in deps or pkg in data.get("devDependencies", {}):
+        return  # respect whatever the agent already declared
+    deps[pkg] = version
+    manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    logger.info("Ensured %s@%s in %s", pkg, version, manifest)
+
+
+def _find_pubspec(path: Path) -> Path | None:
+    """pubspec.yaml at the root, or one level down (mirrors _find_package_root)."""
+    if (path / "pubspec.yaml").exists():
+        return path / "pubspec.yaml"
+    for child in sorted(path.iterdir()):
+        if child.is_dir() and not child.name.startswith(".") and (child / "pubspec.yaml").exists():
+            return child / "pubspec.yaml"
+    return None
+
+
+def _ensure_pubspec_dependency(path: Path, pkg: str, version: str) -> None:
+    pubspec = _find_pubspec(path)
+    if pubspec is None:
+        logger.warning("No pubspec.yaml under %s — cannot ensure %s", path, pkg)
+        return
+    lines = pubspec.read_text(encoding="utf-8").splitlines()
+    if any(line.strip().startswith(f"{pkg}:") for line in lines):
+        return  # already declared anywhere — respect it
+    for i, line in enumerate(lines):
+        # Top-level `dependencies:` block (column 0) — not dev_dependencies/overrides.
+        if line.startswith("dependencies:"):
+            lines.insert(i + 1, f"  {pkg}: {version}")
+            pubspec.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            logger.info("Ensured %s: %s in %s", pkg, version, pubspec)
+            return
+    logger.warning("No top-level `dependencies:` block in %s — cannot ensure %s", pubspec, pkg)
+
+
+# ---------------------------------------------------------------------------
+# Forgefy UI SDK — deterministic manifest backstop (feature-flagged)
+# ---------------------------------------------------------------------------
+# forgefy_ui (Flutter) / @forgefy/ui (React web + native) apply to EVERY app of a
+# template, not just DB-connected ones. Gated behind FORGEFY_UI_ENABLED because
+# until the packages are published, force-adding them would break every build's
+# pub-get / npm-install. Flip the env var on after publishing.
+
+_FORGEFY_UI_DART_DEP = ("forgefy_ui", "^0.1.0")
+_FORGEFY_UI_NPM_DEP = ("@forgefy/ui", "^0.1.0")
+
+
+def _ui_enabled() -> bool:
+    from app.config import get_settings
+    return get_settings().FORGEFY_UI_ENABLED
+
+
+def ensure_forgefy_ui_dependency(path: Path, template_key: str) -> None:
+    """Force the Forgefy UI SDK into the manifest — no-op unless FORGEFY_UI_ENABLED
+    is set. Best effort: never raises, so it can't block a build.
+    """
+    if not _ui_enabled():
+        return
+    try:
+        if template_key == "flutter":
+            _ensure_pubspec_dependency(path, *_FORGEFY_UI_DART_DEP)
+        else:  # next, react_native
+            _ensure_package_json_dependency(_find_package_root(path), *_FORGEFY_UI_NPM_DEP)
+    except Exception as exc:  # a manifest tweak must never fail the build
+        logger.warning("ensure_forgefy_ui_dependency(%s) failed: %s", template_key, exc)
+
 
 _NEXT_CONFIG_CANONICAL = """\
 /** @type {import('next').NextConfig} */

@@ -1,0 +1,16 @@
+name: forgefy
+description: Official Dart & Flutter SDK for the Forgefy Developer API — transcripts in, structured product requirements out.
+version: 0.1.0
+repository: https://github.com/forgefy/forgefy
+issue_tracker: https://github.com/forgefy/forgefy/issues
+
+environment:
+  sdk: ^3.0.0
+
+dependencies:
+  http: ^1.2.0
+  crypto: ^3.0.0
+
+dev_dependencies:
+  lints: ^4.0.0
+  test: ^1.25.0
