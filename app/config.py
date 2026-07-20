@@ -138,6 +138,12 @@ class Settings(BaseSettings):
     # Sentry
     SENTRY_DSN: str = ""
 
+    # Forgefy UI SDK — when true, the build/update agents use forgefy_ui (Flutter)
+    # and @forgefy/ui (React web + native) for layout/animation and force those
+    # packages into generated manifests. Keep false until they are published to
+    # pub.dev / npm, else every generated build fails at pub-get / npm-install.
+    FORGEFY_UI_ENABLED: bool = False
+
     @field_validator("REDIS_URL", "CELERY_BROKER_URL", "CELERY_RESULT_BACKEND", mode="before")
     @classmethod
     def fix_rediss_ssl(cls, v: Any) -> Any:

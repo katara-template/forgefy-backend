@@ -213,6 +213,11 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         logger.info("Update agent used %d tokens project=%s", tokens_used, project_id)
         await record_usage(db, user_id, tokens_used, is_update=True)
 
+        # Forgefy UI SDK (layout/animation) — gated by FORGEFY_UI_ENABLED; applies
+        # to every app of this template.
+        from app.build.workspace import ensure_forgefy_ui_dependency
+        ensure_forgefy_ui_dependency(workspace.path, template_key)
+
         # If a database is connected for this project, keep .env in sync with
         # the real values (see app/build/workspace.py) in case the agent
         # rewrote them.

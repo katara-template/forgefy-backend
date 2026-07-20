@@ -772,6 +772,11 @@ async def _run(session_id: str, project_id: str) -> dict:
             )
         logger.info("Build agent used %d tokens session=%s", tokens_used, session_id)
 
+        # Forgefy UI SDK (layout/animation) — gated by FORGEFY_UI_ENABLED; applies
+        # to every app of this template, so it runs before the DB-specific injects.
+        from app.build.workspace import ensure_forgefy_ui_dependency
+        ensure_forgefy_ui_dependency(workspace.path, template_key)
+
         # If a database is already connected for this project, replace the
         # agent's placeholders with the real values (see app/build/workspace.py).
         proj_doc = await db.collection("projects").document(project_id).get()
