@@ -215,8 +215,13 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
 
         # Forgefy UI SDK (layout/animation) — gated by FORGEFY_UI_ENABLED; applies
         # to every app of this template.
-        from app.build.workspace import ensure_forgefy_ui_dependency
+        from app.build.workspace import ensure_forgefy_ui_dependency, stamp_forgefy_signature
         ensure_forgefy_ui_dependency(workspace.path, template_key)
+
+        # Provenance: stamp the Forgefy signature banner into the app's entry file.
+        # Idempotent, so re-running on an already-stamped app is a no-op; this also
+        # backfills the banner into apps built before this feature on their next edit.
+        stamp_forgefy_signature(workspace.path, template_key)
 
         # If a database is connected for this project, keep .env in sync with
         # the real values (see app/build/workspace.py) in case the agent

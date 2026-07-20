@@ -207,6 +207,10 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
     env["CI"] = "true"
     env["WRANGLER_SEND_METRICS"] = "false"
 
+    # Stamp Forgefy SEO provenance meta into the built HTML before it ships.
+    from app.build.workspace import inject_forgefy_seo_meta
+    inject_forgefy_seo_meta(build_dir)
+
     try:
         # Step 1: Ensure the project exists (create if missing)
         create_result = subprocess.run(
@@ -774,8 +778,11 @@ async def _run(session_id: str, project_id: str) -> dict:
 
         # Forgefy UI SDK (layout/animation) — gated by FORGEFY_UI_ENABLED; applies
         # to every app of this template, so it runs before the DB-specific injects.
-        from app.build.workspace import ensure_forgefy_ui_dependency
+        from app.build.workspace import ensure_forgefy_ui_dependency, stamp_forgefy_signature
         ensure_forgefy_ui_dependency(workspace.path, template_key)
+
+        # Provenance: stamp the Forgefy signature banner into the app's entry file.
+        stamp_forgefy_signature(workspace.path, template_key)
 
         # If a database is already connected for this project, replace the
         # agent's placeholders with the real values (see app/build/workspace.py).
