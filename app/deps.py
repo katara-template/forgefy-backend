@@ -120,6 +120,32 @@ async def get_current_user(
 CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
+# Same tokenUrl as _oauth2, but auto_error=False so a missing/invalid token
+# yields None instead of a 401 — for endpoints (like the help assistant) that
+# serve both signed-in and anonymous visitors.
+_oauth2_optional = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
+
+
+async def get_optional_user(
+    token: Annotated[str | None, Depends(_oauth2_optional)],
+    db: DBSession,
+    settings: SettingsDep,
+) -> User | None:
+    """Resolve the current user if a valid token is present, else None.
+
+    Never raises on auth failure — an anonymous visitor is a valid caller here.
+    """
+    if not token:
+        return None
+    try:
+        return await get_current_user(token=token, db=db, settings=settings)
+    except UnauthorizedError:
+        return None
+
+
+OptionalUser = Annotated[User | None, Depends(get_optional_user)]
+
+
 async def get_admin_user(user: CurrentUser) -> User:
     """Require the current user to have is_admin set."""
     if not user.is_admin:

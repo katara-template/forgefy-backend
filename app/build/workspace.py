@@ -332,6 +332,158 @@ def ensure_forgefy_ui_dependency(path: Path, template_key: str) -> None:
         logger.warning("ensure_forgefy_ui_dependency(%s) failed: %s", template_key, exc)
 
 
+# ---------------------------------------------------------------------------
+# Forgefy signature — deterministic provenance / attribution banner
+# ---------------------------------------------------------------------------
+# Every app Forgefy builds carries a friendly, branded banner comment at the top
+# of its entry file. Injected here (NOT via the LLM, which applies it
+# inconsistently), idempotent (skips a file that already has it), and
+# best-effort (never raises — a marketing banner must never break a build).
+
+_SIGNATURE_MARKER = "Built with Forgefy"
+
+# Banner body — no comment syntax; rendered with the right prefix per language.
+# `//` covers Dart, TypeScript and JavaScript, i.e. every template we ship.
+# Edit the copy/links here in one place.
+_SIGNATURE_BODY = (
+    "███████╗ ██████╗ ██████╗  ██████╗ ███████╗███████╗██╗   ██╗",
+    "██╔════╝██╔═══██╗██╔══██╗██╔════╝ ██╔════╝██╔════╝╚██╗ ██╔╝",
+    "█████╗  ██║   ██║██████╔╝██║  ███╗█████╗  █████╗   ╚████╔╝ ",
+    "██╔══╝  ██║   ██║██╔══██╗██║   ██║██╔══╝  ██╔══╝    ╚██╔╝  ",
+    "██║     ╚██████╔╝██║  ██║╚██████╔╝███████╗██║        ██║   ",
+    "╚═╝      ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝        ╚═╝   ",
+    "",
+    "Built with Forgefy — from a single idea (or a meeting) to a real app.",
+    "",
+    "Build your own app   →  https://forgefy.app",
+    "Docs & guides        →  https://forgefy.app/docs",
+    "",
+    "Made with care for makers who move fast.",
+)
+
+# Entry files to stamp, per template — checked in priority order; the first one
+# that exists gets the banner (the app's main entry, not a registration stub).
+_SIGNATURE_TARGETS: dict[str, tuple[str, ...]] = {
+    "flutter": ("lib/main.dart",),
+    "react_native": (
+        "app/_layout.tsx", "app/_layout.js",  # Expo Router
+        "src/app/_layout.tsx",
+        "App.tsx", "App.js", "App.jsx",       # classic RN
+        "index.tsx", "index.js",
+    ),
+    "next": (
+        "app/layout.tsx", "app/layout.js",    # App Router
+        "src/app/layout.tsx", "src/app/layout.js",
+        "pages/_app.tsx", "pages/_app.js",    # Pages Router
+        "src/pages/_app.tsx", "src/pages/_app.js",
+    ),
+}
+
+
+def _render_signature(prefix: str = "//") -> str:
+    return "\n".join(f"{prefix} {line}".rstrip() for line in _SIGNATURE_BODY)
+
+
+def _is_leading_directive(line: str) -> bool:
+    """True for a JS/TS module directive that must stay at the very top of the file."""
+    s = line.strip().rstrip(";").strip().strip('"').strip("'")
+    return s in ("use client", "use server", "use strict")
+
+
+def _stamp_file(file: Path) -> bool:
+    """Insert the banner at the top of one file. Returns True if it wrote."""
+    text = file.read_text(encoding="utf-8")
+    if _SIGNATURE_MARKER in text:
+        return False  # already stamped — stay idempotent
+    banner = _render_signature("//")
+    lines = text.split("\n")
+    # Keep a shebang or a leading "use client"/"use server" directive on line 1.
+    insert_at = 0
+    if lines:
+        first = lines[0].strip()
+        if first.startswith("#!") or _is_leading_directive(first):
+            insert_at = 1
+    new_lines = lines[:insert_at] + [banner, ""] + lines[insert_at:]
+    file.write_text("\n".join(new_lines), encoding="utf-8")
+    return True
+
+
+def _signature_base(path: Path, template_key: str) -> Path:
+    """Directory the entry-file paths are resolved against (handles subdir projects)."""
+    if template_key == "flutter":
+        pubspec = _find_pubspec(path)
+        return pubspec.parent if pubspec else path
+    return _find_package_root(path)
+
+
+def stamp_forgefy_signature(path: Path, template_key: str) -> None:
+    """Add the Forgefy provenance banner to the app's entry file.
+
+    Deterministic, idempotent and best-effort: any failure is logged, never
+    raised, so the banner can never block a build.
+    """
+    try:
+        base = _signature_base(path, template_key)
+        for rel in _SIGNATURE_TARGETS.get(template_key, ()):  # unknown template → no-op
+            entry = base / rel
+            if entry.is_file():
+                wrote = _stamp_file(entry)
+                logger.info(
+                    "Forgefy signature %s → %s", "added" if wrote else "already present", entry
+                )
+                return
+        logger.info("Forgefy signature: no entry file matched under %s (%s)", base, template_key)
+    except Exception as exc:  # a banner must never fail the build
+        logger.warning("stamp_forgefy_signature(%s) failed: %s", template_key, exc)
+
+
+# ---------------------------------------------------------------------------
+# Forgefy SEO metadata — stamped into deployed web builds
+# ---------------------------------------------------------------------------
+# Search engines index the deployed *.pages.dev HTML, so Forgefy provenance meta
+# tags are injected into the BUILT HTML (not the source). This covers every web
+# template uniformly (Next.js, React Native web) and can't be dropped by the LLM.
+# Idempotent (marker-guarded) and best-effort — never raises, so it can't block
+# a deploy, and is a no-op for non-web artifacts (e.g. a Flutter APK file).
+
+_SEO_MARKER = "forgefy:seo"
+
+_SEO_META_BLOCK = (
+    "\n    <!-- forgefy:seo — provenance metadata added by Forgefy -->"
+    '\n    <meta name="generator" content="Forgefy (https://forgefy.app)">'
+    '\n    <meta name="forgefy" content="Built with Forgefy — https://forgefy.app">'
+    '\n    <link rel="author" href="https://forgefy.app">\n  '
+)
+
+
+def inject_forgefy_seo_meta(build_dir: Path) -> int:
+    """Insert Forgefy SEO meta tags into every HTML file's <head> in a web build.
+
+    Returns the number of files stamped. Idempotent (skips files already carrying
+    the marker) and best-effort — a no-op for a non-directory artifact (e.g. an
+    APK) and never raises, so it can never block a deploy.
+    """
+    try:
+        if not build_dir or not build_dir.is_dir():
+            return 0
+        stamped = 0
+        for html in build_dir.rglob("*.html"):
+            try:
+                text = html.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue  # skip binary/unreadable files without failing the deploy
+            if _SEO_MARKER in text or "</head>" not in text:
+                continue  # already stamped, or no <head> to inject into
+            html.write_text(text.replace("</head>", _SEO_META_BLOCK + "</head>", 1), encoding="utf-8")
+            stamped += 1
+        if stamped:
+            logger.info("Injected Forgefy SEO meta into %d HTML file(s) under %s", stamped, build_dir)
+        return stamped
+    except Exception as exc:  # SEO meta must never block a deploy
+        logger.warning("inject_forgefy_seo_meta(%s) failed: %s", build_dir, exc)
+        return 0
+
+
 _NEXT_CONFIG_CANONICAL = """\
 /** @type {import('next').NextConfig} */
 const nextConfig = {
