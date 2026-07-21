@@ -43,6 +43,7 @@ NAMING = "naming"         # app details → 4-8 char brand name (tiny)
 CLASSIFY = "classify"     # yes/no + reason (tiny)
 PLAN = "plan"             # build execution plan (reasoning)
 CODE = "code"             # code generation / fixes (coding + tool use)
+ASSISTANT = "assistant"   # conversational help/guidance chat (fast, general)
 
 # Free chains. Ordering is deliberate — first entry is the best fit for the
 # task, the rest are progressively weaker but keep the pipeline alive.
@@ -97,6 +98,16 @@ _FREE_ROUTES: dict[str, list[str]] = {
         "cohere/north-mini-code:free",
         "nvidia/nemotron-3-super-120b-a12b:free",
     ],
+    # A help assistant is a latency-sensitive conversation: users wait on every
+    # turn, so favour fast responders over the slow heavyweight reasoners.
+    # gpt-oss answers in ~5s; the others keep it alive without going near the
+    # 25-35s Nemotron-Ultra latencies.
+    ASSISTANT: [
+        "openai/gpt-oss-20b:free",
+        "qwen/qwen3-next-80b-a3b-instruct:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+    ],
 }
 
 # Paid fallbacks, appended only when OPENROUTER_ALLOW_PAID is set. All support
@@ -110,6 +121,7 @@ _PAID_ROUTES: dict[str, list[str]] = {
     CLASSIFY: ["google/gemini-2.5-flash", "deepseek/deepseek-chat"],
     PLAN: ["deepseek/deepseek-r1", "google/gemini-2.5-flash"],
     CODE: ["qwen/qwen3-coder", "deepseek/deepseek-chat"],
+    ASSISTANT: ["google/gemini-2.5-flash", "deepseek/deepseek-chat"],
 }
 
 # Models that accept response_format={"type":"json_object"}. For the rest we
