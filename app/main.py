@@ -14,6 +14,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.v1.router import router as api_v1_router
+from app.api.ws.assistant import router as ws_assistant_router
 from app.api.ws.build_logs import router as ws_build_logs_router
 from app.api.ws.projects import router as ws_projects_router
 from app.api.ws.sessions import router as ws_sessions_router
@@ -165,6 +166,7 @@ def create_app() -> FastAPI:
     app.include_router(ws_projects_router)
     app.include_router(ws_build_logs_router)
     app.include_router(ws_user_events_router)
+    app.include_router(ws_assistant_router)
     # default route for sanity check    
     @app.get("/", tags=["ops"], summary="Sanity check")
     async def root() -> dict[str, str]:

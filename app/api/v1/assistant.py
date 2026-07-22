@@ -182,10 +182,30 @@ def _recent_history(messages: list[dict]) -> str:
 
 
 def _build_system_prompt(
-    *, authed: bool, context: str, memory: list[str], history: str, page: str | None
+    *,
+    authed: bool,
+    context: str,
+    memory: list[str],
+    history: str,
+    page: str | None,
+    build_mode: bool = False,
 ) -> str:
     page_block = f'\nThe user is currently on the "{page}" page.' if page else ""
     history_block = f"\n\nThis thread so far:\n{history}" if history else ""
+    build_block = (
+        """
+
+BUILD MODE IS ON
+The user wants to BUILD an app. Treat their message as an app idea.
+- If essential details are missing (what the app does, its main features, or who
+  it's for), ask ONE short, friendly clarifying question and keep action.type
+  "none". Ask at most one or two questions total — don't interrogate.
+- As soon as you have a clear picture, set action.type "build_app" with a refined
+  1-3 sentence description, and say in "response" that you're starting the build.
+- Lean toward building: a single clear sentence of intent is enough to start."""
+        if build_mode and authed
+        else ""
+    )
 
     if authed:
         account_block = f"""THE SIGNED-IN USER'S ACCOUNT (ground answers in this — be specific, not generic):
@@ -250,7 +270,7 @@ THE DASHBOARD (use these exact routes when you link somewhere)
 
 {account_block}{page_block}{history_block}
 
-{auth_rules}
+{auth_rules}{build_block}
 
 YOUR JOB
 Answer the question or guide the user to their next step. Keep replies short
@@ -363,13 +383,11 @@ def _sanitize_client_history(raw: list[dict] | None) -> list[dict]:
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
-@router.post("/chat", response_model=AssistantChatResponse)
-async def assistant_chat(
-    body: AssistantChatRequest,
-    db: DBSession,
-    user: OptionalUser,
-) -> AssistantChatResponse:
-    """Answer a help question within a thread. Anonymous callers are stateless."""
+async def process_chat(db, user, body: AssistantChatRequest) -> AssistantChatResponse:
+    """Core chat logic shared by the HTTP endpoint and the WebSocket channel.
+
+    `user` is a User or None (anonymous). Anonymous callers are stateless.
+    """
     authed = user is not None
     message = body.message.strip()
     if not message:
@@ -398,7 +416,12 @@ async def assistant_chat(
         history = _recent_history(_sanitize_client_history(body.history))
 
     system = _build_system_prompt(
-        authed=authed, context=context, memory=memory, history=history, page=body.page
+        authed=authed,
+        context=context,
+        memory=memory,
+        history=history,
+        page=body.page,
+        build_mode=(body.mode == "build"),
     )
 
     try:
@@ -452,6 +475,16 @@ async def assistant_chat(
         authenticated=authed,
         conversation_id=cid,
     )
+
+
+@router.post("/chat", response_model=AssistantChatResponse)
+async def assistant_chat(
+    body: AssistantChatRequest,
+    db: DBSession,
+    user: OptionalUser,
+) -> AssistantChatResponse:
+    """Answer a help question within a thread (HTTP). See also /ws/assistant/chat."""
+    return await process_chat(db, user, body)
 
 
 @router.post("/build", response_model=AssistantBuildResponse)

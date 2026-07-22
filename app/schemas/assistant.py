@@ -23,6 +23,9 @@ class AssistantChatRequest(BaseModel):
     # Which conversation thread this message belongs to (signed-in users). When
     # omitted, a new thread is created and its id is returned on the response.
     conversation_id: str | None = None
+    # UI mode: "build" biases the assistant to treat the message as an app idea —
+    # asking clarifying questions, then emitting a build_app action. Default chat.
+    mode: str | None = None
 
 
 class AssistantLink(BaseModel):

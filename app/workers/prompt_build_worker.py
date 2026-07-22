@@ -23,12 +23,31 @@ from app.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
+# Ways a user spells out a name in a build prompt: "called X", "named X",
+# "call it X", 'app called "X"'. Captures a single 3-24 char alphanumeric token.
+_EXPLICIT_NAME_PATTERNS = (
+    re.compile(r'\b(?:called|named)\s+["\']?([A-Za-z][A-Za-z0-9]{2,23})', re.IGNORECASE),
+    re.compile(r'\b(?:call|name)\s+it\s+["\']?([A-Za-z][A-Za-z0-9]{2,23})', re.IGNORECASE),
+)
 
-async def _generate_blueprint(db, session_id: str, description: str) -> dict:
-    """Build a blueprint JSON from a prompt, reusing the meeting-path helpers."""
+
+def _explicit_name(description: str) -> str:
+    """Return a name the user spelled out in the prompt, or "" if none."""
+    for pattern in _EXPLICIT_NAME_PATTERNS:
+        match = pattern.search(description)
+        if match:
+            return match.group(1)
+    return ""
+
+
+async def _generate_blueprint(db, session_id: str, description: str, log_fn) -> dict:
+    """Build a blueprint JSON from a prompt, reusing the meeting-path helpers.
+
+    Emits granular progress via log_fn so the assistant can stream each phase to
+    the user over the build-logs WebSocket.
+    """
     from app.build.blueprint_generator import (
         BlueprintAggregator,
-        _compact_name,
         _detect_platform,
         _name_from_description,
     )
@@ -46,19 +65,23 @@ async def _generate_blueprint(db, session_id: str, description: str) -> dict:
         "origin": "prompt",
     }
 
+    log_fn("info", "Outlining the core features…")
     json_output["features"] = await agg._derive_features(description)
     json_output["requirements_count"] = len(json_output["features"])
 
-    raw_name = _name_from_description(description)
-    compacted = _compact_name(raw_name) if raw_name else ""
-    if not compacted:
-        compacted = await agg._infer_app_name(json_output)
-    json_output["app_name"] = compacted or "Forge"
+    log_fn("info", "Naming your app…")
+    # Honour a name the user spelled out in the prompt ("…called FitTrack"), then
+    # a name stated in the description ("FitTrack helps…"); otherwise let the AI
+    # name generator invent a short brand name.
+    name = _explicit_name(description) or _name_from_description(description)
+    json_output["app_name"] = name[:30] or await agg._infer_app_name(json_output) or "Forge"
 
+    log_fn("info", "Designing the look & feel…")
     json_output["design_system"] = await agg._generate_design_system(json_output)
 
     platform = _detect_platform(json_output)
     json_output["template"] = "next" if platform == "web" else "flutter"
+    log_fn("info", f"Building as a {'web' if platform == 'web' else 'mobile'} app.")
     return json_output
 
 
@@ -77,8 +100,9 @@ async def _build_from_prompt(
 
     try:
         log_fn("started", "Designing your app…")
-        json_output = await _generate_blueprint(db, session_id, description)
+        json_output = await _generate_blueprint(db, session_id, description, log_fn)
 
+        log_fn("info", "Assembling the blueprint…")
         now = datetime.now(UTC)
         blueprint_id = str(uuid.uuid4())
         await db.collection("blueprints").document(blueprint_id).set({
@@ -122,6 +146,9 @@ async def _build_from_prompt(
             "updated_at": now,
         })
 
+        # Navigation signal for the assistant widget — the blueprint now exists.
+        log_fn("blueprint_ready", "Blueprint ready.")
+
         if needs_db:
             log_fn("info", "This app needs a database — connect one to continue.")
             logger.info(
@@ -130,7 +157,7 @@ async def _build_from_prompt(
             )
             return {"withheld_for_db": True, "project_id": project_id}
 
-        log_fn("info", "Blueprint ready — starting the build…")
+        log_fn("info", "Starting the build…")
         from app.workers.build_worker import run_build
         run_build.apply_async(args=[session_id, project_id], queue="build")
         logger.info("Prompt build dispatched session=%s project=%s", session_id, project_id)
