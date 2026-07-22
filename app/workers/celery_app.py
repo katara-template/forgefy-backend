@@ -20,6 +20,7 @@ celery_app = Celery(
         "app.workers.blueprint_worker",
         "app.workers.build_worker",
         "app.workers.update_worker",
+        "app.workers.prompt_build_worker",
         "app.workers.cleanup_worker",
     ],
 )
@@ -40,6 +41,7 @@ celery_app.conf.update(
         "app.workers.blueprint_worker.*": {"queue": "meeting.extract"},
         "app.workers.build_worker.*": {"queue": "build"},
         "app.workers.update_worker.*": {"queue": "build"},
+        "app.workers.prompt_build_worker.*": {"queue": "build"},
         "app.workers.cleanup_worker.*": {"queue": "build"},
     },
     beat_schedule={

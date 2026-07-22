@@ -219,6 +219,78 @@ class TestSignedInChat:
         assert resp.status_code == 200
         assert "trouble" in resp.json()["response"].lower()
 
+    async def test_build_app_action_passes_through_with_description(
+        self, signed_in: AsyncClient, mock_db: MagicMock
+    ) -> None:
+        _doc(mock_db, None)
+        ai = {
+            "response": "Building your fitness app now.",
+            "action": {
+                "type": "build_app",
+                "description": "A fitness tracking app for logging workouts and progress.",
+            },
+        }
+        with patch("app.api.v1.assistant.call_openrouter", return_value=ai):
+            resp = await signed_in.post(
+                "/api/v1/assistant/chat", json={"message": "build me a fitness app"}
+            )
+
+        assert resp.status_code == 200
+        action = resp.json()["action"]
+        assert action["type"] == "build_app"
+        assert "fitness" in action["description"]
+
+    async def test_build_app_without_description_is_dropped(
+        self, signed_in: AsyncClient, mock_db: MagicMock
+    ) -> None:
+        _doc(mock_db, None)
+        ai = {"response": "What should the app do?", "action": {"type": "build_app"}}
+        with patch("app.api.v1.assistant.call_openrouter", return_value=ai):
+            resp = await signed_in.post(
+                "/api/v1/assistant/chat", json={"message": "build me an app"}
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["action"] is None
+
+
+class TestBuildEndpoint:
+    async def test_build_creates_session_project_and_dispatches(
+        self, signed_in: AsyncClient, mock_db: MagicMock
+    ) -> None:
+        with patch("app.api.v1.assistant.dispatch") as mock_dispatch:
+            resp = await signed_in.post(
+                "/api/v1/assistant/build",
+                json={"description": "A recipe box app to save and organize recipes."},
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["project_id"]
+        assert data["session_id"]
+        # Session + project stubs written, worker dispatched.
+        _set_call(mock_db).assert_called()
+        mock_dispatch.assert_awaited_once()
+        # Dispatched with (session_id, project_id, description, user_id).
+        args = mock_dispatch.await_args.kwargs.get("args") or mock_dispatch.await_args.args[1]
+        assert data["session_id"] in args and data["project_id"] in args
+
+    async def test_build_rejects_too_short_description(
+        self, signed_in: AsyncClient, mock_db: MagicMock
+    ) -> None:
+        with patch("app.api.v1.assistant.dispatch") as mock_dispatch:
+            resp = await signed_in.post("/api/v1/assistant/build", json={"description": "hi"})
+
+        assert resp.status_code == 422
+        mock_dispatch.assert_not_called()
+
+    async def test_build_requires_auth(self, client: AsyncClient) -> None:
+        resp = await client.post(
+            "/api/v1/assistant/build",
+            json={"description": "A note-taking app with tags and search."},
+        )
+        assert resp.status_code == 401
+
 
 class TestConversations:
     async def test_list_returns_user_threads(
