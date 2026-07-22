@@ -17,16 +17,25 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter
 
 from app.ai.openrouter import ASSISTANT, OpenRouterError, call_openrouter
-from app.core.exceptions import ForbiddenError, NotFoundError, UnauthorizedError
+from app.core.dispatch import dispatch
+from app.core.exceptions import (
+    ForbiddenError,
+    NotFoundError,
+    UnauthorizedError,
+    ValidationError,
+)
 from app.deps import DBSession, OptionalUser
 from app.schemas.assistant import (
     AssistantAction,
+    AssistantBuildRequest,
+    AssistantBuildResponse,
     AssistantChatRequest,
     AssistantChatResponse,
     AssistantLink,
@@ -63,7 +72,7 @@ _ALLOWED_LINK_ROOTS = frozenset(
 _VALID_PLATFORMS = frozenset({"meet", "zoom", "teams", "physical"})
 
 # Actions the model may request. Anything else collapses to "none".
-_VALID_ACTIONS = frozenset({"none", "start_session", "auth_required"})
+_VALID_ACTIONS = frozenset({"none", "start_session", "build_app", "auth_required"})
 
 # How much state to carry. History is capped so each thread doc stays small and
 # the prompt bounded; memory is the distilled long-term layer.
@@ -173,10 +182,30 @@ def _recent_history(messages: list[dict]) -> str:
 
 
 def _build_system_prompt(
-    *, authed: bool, context: str, memory: list[str], history: str, page: str | None
+    *,
+    authed: bool,
+    context: str,
+    memory: list[str],
+    history: str,
+    page: str | None,
+    build_mode: bool = False,
 ) -> str:
     page_block = f'\nThe user is currently on the "{page}" page.' if page else ""
     history_block = f"\n\nThis thread so far:\n{history}" if history else ""
+    build_block = (
+        """
+
+BUILD MODE IS ON
+The user wants to BUILD an app. Treat their message as an app idea.
+- If essential details are missing (what the app does, its main features, or who
+  it's for), ask ONE short, friendly clarifying question and keep action.type
+  "none". Ask at most one or two questions total — don't interrogate.
+- As soon as you have a clear picture, set action.type "build_app" with a refined
+  1-3 sentence description, and say in "response" that you're starting the build.
+- Lean toward building: a single clear sentence of intent is enough to start."""
+        if build_mode and authed
+        else ""
+    )
 
     if authed:
         account_block = f"""THE SIGNED-IN USER'S ACCOUNT (ground answers in this — be specific, not generic):
@@ -198,6 +227,16 @@ WHAT YOU REMEMBER ABOUT THIS USER (from past conversations):
 - Once you have everything, set action.type = "start_session" with
   action.platform and action.meeting_url filled in. The app creates it, joins the
   meeting, and opens it; your "response" should say you're starting it.
+
+CAPABILITIES — BUILDING AN APP FROM A PROMPT
+- You can BUILD A FULL APP directly from the user's idea — no meeting needed.
+  Forgefy generates a blueprint (features + design) and builds it automatically.
+- When the user asks you to build/create/make an app, set action.type = "build_app"
+  and put a clear 1-3 sentence spec of the app in action.description (what it
+  does and who it's for). In "response", say you're starting the build.
+- If the idea is too vague to build (e.g. "build me something cool"), ask ONE
+  short question to pin down what the app should do, and keep action.type "none".
+  Don't over-interrogate — a single clear sentence of intent is enough to start.
 - To point the user at one of their apps, link to that project's own route (the
   "route" field in the account data above)."""
     else:
@@ -231,7 +270,7 @@ THE DASHBOARD (use these exact routes when you link somewhere)
 
 {account_block}{page_block}{history_block}
 
-{auth_rules}
+{auth_rules}{build_block}
 
 YOUR JOB
 Answer the question or guide the user to their next step. Keep replies short
@@ -241,13 +280,14 @@ OUTPUT — reply with ONLY a JSON object, no prose around it:
 {{
   "response": "your reply to show the user (plain text or light markdown)",
   "links": [{{"label": "Open Billing", "to": "/billing"}}],
-  "action": {{"type": "none", "platform": null, "meeting_url": null}},
+  "action": {{"type": "none", "platform": null, "meeting_url": null, "description": null}},
   "remember": ["a durable fact worth recalling next time"]
 }}
 
 RULES
 - "links": 0-3 items. "to" MUST be one of the routes listed above. No external URLs.
-- "action.type": one of "none", "start_session", "auth_required". Use "none" unless a real action is intended.
+- "action.type": one of "none", "start_session", "build_app", "auth_required". Use "none" unless a real action is intended.
+- For "build_app", put the app spec in "action.description".
 - "remember": only when the user reveals something durable about their goals, preferences, or projects; else []. Never store secrets, tokens, or passwords.
 - If you don't know something, say so plainly rather than inventing details."""
 
@@ -290,6 +330,9 @@ def _parse_action(raw: object, *, authed: bool) -> AssistantAction:
         url = str(raw.get("meeting_url") or "").strip()
         if url:
             action.meeting_url = url[:500]
+        desc = str(raw.get("description") or "").strip()
+        if desc:
+            action.description = desc[:2000]
 
     if not authed and action.type != "none":
         # Privileged intent from an anonymous visitor → gate behind sign-in.
@@ -304,6 +347,9 @@ def _parse_action(raw: object, *, authed: bool) -> AssistantAction:
             action.platform != "physical" and not action.meeting_url
         ):
             action.type = "none"
+    # A build needs a real spec — without one the assistant should have asked.
+    elif action.type == "build_app" and not (action.description and len(action.description) >= 8):
+        action.type = "none"
     return action
 
 
@@ -337,13 +383,11 @@ def _sanitize_client_history(raw: list[dict] | None) -> list[dict]:
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
-@router.post("/chat", response_model=AssistantChatResponse)
-async def assistant_chat(
-    body: AssistantChatRequest,
-    db: DBSession,
-    user: OptionalUser,
-) -> AssistantChatResponse:
-    """Answer a help question within a thread. Anonymous callers are stateless."""
+async def process_chat(db, user, body: AssistantChatRequest) -> AssistantChatResponse:
+    """Core chat logic shared by the HTTP endpoint and the WebSocket channel.
+
+    `user` is a User or None (anonymous). Anonymous callers are stateless.
+    """
     authed = user is not None
     message = body.message.strip()
     if not message:
@@ -372,7 +416,12 @@ async def assistant_chat(
         history = _recent_history(_sanitize_client_history(body.history))
 
     system = _build_system_prompt(
-        authed=authed, context=context, memory=memory, history=history, page=body.page
+        authed=authed,
+        context=context,
+        memory=memory,
+        history=history,
+        page=body.page,
+        build_mode=(body.mode == "build"),
     )
 
     try:
@@ -426,6 +475,82 @@ async def assistant_chat(
         authenticated=authed,
         conversation_id=cid,
     )
+
+
+@router.post("/chat", response_model=AssistantChatResponse)
+async def assistant_chat(
+    body: AssistantChatRequest,
+    db: DBSession,
+    user: OptionalUser,
+) -> AssistantChatResponse:
+    """Answer a help question within a thread (HTTP). See also /ws/assistant/chat."""
+    return await process_chat(db, user, body)
+
+
+@router.post("/build", response_model=AssistantBuildResponse)
+async def assistant_build(
+    body: AssistantBuildRequest,
+    db: DBSession,
+    user: OptionalUser,
+) -> AssistantBuildResponse:
+    """Start a prompt → blueprint → build run; returns the new project's id.
+
+    Creates a prompt-originated session (already in PROCESSING) plus a project
+    stub the UI can open immediately, then hands off to the prompt build worker,
+    which designs the blueprint and dispatches the normal build pipeline.
+    """
+    if user is None:
+        raise UnauthorizedError("Sign in to build an app")
+
+    description = body.description.strip()
+    if len(description) < 8:
+        raise ValidationError("Please describe the app you'd like to build in a sentence or two.")
+
+    from app.core.usage import check_not_over_limit
+    from app.db.models.enums import Platform, SessionStatus
+
+    uid = str(user.id)
+    await check_not_over_limit(db, uid)
+
+    now = datetime.now(UTC)
+    session_id = str(uuid.uuid4())
+    project_id = str(uuid.uuid4())
+
+    await db.collection("sessions").document(session_id).set({
+        "user_id": uid,
+        "status": SessionStatus.PROCESSING.value,
+        "platform": Platform.PHYSICAL.value,
+        "meeting_url": None,
+        "origin": "prompt",
+        "prompt": description[:2000],
+        "start_time": None,
+        "end_time": None,
+        "created_at": now,
+    })
+
+    stub_name = re.sub(r"[^a-zA-Z0-9._-]", "-", description[:40]).strip("-").lower() or "new-app"
+    await db.collection("projects").document(project_id).set({
+        "owner_id": uid,
+        "session_id": session_id,
+        "blueprint_id": None,
+        "app_name": stub_name,
+        "template_key": "next",
+        "repo_full_name": "",
+        "github_url": "",
+        "preview_url": None,
+        "artifact_url": None,
+        "is_updating": True,
+        "build_error": None,
+        "blueprint_context": {"app_description": description},
+        "created_at": now,
+        "updated_at": now,
+    })
+
+    from app.workers.prompt_build_worker import build_from_prompt
+    await dispatch(build_from_prompt, args=[session_id, project_id, description, uid], queue="build")
+    logger.info("Prompt build queued user=%s project=%s", uid, project_id)
+
+    return AssistantBuildResponse(project_id=project_id, session_id=session_id)
 
 
 @router.get("/conversations", response_model=ConversationListResponse)

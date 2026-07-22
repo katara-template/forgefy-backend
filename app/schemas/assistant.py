@@ -23,6 +23,9 @@ class AssistantChatRequest(BaseModel):
     # Which conversation thread this message belongs to (signed-in users). When
     # omitted, a new thread is created and its id is returned on the response.
     conversation_id: str | None = None
+    # UI mode: "build" biases the assistant to treat the message as an app idea —
+    # asking clarifying questions, then emitting a build_app action. Default chat.
+    mode: str | None = None
 
 
 class AssistantLink(BaseModel):
@@ -38,13 +41,16 @@ class AssistantAction(BaseModel):
     - "none": nothing to do (pure advice).
     - "start_session": create + join a meeting session. platform/meeting_url are
       filled once known; the app only receives this when it can create outright.
+    - "build_app": build a full app from `description`. The UI calls
+      POST /assistant/build and navigates to the new project's page.
     - "auth_required": the visitor asked for something that needs an account;
       the UI shows the inline sign-in / register panel.
     """
 
-    type: str = "none"  # "none" | "start_session" | "auth_required"
+    type: str = "none"  # "none" | "start_session" | "build_app" | "auth_required"
     platform: str | None = None  # "meet" | "zoom" | "teams" | "physical"
     meeting_url: str | None = None
+    description: str | None = None  # app spec, for "build_app"
 
 
 class AssistantChatResponse(BaseModel):
@@ -76,3 +82,12 @@ class ConversationDetail(BaseModel):
     id: str
     title: str
     messages: list[dict] = []
+
+
+class AssistantBuildRequest(BaseModel):
+    description: str
+
+
+class AssistantBuildResponse(BaseModel):
+    project_id: str
+    session_id: str
