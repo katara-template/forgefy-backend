@@ -91,11 +91,16 @@ def _cors_headers(request: Request) -> dict[str, str]:
         if isinstance(app, CORSMiddleware):
             if app.allow_all_origins or origin in app.allow_origins:
                 allow = origin if not app.allow_all_origins else "*"
-                return {
+                headers = {
                     "Access-Control-Allow-Origin": allow,
-                    "Access-Control-Allow-Credentials": "true",
                     "Vary": "Origin",
                 }
+                # Mirror the middleware rather than hardcoding "true" — under a
+                # wildcard allowlist credentials are deliberately off, and error
+                # responses must not advertise what normal responses refuse.
+                if app.allow_credentials:
+                    headers["Access-Control-Allow-Credentials"] = "true"
+                return headers
             return {}
         app = getattr(app, "app", None)
     return {}

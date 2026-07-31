@@ -19,8 +19,15 @@ ENV/
 
 # Environment — never commit secrets
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+
+# Celery beat runtime state (a shelve DB rewritten on every scheduler tick).
+# These are currently tracked — run once to stop the churn:
+#   git rm --cached celerybeat-schedule*
+celerybeat-schedule
+celerybeat-schedule-shm
+celerybeat-schedule-wal
 
 # Firebase service account — never commit
 firebase-credentials.json

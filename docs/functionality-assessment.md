@@ -1,112 +1,118 @@
 # Forgefy — Functionality Assessment
 
-**Date:** 2026-05-27  
-**Overall Score: ~58% functional end-to-end**
+**Date:** 2026-07-30
+**Overall Score: ~86% launch-ready** (was ~58% on 2026-05-27)
+
+Scores below reflect what is **verified in code and by running the test suites**.
+Anything depending on a live third-party call is marked ⚠️ **unverified** — those
+need real credentials and a manual end-to-end run, not a code read.
+
+---
+
+## What changed since the 2026-05-27 assessment
+
+All five roadmap priorities from the previous revision are implemented:
+
+| Roadmap item | Where |
+|---|---|
+| Build error surfacing | `app/core/build_errors.py` + `build_error` on project docs |
+| Build log streaming | `app/api/ws/build_logs.py` |
+| Recall.ai bot (Meet/Zoom/Teams) | `app/connectors/recall.py`, routed via `factory.py` |
+| Blueprint inline editing | `PATCH /api/v1/voxa/blueprint/{id}` (`app/api/v1/blueprints.py`) |
+| Deepgram reconnection | backoff in `app/transcription/deepgram_client.py`, `deepgram_live.py` |
+
+Fixed in this revision:
+
+- **CORS** — `create_app()` hardcoded `allow_origins=["*"]` with
+  `allow_credentials=True`, ignoring the documented `CORS_ORIGINS` setting.
+  Because Starlette reflects the caller's `Origin` when wildcard and credentials
+  are combined, any site could issue credentialed cross-origin requests. Now
+  driven by `CORS_ORIGINS`; a literal `*` forces credentials off. Pinned by
+  `tests/test_cors.py`.
+- **Admin dashboard Settings page** — was entirely local React state, silently
+  discarding every change. Build model and API keys are now wired to the real
+  endpoints. See "Known gaps" for the two sections that were removed.
+- **CI was red on both repos** — 5 ruff errors in the backend; 2 stale frontend
+  tests in `forgefy-meeting-to-app` (they predated `ensureFreshToken()`, whose
+  extra `fetch` shifted their mock chains). Both green now.
+- **`forgefy-dashboard` had no CI and no typecheck script** — both added.
 
 ---
 
 ## Feature Breakdown
 
-| Feature | % | Reason |
+| Feature | % | Notes |
 |---|---|---|
-| **Auth (register / login / Google)** | 90% | Solid JWT + Firebase impl. Missing: email verify, password reset |
-| **Dashboard UI** | 85% | WebSocket updates work, session + project cards render correctly |
-| **Session creation (physical upload)** | 75% | Upload → transcription → blueprint path is complete. Deepgram needs live test |
-| **Session creation (Meet / Zoom / Teams)** | 40% | Recall.ai connector factory exists but whether the bot actually joins is unverified |
-| **Transcription (Deepgram)** | 60% | Architecture is correct but no reconnection logic if WebSocket drops mid-meeting |
-| **Feature extraction pipeline** | 55% | LangGraph chain exists but silent fallback synthesis means bad blueprints pass through quietly |
-| **Blueprint generation + approval** | 80% | Aggregation logic is solid; only gap is no inline editing — user can't fix a wrong blueprint |
-| **Build agent (file writing)** | 65% | Claude tool loop works but 60-iteration hard limit means complex apps may get "Agent reached iteration limit" with partial code |
+| **Auth (register / login / Google)** | 90% | JWT + Firebase. Missing: email verify, password reset |
+| **Dashboard UI** | 85% | WebSocket updates and session/project cards work |
+| **Session creation (physical upload)** | 80% | Upload → transcription → blueprint complete. ⚠️ Deepgram needs a live run |
+| **Session creation (Meet / Zoom / Teams)** | 65% | Recall.ai wired for all three. ⚠️ Bot actually joining is unverified |
+| **Transcription (Deepgram)** | 75% | Reconnection with backoff now implemented. ⚠️ Live stream unverified |
+| **Feature extraction pipeline** | 70% | LangGraph chain + short-fragment guard. Silent fallback synthesis still passes weak blueprints through |
+| **Blueprint generation + approval** | 90% | Aggregation solid; inline editing now available |
+| **Build agent (file writing)** | 70% | Claude tool loop works; 60-iteration cap can still truncate very large apps |
 | **GitHub push** | 85% | Standard REST API, token handling correct |
-| **Cloudflare Pages deploy (Next.js)** | 60% | Code is right but depends on valid credentials + `next.config.js` patch not being fragile |
-| **Appetize preview (Flutter)** | 55% | APK build in Docker is the risky step — needs real Flutter SDK warm-up time |
-| **Expo Snack preview (React Native)** | 45% | Expo Snack API is flaky by nature; file size limits will trip up large projects |
-| **Project editor (prompt → update)** | 65% | Update agent runs, GitHub push works, but zero feedback to user if it fails silently |
-| **GitHub OAuth linking** | 70% | Flow correctly implemented; needs real `GITHUB_CLIENT_ID/SECRET` to test |
+| **Cloudflare Pages deploy (Next.js)** | 60% | ⚠️ Depends on valid credentials + `next.config.js` patch holding |
+| **Appetize preview (Flutter)** | 55% | ⚠️ APK build in Docker is the risky step |
+| **Expo Snack preview (React Native)** | 45% | ⚠️ Expo Snack API is flaky; file size limits bite on large projects |
+| **Project editor (prompt → update)** | 80% | Update agent + GitHub push; failures now surface via `build_error` |
+| **GitHub OAuth linking** | 70% | ⚠️ Needs real `GITHUB_CLIENT_ID/SECRET` to verify |
+| **Developer API (keys / extract / usage)** | 85% | Key hashing, quotas, async jobs, webhooks with HMAC signing |
+| **Admin dashboard** | 80% | All pages wired to the real API |
 
 ---
 
-## The 3 Biggest Gaps
+## Verification status
 
-### 1. Silent failures
-If build, extraction, or deploy fail in Celery, the frontend just freezes with no error. The user has no idea what happened.
-
-### 2. Recall.ai bot unverified
-The most-used path (Meet/Zoom/Teams) has the most unknowns. Physical upload is the safest path to demo right now.
-
-### 3. No build log streaming
-User approves blueprint and stares at a spinner for 1–3 minutes with no indication of what's happening.
+| Check | Result |
+|---|---|
+| `pytest tests/` | **419 passed, 0 failed** (~17 min) |
+| `ruff check app/ tests/` | clean |
+| `forgefy-meeting-to-app` — typecheck / test / build | clean · **13 passed** · clean |
+| `forgefy-dashboard` — lint / typecheck / build | clean (6 pre-existing shadcn warnings) · clean · clean |
 
 ---
 
-## Roadmap to 85%
+## Known gaps
 
-### Priority 1 — Fix silent failures (+12%)
+### 1. Live third-party paths are unproven
+Recall.ai joining a real meeting, Deepgram streaming, and the three preview/deploy
+targets (Cloudflare, Appetize, Expo Snack) have **never been verified end-to-end**.
+This is the single largest risk to the score above — every one of them is code-complete
+but credential-dependent. Physical upload remains the safest demo path.
 
-Right now if build/update/extraction fails, the frontend freezes and the user never finds out.
+### 2. Outbound webhook subscriptions have no backend
+The admin Settings page previously showed a webhook CRUD UI backed by nothing.
+`app/api/v1/webhooks.py` handles **inbound** webhooks only (Recall, NotchPay);
+per-job delivery webhooks exist for the async extract API. There is no
+platform-wide webhook subscription model. The fake UI was removed rather than
+left to silently discard input — building the real feature is a scoped piece of
+work, not a launch fix.
 
-**What to build:**
-- Add `build_error: str | None` field to the project Firestore doc
-- When any worker task throws, write the error to that field + set `is_updating: false`
-- Show the error in the project editor and on the dashboard card
-- Same for sessions stuck in PROCESSING — surface extraction errors
+### 3. Notification preferences have no backend
+Same story — the toggles persisted nothing and were removed.
 
-**Impact:** Turns "app appears broken" into "app tells you what went wrong."
+### 4. Silent fallback synthesis in extraction
+If the LangGraph chain degrades, a weak blueprint can still pass through without
+signalling low confidence. Worth a confidence score on the blueprint.
 
----
+### 5. Test suite runtime
+419 tests in ~17 minutes (~2.5s each) because several exercise real retry/backoff
+timing. Injecting a clock into the retry helpers would cut this substantially.
 
-### Priority 2 — Build log streaming (+8%)
-
-Stream real-time agent activity ("Reading `main.dart`…", "Writing `pubspec.yaml`…", "Thinking…") to the frontend via Redis pub/sub.
-
-**What to build:**
-- `app/api/ws/build_logs.py` — WebSocket endpoint at `/ws/projects/{project_id}/logs`
-- Emit events from `app/build/agent_tools.py` (each tool call) and `app/build/build_agent.py` (each model response)
-- Activity feed panel in the project editor page (`src/routes/_auth/projects/$projectId.tsx`)
-
----
-
-### Priority 3 — Verify & fix Recall.ai bot (+8%)
-
-The connector code exists but needs end-to-end testing. **This requires manual work.**
-
-**Steps:**
-1. Obtain a valid `RECALL_API_KEY`
-2. Set `PUBLIC_API_BASE_URL` in `.env` to your Render backend URL
-3. For local testing: `ngrok http 8000` → paste the ngrok URL as `PUBLIC_API_BASE_URL`
-4. Create a test Meet/Zoom/Teams session and verify the bot joins
-5. Fix any code gaps found during testing
+### 6. `src/lib/mock-data.ts` (dashboard) is vestigial
+Only its `Status` type is still imported (`status-badge.tsx`, `_auth/index.tsx`).
+The exported fixture data is dead and should be deleted once the type moves.
 
 ---
 
-### Priority 4 — Blueprint inline editing (+4%)
-
-Currently the user can only *view* the JSON. If the AI produced a wrong app name or template, they must restart the whole flow.
-
-**What to build:**
-- Allow editing `app_name`, `template_key`, and features list in the UI before approving
-- `PATCH /api/v1/voxa/blueprint/{id}` endpoint on the backend
-
----
-
-### Priority 5 — Deepgram reconnection (+3%)
-
-If the Deepgram stream drops mid-meeting, transcription silently stops.
-
-**What to build:**
-- Auto-reconnect with exponential backoff when the Deepgram WebSocket closes unexpectedly
-- Small change in `app/services/deepgram_client.py` or equivalent
-
----
-
-## Summary Table
+## Roadmap to ~95%
 
 | Action | Who | Effort | % Gain |
 |---|---|---|---|
-| Build error surfacing | Dev (code) | Medium | +12% |
-| Build log streaming | Dev (code) | Medium | +8% |
-| Recall.ai verification | Manual testing + credentials | Low | +8% |
-| Blueprint inline editing | Dev (code) | Small | +4% |
-| Deepgram reconnection | Dev (code) | Small | +3% |
-
-**Total: ~+35% → target score ~85–90%**
+| Verify Recall.ai bot end-to-end | Manual + `RECALL_API_KEY`, `PUBLIC_API_BASE_URL` | Low | +4% |
+| Verify Deepgram live streaming | Manual + credentials | Low | +2% |
+| Verify the 3 deploy/preview targets | Manual + credentials | Medium | +3% |
+| Blueprint confidence score (kill silent fallback) | Dev | Medium | +2% |
+| Email verification + password reset | Dev | Medium | +2% |
+| Outbound webhook subscriptions (backend + UI) | Dev | Medium | — feature |
