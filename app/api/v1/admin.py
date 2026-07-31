@@ -223,7 +223,7 @@ async def get_overview(db: DBSession, user: AdminUser) -> OverviewOut:
         meetings_all_time=meetings_all_time,
         meetings_this_month=meetings_this_month,
         apps_total=apps_total,
-        apps_by_framework=dict(zip(TEMPLATE_LABELS.values(), framework_counts)),
+        apps_by_framework=dict(zip(TEMPLATE_LABELS.values(), framework_counts, strict=True)),
         active_users=active_users,
         new_signups_week=new_signups_week,
         pipeline=PipelineStats(
@@ -319,10 +319,10 @@ async def get_meetings_stats(db: DBSession, user: AdminUser) -> MeetingsStatsOut
         total=total,
         this_month=this_month,
         by_status=MeetingsByStatus(processed=processed, pending=pending, failed=failed),
-        by_platform=dict(zip(_PLATFORMS, platform_counts)),
+        by_platform=dict(zip(_PLATFORMS, platform_counts, strict=True)),
         per_day=[
             DailyCount(date=day_start.date().isoformat(), count=count)
-            for day_start, count in zip(day_starts, day_counts)
+            for day_start, count in zip(day_starts, day_counts, strict=True)
         ],
     )
 

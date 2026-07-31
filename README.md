@@ -496,19 +496,15 @@ pytest tests/test_auth.py tests/test_sessions.py -v
 pytest tests/ --cov=app --cov-report=term-missing
 ```
 
-Test suites:
+Test files are named after what they cover (`test_auth.py`, `test_sessions.py`,
+`test_pipeline.py`, `workers/test_blueprint_worker.py`, …). List them with:
 
-| File | Count | Covers |
-|---|---|---|
-| `test_auth.py` | 10 | Register, login, refresh endpoints |
-| `test_sessions.py` | 10 | Session CRUD endpoints |
-| `test_state_machine.py` | 10 | State transition logic |
-| `test_ws.py` | 14 | WebSocket gateway, ConnectionManager, event schemas |
-| `test_transcription.py` | 11 | DeepgramClient, transcription Celery tasks |
-| `test_pipeline.py` | 12 | LangGraph pipeline, 4 agents, extraction worker |
-| `test_blueprints.py` | 10 | Blueprint endpoints, aggregator, worker |
-| `test_connectors.py` | 14 | Meet/Zoom/Teams connectors, factory, worker |
-| `workers/test_blueprint_worker.py` | 14 | Blueprint worker task logic |
+```bash
+pytest tests/ --collect-only -q
+```
+
+Note the suite takes ~17 minutes — several tests exercise real retry/backoff
+paths rather than mocking the clock, so budget for it in CI.
 
 ## Project Structure
 
@@ -521,7 +517,7 @@ app/
 │   ├── v1/              # REST endpoints (auth, sessions, blueprints)
 │   └── ws/              # WebSocket gateway + ConnectionManager
 ├── build/               # BlueprintAggregator
-├── connectors/          # Playwright Meet bot + Zoom/Teams stubs
+├── connectors/          # Recall.ai cloud bot (Meet/Zoom/Teams) + legacy Playwright Meet bot
 ├── core/                # Exceptions, rate limiting, security, logging
 ├── db/
 │   ├── firebase.py      # Firebase Admin SDK / Firestore client init
@@ -530,5 +526,5 @@ app/
 ├── schemas/             # Pydantic request/response models
 ├── transcription/       # DeepgramClient streaming wrapper
 └── workers/             # Celery tasks (connector, transcription, extraction, blueprint)
-tests/                   # 105 pytest tests
+tests/                   # 419 pytest tests across 44 files
 ```

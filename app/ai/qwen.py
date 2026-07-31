@@ -14,8 +14,16 @@ from __future__ import annotations
 
 import logging
 
-from app.ai.openrouter import BLUEPRINT, SYNTHESIS  # noqa: F401  (re-exported for call sites)
-from app.ai.openrouter import CLASSIFY, CODE, DESIGN, FEATURES, NAMING, PLAN  # noqa: F401
+from app.ai.openrouter import (  # noqa: F401  (re-exported for call sites)  # noqa: F401
+    BLUEPRINT,
+    CLASSIFY,
+    CODE,
+    DESIGN,
+    FEATURES,
+    NAMING,
+    PLAN,
+    SYNTHESIS,
+)
 
 logger = logging.getLogger(__name__)
 

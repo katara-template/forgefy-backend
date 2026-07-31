@@ -148,10 +148,24 @@ def create_app() -> FastAPI:
     app.add_middleware(SlowAPIMiddleware)
 
     # ── CORS ──────────────────────────────────────────────────────────────────
+    # Origins come from the CORS_ORIGINS setting (JSON array, Python-style list,
+    # or comma-separated — see config.parse_cors_origins).
+    #
+    # A literal "*" is honoured but forces allow_credentials off: Starlette
+    # echoes the caller's Origin back when wildcard and credentials are combined,
+    # which lets *any* site make credentialed cross-origin calls. Auth here is
+    # Bearer-header rather than cookie-based, so dropping credentials costs
+    # nothing and removes that footgun.
+    cors_origins = list(settings.CORS_ORIGINS)
+    allow_all_origins = "*" in cors_origins
+    if allow_all_origins and settings.APP_ENV == "production":
+        logger.warning(
+            "CORS_ORIGINS contains '*' in production — set an explicit origin allowlist"
+        )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials=not allow_all_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )

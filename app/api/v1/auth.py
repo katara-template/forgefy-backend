@@ -212,15 +212,15 @@ async def login(
             and await anyio.to_thread.run_sync(verify_password, body.password, legacy_hash)
         ):
             firebase_uid = user_doc.id
-            try:
+            # Already imported by scripts/migrate_users_to_firebase.py meanwhile —
+            # the Firestore write below still needs to happen either way.
+            with suppress(firebase_admin.auth.UidAlreadyExistsError):
                 await anyio.to_thread.run_sync(
                     partial(
                         firebase_admin.auth.create_user,
                         uid=firebase_uid, email=body.email, password=body.password,
                     )
                 )
-            except firebase_admin.auth.UidAlreadyExistsError:
-                pass  # imported by scripts/migrate_users_to_firebase.py meanwhile
             await user_doc.reference.set({"firebase_uid": firebase_uid}, merge=True)
             logger.info("Lazily migrated user to Firebase Auth: id=%s", user_doc.id)
         else:
