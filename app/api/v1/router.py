@@ -13,7 +13,10 @@ from app.api.v1 import (
     projects,
     sessions,
     usage,
+    voice,
     webhooks,
+    zoom_bot,
+    zoom_oauth,
 )
 
 router = APIRouter()
@@ -29,4 +32,9 @@ router.include_router(projects.router, prefix="/projects", tags=["projects"])
 router.include_router(assistant.router, prefix="/assistant", tags=["assistant"])
 router.include_router(billing.router, prefix="/billing", tags=["billing"])
 router.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
+# Self-hosted Zoom bots report here; Recall keeps its own handler in webhooks.
+router.include_router(zoom_bot.router, prefix="/webhooks", tags=["webhooks"])
+# Hosts link their Zoom account here so our bot may join their meetings.
+router.include_router(zoom_oauth.router, prefix="/zoom", tags=["zoom"])
 router.include_router(admin.router, prefix="/admin", tags=["admin"])
+router.include_router(voice.router, prefix="/voice", tags=["voice"])

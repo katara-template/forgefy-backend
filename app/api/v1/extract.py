@@ -50,8 +50,8 @@ router = APIRouter()
 _ALL_GROUPS = tuple(EXTRACTORS)
 
 # At most this many sync extractions in flight per process. Each standard-tier
-# request fans out to 4 parallel model calls and occupies a thread for its
-# whole duration — beyond this, shed load with a 429 instead of queueing
+# request fans out to one parallel model call per extractor and occupies a
+# thread for its whole duration — beyond this, shed load with a 429 instead of queueing
 # requests into timeout territory (batch work belongs on /extract/jobs).
 # A plain counter, not an asyncio primitive: the event loop makes the
 # check-then-increment atomic, and it survives the per-test loop churn that

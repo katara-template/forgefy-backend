@@ -1,0 +1,11 @@
+# The Zoom Meeting SDK is licensed and must not be committed. Download it from
+# marketplace.zoom.us and unpack it here — see README.md.
+lib/zoomsdk/*
+!lib/zoomsdk/.gitkeep
+
+build/
+out/
+.env
+
+__pycache__/
+*.pyc

@@ -129,6 +129,22 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "run_tests",
+        "description": (
+            "Run the project's test suite and return the results. "
+            "Flutter → 'flutter test'. Next.js / React Native → 'npm test'. "
+            "Use this after writing tests to confirm they actually pass, and to check "
+            "that existing tests still pass after a change. A test that has never been "
+            "run is not evidence of anything. "
+            "Returns the runner's output, including which tests failed and why."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
         "name": "generate_video",
         "description": (
             "Generate a short AI video (Kling Video) and save it to the app's assets folder. "
@@ -261,6 +277,46 @@ def _run_analysis(workspace: Path, log_fn=None) -> str:
             return f"tsc --noEmit failed: {exc}"
 
     return "No recognisable project type in workspace (no pubspec.yaml or tsconfig.json)."
+
+
+def _run_tests(workspace: Path, log_fn=None) -> str:
+    """Run the project's test suite and return the runner output."""
+    is_flutter = (workspace / "pubspec.yaml").exists()
+    is_node = (workspace / "package.json").exists()
+
+    if is_flutter:
+        flutter = shutil.which("flutter") or shutil.which("flutter.bat")
+        if not flutter:
+            return "flutter not found on PATH — tests skipped."
+        cmd = [flutter, "test", "--reporter", "compact"]
+    elif is_node:
+        npm = shutil.which("npm") or shutil.which("npm.cmd")
+        if not npm:
+            return "npm not found on PATH — tests skipped."
+        # --if-present so a template without a test script reports cleanly instead
+        # of failing the phase with npm's "missing script" error.
+        cmd = [npm, "test", "--if-present", "--", "--watch=false"]
+    else:
+        return "No recognisable project type in workspace (no pubspec.yaml or package.json)."
+
+    try:
+        result = subprocess.run(
+            cmd, cwd=workspace, capture_output=True, text=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            "Test run timed out after 300 s. A hanging test usually means a watch mode "
+            "or an unawaited async call — check the test setup rather than the app code."
+        )
+    except Exception as exc:
+        return f"Test run failed to start: {exc}"
+
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode == 0:
+        if not output:
+            return "Tests: no test suite found in this project."
+        return ("Tests passed.\n" + output)[-4000:]
+    return ("Tests FAILED:\n" + output)[-4000:]
 
 
 def _generate_image(
@@ -484,6 +540,9 @@ def _dispatch_tool(
 
         case "analyze_code":
             return _run_analysis(workspace, log_fn)
+
+        case "run_tests":
+            return _run_tests(workspace, log_fn)
 
         case "generate_image":
             return _generate_image(inputs["prompt"], inputs["filename"], workspace, log_fn)

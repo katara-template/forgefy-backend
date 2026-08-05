@@ -437,3 +437,98 @@ class TestClassifyNeedsDatabase:
 
         assert needs_db is False
         assert reason == ""
+
+
+# ── _merge_entities ───────────────────────────────────────────────────────────
+
+
+class TestMergeEntities:
+    """Segment-level extraction reports the same entity repeatedly; the merge
+    must produce one entity carrying the union of everything seen."""
+
+    def test_empty_input_returns_empty_list(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        assert _merge_entities([]) == []
+
+    def test_unions_fields_across_segments(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        result = _merge_entities([
+            {"name": "Invoice", "description": "A bill", "fields": [
+                {"name": "amount", "type": "decimal", "required": True, "notes": ""},
+            ]},
+            {"name": "Invoice", "description": "", "fields": [
+                {"name": "due_date", "type": "date", "required": False, "notes": ""},
+            ]},
+        ])
+
+        assert len(result) == 1
+        assert result[0]["description"] == "A bill"
+        assert [f["name"] for f in result[0]["fields"]] == ["amount", "due_date"]
+
+    def test_dedupes_entity_name_case_insensitively(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        result = _merge_entities([
+            {"name": "Invoice", "fields": []},
+            {"name": "invoice", "fields": []},
+        ])
+
+        assert len(result) == 1
+        assert result[0]["name"] == "Invoice"  # first spelling wins
+
+    def test_required_is_sticky_and_first_type_wins(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        result = _merge_entities([
+            {"name": "Invoice", "fields": [
+                {"name": "amount", "type": "decimal", "required": False, "notes": ""},
+            ]},
+            {"name": "Invoice", "fields": [
+                {"name": "amount", "type": "text", "required": True, "notes": "in cents"},
+            ]},
+        ])
+
+        field = result[0]["fields"][0]
+        assert field["required"] is True
+        assert field["type"] == "decimal"
+        assert field["notes"] == "in cents"
+
+    def test_dedupes_relationships(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        result = _merge_entities([
+            {"name": "Invoice", "relationships": [
+                {"kind": "belongs_to", "target": "Customer", "notes": ""},
+            ]},
+            {"name": "Invoice", "relationships": [
+                {"kind": "belongs_to", "target": "customer", "notes": "one per invoice"},
+                {"kind": "has_many", "target": "LineItem", "notes": ""},
+            ]},
+        ])
+
+        rels = result[0]["relationships"]
+        assert [(r["kind"], r["target"]) for r in rels] == [
+            ("belongs_to", "Customer"), ("has_many", "LineItem"),
+        ]
+
+    def test_skips_nameless_entities_and_fields(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        result = _merge_entities([
+            {"name": "", "fields": [{"name": "x", "type": "text"}]},
+            {"name": "Invoice", "fields": [{"name": "  ", "type": "text"}]},
+        ])
+
+        assert len(result) == 1
+        assert result[0]["fields"] == []
+
+    def test_tolerates_missing_keys(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        result = _merge_entities([{"name": "Invoice"}])
+
+        assert result == [
+            {"name": "Invoice", "description": "", "fields": [], "relationships": []}
+        ]

@@ -39,6 +39,11 @@ def call_claude(
         model=model,
         max_tokens=max_tokens,
         system=system_prompt,
+        # Sonnet 5 and later think by default when this is omitted, and max_tokens
+        # caps thinking + response together — a 1024 budget can be spent thinking,
+        # truncating the JSON mid-object and failing the parse below. These are
+        # strict-schema extractions with no tools, so thinking buys nothing.
+        thinking={"type": "disabled"},
         messages=[{"role": "user", "content": user_content}],
     )
     if usage is not None:

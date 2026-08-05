@@ -22,6 +22,7 @@ celery_app = Celery(
         "app.workers.update_worker",
         "app.workers.prompt_build_worker",
         "app.workers.cleanup_worker",
+        "app.workers.zoom_bot_worker",
     ],
 )
 
@@ -34,6 +35,7 @@ celery_app.conf.update(
     task_track_started=True,
     task_routes={
         "app.workers.connector_worker.*": {"queue": "meeting.audio"},
+        "app.workers.zoom_bot_worker.*": {"queue": "meeting.audio"},
         "app.workers.transcription_worker.*": {"queue": "meeting.audio"},
         "app.workers.upload_worker.*": {"queue": "meeting.audio"},
         "app.workers.extraction_worker.*": {"queue": "meeting.transcribe"},

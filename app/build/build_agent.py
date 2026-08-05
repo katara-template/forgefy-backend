@@ -1251,6 +1251,8 @@ Return ONLY valid JSON — absolutely no other text before or after:
 {
   "summary": "<one sentence — what will be built or changed>",
   "skip_design_agent": false,
+  "skip_schema_agent": false,
+  "skip_test_agent": false,
   "skip_security_agent": false,
   "design_impact": {
     "uses_existing_core_components": ["<component name>"],
@@ -1282,6 +1284,13 @@ Rules:
 - skip_design_agent: set true ONLY when ALL of these are true:
     new_components_needed is empty, affects_theme is false, signature_element_appears is false.
     Pure logic, data, or backend changes qualify. Any visual or UI change must be false.
+- skip_schema_agent: set true ONLY when the change stores NO new data — no new entity,
+    no new field on an existing entity, no new relationship. Pure UI, styling, copy,
+    navigation, or read-only display changes qualify. If the request adds anything the
+    app must remember between sessions, it must be false.
+- skip_test_agent: set true ONLY when the change adds NO testable logic — pure styling,
+    copy edits, asset swaps, or config changes. Any new business rule, calculation,
+    validation, state transition, or data mapping must be false.
 - skip_security_agent: set true ONLY when the change has NO authentication, NO API keys,
     NO user permissions, NO external API calls, NO data storage (DB, files, cookies).
     Pure UI-only or pure read-only data display changes qualify.
@@ -1352,6 +1361,9 @@ def _call_planner(
             resp = client.messages.create(
                 model=model, max_tokens=4096,
                 system=_PLANNER_SYSTEM,
+                # Sonnet 5+ thinks by default; thinking blocks lead `content`, so the
+                # content[0].text read below would hit a ThinkingBlock. JSON-only call.
+                thinking={"type": "disabled"},
                 messages=[{"role": "user", "content": planner_input}],
             )
             raw = resp.content[0].text.strip() if resp.content else ""
@@ -1829,6 +1841,244 @@ def _design_agent_user_msg(
         f"{workspace_section}\n"
         "Read the design system files, prepare any missing core components, "
         "verify token completeness, then output your design brief starting with DESIGN READY:"
+    )
+
+
+_SCHEMA_SYSTEM = """You are the Forgefy Schema Agent. You run AFTER the planner and BEFORE the design and execution agents.
+
+Your job: turn the blueprint's data model into concrete Postgres/Supabase migration SQL,
+so the executor writes queries against a schema that actually exists instead of inventing
+table and column names as it goes.
+
+══════════════════════════════════════════
+WHAT YOU PRODUCE
+══════════════════════════════════════════
+1. ONE migration file at supabase/migrations/<UTC timestamp>_<short_snake_name>.sql
+   (timestamp format YYYYMMDDHHMMSS — use a plausible current UTC time).
+2. A SCHEMA READY: brief listing every table and its columns, for the executor to code against.
+
+You do NOT run migrations — there is no execution path from this workspace to a live
+database. You write the SQL file into the repo; applying it is the developer's step.
+Say so in your brief rather than claiming tables were created.
+
+══════════════════════════════════════════
+BEFORE YOU WRITE
+══════════════════════════════════════════
+• list_files on supabase/migrations/ — if migrations already exist, READ them first.
+  You are extending an existing schema, not redefining it. Never rewrite or delete a
+  previous migration; add a new one with ALTER TABLE / CREATE TABLE IF NOT EXISTS.
+• Read the blueprint's "entities" — that is the extracted data model. Entities carry
+  "fields" (name/type/required/notes) and "relationships" (kind/target).
+• If the blueprint has no entities and the plan implies no storage, output
+  "SCHEMA READY: no persistent data required — no migration written" and STOP.
+  Do NOT invent a schema to look productive.
+
+══════════════════════════════════════════
+SQL RULES — non-negotiable
+══════════════════════════════════════════
+• snake_case, plural table names ("Invoice" entity → invoices table).
+• Every table gets: id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now().
+  Add updated_at timestamptz when the entity is edited after creation.
+• Blueprint field types map as: text→text, integer→integer, decimal→numeric(12,2),
+  boolean→boolean, timestamp→timestamptz, date→date, uuid→uuid, json→jsonb,
+  enum→text with a CHECK constraint listing the allowed values.
+• required: true → NOT NULL. Give NOT NULL columns a DEFAULT when a sensible one exists,
+  otherwise leave it and note it in the brief.
+• belongs_to → a <target_singular>_id uuid REFERENCES <target_plural>(id) column.
+  has_many → the foreign key lives on the OTHER table, not this one.
+  many_to_many → a join table named <a>_<b> alphabetically, with both FKs and a
+  composite primary key.
+• ON DELETE: CASCADE when the child is meaningless without the parent, otherwise RESTRICT.
+  Never leave the default (NO ACTION) unstated.
+• Add an index on every foreign key column.
+
+══════════════════════════════════════════
+ROW LEVEL SECURITY — mandatory
+══════════════════════════════════════════
+The anon key ships in the client app. RLS IS the security boundary, so a table without
+policies is a public table.
+
+• ALTER TABLE <t> ENABLE ROW LEVEL SECURITY; on EVERY table you create.
+• Write explicit policies. Default shape for user-owned data:
+    - the table carries user_id uuid not null references auth.users(id) on delete cascade
+    - select/insert/update/delete policies each using (auth.uid() = user_id)
+• For data that is genuinely public-readable, write an explicit
+  "select using (true)" policy and say in your brief why it is public.
+• NEVER write a policy that is "using (true)" for insert/update/delete.
+• If the meeting discussed roles or permissions, model them — do not flatten every
+  user to the same access level.
+
+══════════════════════════════════════════
+OUTPUT
+══════════════════════════════════════════
+End with a brief starting with SCHEMA READY: that lists, per table, the exact column
+names and types, the FK relationships, and the RLS policy shape. The executor reads
+ONLY this brief — if a column is not in it, the executor will not know it exists."""
+
+
+def _schema_agent_user_msg(
+    app_name: str,
+    template_key: str,
+    blueprint: dict[str, Any],
+    plan: dict[str, Any] | None,
+    prompt: str,
+    workspace: Path | None = None,
+) -> str:
+    framework = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(
+        template_key, template_key
+    )
+    entities = blueprint.get("entities") or []
+    entities_section = (
+        f"Extracted data model ({len(entities)} entities):\n{json.dumps(entities, indent=2)}"
+        if entities
+        else "The blueprint carries no extracted entities — derive storage needs from the "
+        "change request and plan, and write no migration if nothing needs persisting."
+    )
+    plan_section = (
+        f"Execution plan:\n{json.dumps(plan, indent=2)}"
+        if plan
+        else "No structured plan — infer storage needs from the change request below."
+    )
+    core_prompt = (
+        prompt.split("\nCURRENT REQUEST\n", 1)[-1].strip()
+        if "\nCURRENT REQUEST\n" in prompt
+        else prompt
+    )
+
+    workspace_section = ""
+    if workspace is not None:
+        workspace_section = (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "CURRENT FILE TREE\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + _scan_workspace(workspace) + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
+    return (
+        f"App: {app_name}\nFramework: {framework}\n\n"
+        f"Incoming change request:\n{core_prompt[:600]}\n\n"
+        f"{entities_section}\n\n"
+        f"{plan_section}\n"
+        f"{workspace_section}\n"
+        "Read any existing migrations, then write the migration and output your brief "
+        "starting with SCHEMA READY:"
+    )
+
+
+_TEST_SYSTEM = """You are the Forgefy Test Agent. You run AFTER the validator, once the code compiles.
+
+Your job: prove the feature actually works by writing tests and running them. Static
+analysis says the code type-checks; it says nothing about whether it behaves correctly.
+
+══════════════════════════════════════════
+WHAT YOU DO
+══════════════════════════════════════════
+1. Read the changed files to understand what behaviour was added.
+2. Write focused tests for that behaviour, in the project's existing test location
+   and style — list_files the test directory and read an existing test FIRST.
+   If there is no test directory, create the framework's conventional one
+   (Flutter → test/, Next.js → __tests__/ or *.test.ts beside the source,
+   React Native → __tests__/).
+3. Call run_tests() and read the result.
+4. If a test fails, decide which side is wrong:
+   • The test encodes the wrong expectation → fix the test.
+   • The implementation is genuinely broken → fix the implementation.
+   Say which one you concluded and why. Do NOT delete or skip a failing test to
+   get a green run — a deleted test is a lie about coverage.
+5. Repeat until run_tests() passes, or you have a specific reason it cannot.
+
+══════════════════════════════════════════
+WHAT TO TEST — and what not to
+══════════════════════════════════════════
+Test the logic this change introduced:
+  • Business rules, calculations, validation, state transitions
+  • Data mapping — an entity's fields surviving a round trip
+  • Error paths that the code explicitly handles
+  • Edge cases the blueprint or plan calls out (empty lists, missing optional
+    fields, boundary values)
+
+Do NOT test:
+  • The framework itself (that setState re-renders, that a Provider provides)
+  • Third-party library internals
+  • Static styling — colors, padding, font sizes. These change constantly and a
+    test that asserts them breaks on every design tweak while catching no bugs.
+  • Trivial getters/setters with no logic
+
+A small number of tests that assert real behaviour beats a large number that
+assert the framework works.
+
+══════════════════════════════════════════
+HARD RULES
+══════════════════════════════════════════
+• NEVER weaken a test to make it pass — no commenting out assertions, no skip
+  markers, no changing an expected value to whatever the code happened to return.
+  If the code is wrong, fix the code.
+• Do NOT add a testing framework or dependency that isn't already in the project.
+  If none is present, write tests in whatever the framework ships with
+  (Flutter: flutter_test; Next.js/React Native: whatever the test script invokes),
+  and if there is genuinely no runner, say so and stop rather than installing one.
+• Do NOT modify application code except to fix a real defect a test exposed.
+  You are not here to refactor.
+• If run_tests() reports no suite and there is no runner configured, write the
+  tests anyway so they are in the repo, and state clearly that they were not run.
+
+══════════════════════════════════════════
+OUTPUT
+══════════════════════════════════════════
+End with a brief starting with TESTS: that states how many tests you wrote, what
+behaviour they cover, the final run_tests() result, and — if anything is still
+failing or unrun — exactly what and why. Report the real outcome; a passing claim
+that isn't backed by a run_tests() result is worse than admitting the gap."""
+
+
+def _test_agent_user_msg(
+    app_name: str,
+    template_key: str,
+    plan: dict[str, Any] | None,
+    prompt: str,
+    workspace: Path | None = None,
+    exec_summary: str = "",
+) -> str:
+    framework = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(
+        template_key, template_key
+    )
+    plan_section = (
+        f"Execution plan (files_to_create / files_to_modify tell you what changed):\n"
+        f"{json.dumps(plan, indent=2)}"
+        if plan
+        else "No structured plan — infer what changed from the request and the summary below."
+    )
+    core_prompt = (
+        prompt.split("\nCURRENT REQUEST\n", 1)[-1].strip()
+        if "\nCURRENT REQUEST\n" in prompt
+        else prompt
+    )
+    exec_section = (
+        f"\nWhat the executor reported doing:\n{exec_summary.strip()[:1500]}\n"
+        if exec_summary
+        else ""
+    )
+
+    workspace_section = ""
+    if workspace is not None:
+        workspace_section = (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "CURRENT FILE TREE\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + _scan_workspace(workspace) + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
+    return (
+        f"App: {app_name}\nFramework: {framework}\n\n"
+        f"Change that was implemented:\n{core_prompt[:600]}\n"
+        f"{exec_section}\n"
+        f"{plan_section}\n"
+        f"{workspace_section}\n"
+        "Read an existing test to match the project's style, write tests for the new "
+        "behaviour, run them, then output your brief starting with TESTS:"
     )
 
 
@@ -2510,26 +2760,37 @@ def _update_user_msg_with_brief(
     plan: dict[str, Any] | None,
     workspace: Path | None,
     design_brief: str,
+    schema_brief: str = "",
 ) -> str:
-    """Like _update_user_msg but prepends the design agent's output so the executor knows
-    exactly which components and tokens were prepared."""
+    """Like _update_user_msg but prepends the design and schema agents' output so the
+    executor knows exactly which components, tokens, tables and columns were prepared."""
     base = _update_user_msg(app_name, template_key, blueprint, prompt, plan, workspace)
-    if not design_brief:
-        return base
-    brief_block = (
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "DESIGN SYSTEM BRIEF — use these components and tokens\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        + design_brief.strip() + "\n"
-        + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-    return brief_block + base
+    blocks = ""
+    if schema_brief:
+        blocks += (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "DATABASE SCHEMA BRIEF — query these tables and columns, invent no others\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + schema_brief.strip() + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+    if design_brief:
+        blocks += (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "DESIGN SYSTEM BRIEF — use these components and tokens\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + design_brief.strip() + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+    return blocks + base
 
 
 # Per-agent iteration budgets — focused agents get fewer iterations to save tokens
 _ITERS_DESIGN = 30
+_ITERS_SCHEMA = 20
 _ITERS_EXEC = 50
 _ITERS_VALIDATE = 25
+_ITERS_TEST = 25
 _ITERS_SECURITY = 20
 _ITERS_FIX = 100
 
@@ -2545,6 +2806,33 @@ def _should_skip_design(plan: dict[str, Any] | None) -> bool:
         and not di.get("affects_theme")
         and not di.get("signature_element_appears")
     )
+
+
+def _should_skip_schema(plan: dict[str, Any] | None, blueprint: dict[str, Any]) -> bool:
+    """Skip the schema phase only when the planner says nothing is stored.
+
+    Unlike _should_skip_design there is no heuristic fallback: a missing plan means
+    run the phase. Guessing wrong the other way leaves the executor writing queries
+    against tables that were never defined, which fails at runtime rather than at
+    build time.
+    """
+    if plan and plan.get("skip_schema_agent"):
+        # A planner "skip" is overridden when the blueprint carries an explicit data
+        # model — entities in the blueprint are direct evidence that something is stored.
+        return not (blueprint.get("entities") or [])
+    return False
+
+
+def _should_skip_test(plan: dict[str, Any] | None) -> bool:
+    """Skip the test phase only when the planner says nothing testable changed.
+
+    No plan means run it. There is no blueprint-level evidence to override with
+    (unlike the schema gate) — the plan is the only signal about whether the
+    change introduced behaviour worth asserting on.
+    """
+    if not plan:
+        return False
+    return bool(plan.get("skip_test_agent"))
 
 
 def _should_skip_security(plan: dict[str, Any] | None) -> bool:
@@ -2575,6 +2863,150 @@ def _make_fix_prompt(val_summary: str) -> str:
     )
 
 
+# A phase runner: (system_prompt, user_msg, max_iterations) -> (summary, tokens).
+# Every backend supplies one by closing over its own tool loop; the phase sequence
+# below is then shared, so a new phase is added in exactly one place.
+RunPhase = Callable[[str, str, int], tuple[str, int]]
+
+
+def _run_update_sequence(
+    run_phase: RunPhase,
+    *,
+    workspace: Path,
+    prompt: str,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    plan: dict[str, Any] | None,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+) -> tuple[str, int]:
+    """schema? → design? → execute → validate → fix? → security?
+
+    The single definition of the update pipeline. Backends differ only in how a
+    phase is executed (which tool loop, which client args), which is what
+    ``run_phase`` abstracts — planning happens in the caller because its
+    arguments are backend-specific.
+    """
+    total_tokens = 0
+
+    def _cancelled() -> bool:
+        return bool(cancel_fn and cancel_fn())
+
+    if _cancelled():
+        return "Stopped by user.", total_tokens
+
+    # Pre-execution phases produce briefs the executor reads. Their user messages
+    # are built lazily — each one scans the workspace, which is wasted work for a
+    # phase the planner told us to skip.
+    briefs = {"schema": "", "design": ""}
+    pre_exec = (
+        (
+            "schema", "Database schema",
+            _should_skip_schema(plan, blueprint), _SCHEMA_SYSTEM, _ITERS_SCHEMA,
+            lambda: _schema_agent_user_msg(app_name, template_key, blueprint, plan, prompt, workspace),
+            "Preparing database schema…",
+            "Schema phase skipped — no new data is stored.",
+        ),
+        (
+            "design", "Design system",
+            _should_skip_design(plan), _DESIGN_AGENT_SYSTEM, _ITERS_DESIGN,
+            lambda: _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
+            "Preparing design system…",
+            "Design phase skipped — no new components or theme changes.",
+        ),
+    )
+
+    for key, label, skip, system, iters, make_msg, thinking, skip_msg in pre_exec:
+        if skip:
+            if log_fn:
+                log_fn("info", skip_msg)
+            continue
+        if log_fn:
+            log_fn("info", f"━━━ {label} phase ━━━")
+            log_fn("thinking", thinking)
+        briefs[key], tokens = run_phase(system, make_msg(), iters)
+        total_tokens += tokens
+        if _cancelled():
+            return briefs[key] or "Stopped by user.", total_tokens
+
+    if log_fn:
+        log_fn("info", "━━━ Execution phase ━━━")
+    exec_summary, tokens = run_phase(
+        _UPDATE_SYSTEM,
+        _update_user_msg_with_brief(
+            app_name, template_key, blueprint, prompt, plan, workspace,
+            briefs["design"], briefs["schema"],
+        ),
+        _ITERS_EXEC,
+    )
+    total_tokens += tokens
+    if _cancelled():
+        return exec_summary or "Stopped by user.", total_tokens
+
+    if log_fn:
+        log_fn("info", "━━━ Validation phase ━━━")
+        log_fn("thinking", "Validating implementation…")
+    val_summary, tokens = run_phase(
+        _VALIDATOR_SYSTEM,
+        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
+        _ITERS_VALIDATE,
+    )
+    total_tokens += tokens
+    if _cancelled():
+        return val_summary or exec_summary, total_tokens
+
+    if _validation_needs_fix_pass(val_summary):
+        if log_fn:
+            log_fn("info", "━━━ Post-validation fix pass ━━━")
+            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
+        # The fix pass replaces the validator's summary — it is the newer account
+        # of the same work.
+        val_summary, tokens = run_phase(_UPDATE_SYSTEM, _make_fix_prompt(val_summary), _ITERS_FIX)
+        total_tokens += tokens
+        if _cancelled():
+            return val_summary or exec_summary, total_tokens
+
+    # Tests run after the fix pass, so they assert against code that compiles —
+    # a test suite written against known-broken code just re-reports the same
+    # failure the validator already found.
+    if not _should_skip_test(plan):
+        if log_fn:
+            log_fn("info", "━━━ Test phase ━━━")
+            log_fn("thinking", "Writing and running tests…")
+        # The test brief is surfaced to the user rather than fed forward: it is
+        # evidence about the work, not input to a later phase.
+        test_summary, tokens = run_phase(
+            _TEST_SYSTEM,
+            _test_agent_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
+            _ITERS_TEST,
+        )
+        total_tokens += tokens
+        if test_summary.strip() and log_fn:
+            log_fn("info", test_summary.strip()[:500])
+        if _cancelled():
+            return val_summary or exec_summary, total_tokens
+    elif log_fn:
+        log_fn("info", "Test phase skipped — no testable logic changed.")
+
+    if not _should_skip_security(plan):
+        if log_fn:
+            log_fn("info", "━━━ Security review phase ━━━")
+            log_fn("thinking", "Reviewing for security issues…")
+        # The security agent fixes what it finds in place; its prose isn't
+        # surfaced, so only its token cost is kept.
+        _, tokens = run_phase(
+            _SECURITY_SYSTEM,
+            _security_user_msg(app_name, template_key, plan, prompt, workspace),
+            _ITERS_SECURITY,
+        )
+        total_tokens += tokens
+    elif log_fn:
+        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
+
+    return val_summary or exec_summary, total_tokens
+
+
 def run_update_agent(
     workspace: Path,
     prompt: str,
@@ -2595,77 +3027,18 @@ def run_update_agent(
     )
     _log_plan(plan, log_fn)
     client = anthropic.Anthropic(api_key=api_key)
-    total_tokens = 0
 
-    if cancel_fn and cancel_fn():
-        return "Stopped by user.", 0
-
-    design_summary = ""
-    if not _should_skip_design(plan):
-        if log_fn:
-            log_fn("info", "━━━ Design system phase ━━━")
-            log_fn("thinking", "Preparing design system…")
-        design_summary, design_tokens = _loop(
-            client, model, _DESIGN_AGENT_SYSTEM, workspace,
-            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+    def run_phase(system: str, user_msg: str, iters: int) -> tuple[str, int]:
+        return _loop(
+            client, model, system, workspace, user_msg,
+            log_fn, cancel_fn, max_iterations=iters,
         )
-        total_tokens += design_tokens
-        if cancel_fn and cancel_fn():
-            return design_summary or "Stopped by user.", total_tokens
-    elif log_fn:
-        log_fn("info", "Design phase skipped — no new components or theme changes.")
 
-    if log_fn:
-        log_fn("info", "━━━ Execution phase ━━━")
-    exec_summary, exec_tokens = _loop(
-        client, model, _UPDATE_SYSTEM, workspace,
-        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
+    return _run_update_sequence(
+        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
+        app_name=app_name, template_key=template_key, plan=plan,
+        log_fn=log_fn, cancel_fn=cancel_fn,
     )
-    total_tokens += exec_tokens
-    if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", total_tokens
-
-    if log_fn:
-        log_fn("info", "━━━ Validation phase ━━━")
-        log_fn("thinking", "Validating implementation…")
-    val_summary, val_tokens = _loop(
-        client, model, _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
-    )
-    total_tokens += val_tokens
-    if cancel_fn and cancel_fn():
-        return val_summary or exec_summary, total_tokens
-
-    if _validation_needs_fix_pass(val_summary):
-        if log_fn:
-            log_fn("info", "━━━ Post-validation fix pass ━━━")
-            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
-        fix_summary, fix_tokens = _loop(
-            client, model, _UPDATE_SYSTEM, workspace,
-            _make_fix_prompt(val_summary), log_fn, cancel_fn, max_iterations=_ITERS_FIX,
-        )
-        total_tokens += fix_tokens
-        val_summary = fix_summary
-        if cancel_fn and cancel_fn():
-            return val_summary or exec_summary, total_tokens
-
-    if not _should_skip_security(plan):
-        if log_fn:
-            log_fn("info", "━━━ Security review phase ━━━")
-            log_fn("thinking", "Reviewing for security issues…")
-        sec_summary, sec_tokens = _loop(
-            client, model, _SECURITY_SYSTEM, workspace,
-            _security_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
-        )
-        total_tokens += sec_tokens
-    elif log_fn:
-        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
-
-    return val_summary or exec_summary, total_tokens
 
 
 def run_update_agent_ollama(
@@ -2688,77 +3061,18 @@ def run_update_agent_ollama(
         backend="Qwen3", base_url=base_url, ollama_model=model, ollama_timeout=timeout,
     )
     _log_plan(plan, log_fn)
-    total_tokens = 0
 
-    if cancel_fn and cancel_fn():
-        return "Stopped by user.", 0
-
-    design_summary = ""
-    if not _should_skip_design(plan):
-        if log_fn:
-            log_fn("info", "━━━ Design system phase ━━━")
-            log_fn("thinking", "Preparing design system…")
-        design_summary, design_tokens = _ollama_loop(
-            base_url, model, _DESIGN_AGENT_SYSTEM, workspace,
-            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
-            timeout, log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+    def run_phase(system: str, user_msg: str, iters: int) -> tuple[str, int]:
+        return _ollama_loop(
+            base_url, model, system, workspace, user_msg,
+            timeout, log_fn, cancel_fn, max_iterations=iters,
         )
-        total_tokens += design_tokens
-        if cancel_fn and cancel_fn():
-            return design_summary or "Stopped by user.", total_tokens
-    elif log_fn:
-        log_fn("info", "Design phase skipped — no new components or theme changes.")
 
-    if log_fn:
-        log_fn("info", "━━━ Execution phase ━━━")
-    exec_summary, exec_tokens = _ollama_loop(
-        base_url, model, _UPDATE_SYSTEM, workspace,
-        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
-        timeout, log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
+    return _run_update_sequence(
+        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
+        app_name=app_name, template_key=template_key, plan=plan,
+        log_fn=log_fn, cancel_fn=cancel_fn,
     )
-    total_tokens += exec_tokens
-    if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", total_tokens
-
-    if log_fn:
-        log_fn("info", "━━━ Validation phase ━━━")
-        log_fn("thinking", "Validating implementation…")
-    val_summary, val_tokens = _ollama_loop(
-        base_url, model, _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
-        timeout, log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
-    )
-    total_tokens += val_tokens
-    if cancel_fn and cancel_fn():
-        return val_summary or exec_summary, total_tokens
-
-    if _validation_needs_fix_pass(val_summary):
-        if log_fn:
-            log_fn("info", "━━━ Post-validation fix pass ━━━")
-            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
-        fix_summary, fix_tokens = _ollama_loop(
-            base_url, model, _UPDATE_SYSTEM, workspace,
-            _make_fix_prompt(val_summary), timeout, log_fn, cancel_fn, max_iterations=_ITERS_FIX,
-        )
-        total_tokens += fix_tokens
-        val_summary = fix_summary
-        if cancel_fn and cancel_fn():
-            return val_summary or exec_summary, total_tokens
-
-    if not _should_skip_security(plan):
-        if log_fn:
-            log_fn("info", "━━━ Security review phase ━━━")
-            log_fn("thinking", "Reviewing for security issues…")
-        sec_summary, sec_tokens = _ollama_loop(
-            base_url, model, _SECURITY_SYSTEM, workspace,
-            _security_user_msg(app_name, template_key, plan, prompt, workspace),
-            timeout, log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
-        )
-        total_tokens += sec_tokens
-    elif log_fn:
-        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
-
-    return val_summary or exec_summary, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -2993,77 +3307,18 @@ def run_update_agent_gemini(
         backend="gemini", api_key=api_key, model=model,
     )
     _log_plan(plan, log_fn)
-    total_tokens = 0
 
-    if cancel_fn and cancel_fn():
-        return "Stopped by user.", 0
-
-    design_summary = ""
-    if not _should_skip_design(plan):
-        if log_fn:
-            log_fn("info", "━━━ Design system phase ━━━")
-            log_fn("thinking", "Preparing design system…")
-        design_summary, design_tokens = _gemini_loop(
-            api_key, model, _DESIGN_AGENT_SYSTEM, workspace,
-            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+    def run_phase(system: str, user_msg: str, iters: int) -> tuple[str, int]:
+        return _gemini_loop(
+            api_key, model, system, workspace, user_msg,
+            log_fn, cancel_fn, max_iterations=iters,
         )
-        total_tokens += design_tokens
-        if cancel_fn and cancel_fn():
-            return design_summary or "Stopped by user.", total_tokens
-    elif log_fn:
-        log_fn("info", "Design phase skipped — no new components or theme changes.")
 
-    if log_fn:
-        log_fn("info", "━━━ Execution phase ━━━")
-    exec_summary, exec_tokens = _gemini_loop(
-        api_key, model, _UPDATE_SYSTEM, workspace,
-        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
+    return _run_update_sequence(
+        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
+        app_name=app_name, template_key=template_key, plan=plan,
+        log_fn=log_fn, cancel_fn=cancel_fn,
     )
-    total_tokens += exec_tokens
-    if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", total_tokens
-
-    if log_fn:
-        log_fn("info", "━━━ Validation phase ━━━")
-        log_fn("thinking", "Validating implementation…")
-    val_summary, val_tokens = _gemini_loop(
-        api_key, model, _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
-    )
-    total_tokens += val_tokens
-    if cancel_fn and cancel_fn():
-        return val_summary or exec_summary, total_tokens
-
-    if _validation_needs_fix_pass(val_summary):
-        if log_fn:
-            log_fn("info", "━━━ Post-validation fix pass ━━━")
-            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
-        fix_summary, fix_tokens = _gemini_loop(
-            api_key, model, _UPDATE_SYSTEM, workspace,
-            _make_fix_prompt(val_summary), log_fn, cancel_fn, max_iterations=_ITERS_FIX,
-        )
-        total_tokens += fix_tokens
-        val_summary = fix_summary
-        if cancel_fn and cancel_fn():
-            return val_summary or exec_summary, total_tokens
-
-    if not _should_skip_security(plan):
-        if log_fn:
-            log_fn("info", "━━━ Security review phase ━━━")
-            log_fn("thinking", "Reviewing for security issues…")
-        sec_summary, sec_tokens = _gemini_loop(
-            api_key, model, _SECURITY_SYSTEM, workspace,
-            _security_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
-        )
-        total_tokens += sec_tokens
-    elif log_fn:
-        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
-
-    return val_summary or exec_summary, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -3219,77 +3474,18 @@ def run_update_agent_openai(
         backend="gpt", api_key=api_key, model=model,
     )
     _log_plan(plan, log_fn)
-    total_tokens = 0
 
-    if cancel_fn and cancel_fn():
-        return "Stopped by user.", 0
-
-    design_summary = ""
-    if not _should_skip_design(plan):
-        if log_fn:
-            log_fn("info", "━━━ Design system phase ━━━")
-            log_fn("thinking", "Preparing design system…")
-        design_summary, design_tokens = _openai_loop(
-            api_key, model, _DESIGN_AGENT_SYSTEM, workspace,
-            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+    def run_phase(system: str, user_msg: str, iters: int) -> tuple[str, int]:
+        return _openai_loop(
+            api_key, model, system, workspace, user_msg,
+            log_fn, cancel_fn, max_iterations=iters,
         )
-        total_tokens += design_tokens
-        if cancel_fn and cancel_fn():
-            return design_summary or "Stopped by user.", total_tokens
-    elif log_fn:
-        log_fn("info", "Design phase skipped — no new components or theme changes.")
 
-    if log_fn:
-        log_fn("info", "━━━ Execution phase ━━━")
-    exec_summary, exec_tokens = _openai_loop(
-        api_key, model, _UPDATE_SYSTEM, workspace,
-        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
+    return _run_update_sequence(
+        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
+        app_name=app_name, template_key=template_key, plan=plan,
+        log_fn=log_fn, cancel_fn=cancel_fn,
     )
-    total_tokens += exec_tokens
-    if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", total_tokens
-
-    if log_fn:
-        log_fn("info", "━━━ Validation phase ━━━")
-        log_fn("thinking", "Validating implementation…")
-    val_summary, val_tokens = _openai_loop(
-        api_key, model, _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
-    )
-    total_tokens += val_tokens
-    if cancel_fn and cancel_fn():
-        return val_summary or exec_summary, total_tokens
-
-    if _validation_needs_fix_pass(val_summary):
-        if log_fn:
-            log_fn("info", "━━━ Post-validation fix pass ━━━")
-            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
-        fix_summary, fix_tokens = _openai_loop(
-            api_key, model, _UPDATE_SYSTEM, workspace,
-            _make_fix_prompt(val_summary), log_fn, cancel_fn, max_iterations=_ITERS_FIX,
-        )
-        total_tokens += fix_tokens
-        val_summary = fix_summary
-        if cancel_fn and cancel_fn():
-            return val_summary or exec_summary, total_tokens
-
-    if not _should_skip_security(plan):
-        if log_fn:
-            log_fn("info", "━━━ Security review phase ━━━")
-            log_fn("thinking", "Reviewing for security issues…")
-        sec_summary, sec_tokens = _openai_loop(
-            api_key, model, _SECURITY_SYSTEM, workspace,
-            _security_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
-        )
-        total_tokens += sec_tokens
-    elif log_fn:
-        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
-
-    return val_summary or exec_summary, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -3624,81 +3820,21 @@ def run_update_agent_openrouter(
         backend="Qwen3",
     )
     _log_plan(plan, log_fn)
-    # Sum usage across every phase so the update is billed for its full cost
-    # (see core/usage.py). Note: the planner call above routes through
-    # chat_openrouter, which doesn't surface usage — its (small) tokens aren't
-    # counted here; the tool-loop phases below are the bulk of the cost.
-    total_tokens = 0
+    # The planner call above routes through chat_openrouter, which doesn't
+    # surface usage — its (small) tokens aren't counted; the tool-loop phases
+    # below are the bulk of the cost.
 
-    if cancel_fn and cancel_fn():
-        return "Stopped by user.", total_tokens
-
-    design_summary = ""
-    if not _should_skip_design(plan):
-        if log_fn:
-            log_fn("info", "━━━ Design system phase ━━━")
-            log_fn("thinking", "Preparing design system…")
-        design_summary, design_tokens = _openrouter_loop(
-            _DESIGN_AGENT_SYSTEM, workspace,
-            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+    def run_phase(system: str, user_msg: str, iters: int) -> tuple[str, int]:
+        return _openrouter_loop(
+            system, workspace, user_msg,
+            log_fn, cancel_fn, max_iterations=iters,
         )
-        total_tokens += design_tokens
-        if cancel_fn and cancel_fn():
-            return design_summary or "Stopped by user.", total_tokens
-    elif log_fn:
-        log_fn("info", "Design phase skipped — no new components or theme changes.")
 
-    if log_fn:
-        log_fn("info", "━━━ Execution phase ━━━")
-    exec_summary, exec_tokens = _openrouter_loop(
-        _UPDATE_SYSTEM, workspace,
-        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
+    return _run_update_sequence(
+        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
+        app_name=app_name, template_key=template_key, plan=plan,
+        log_fn=log_fn, cancel_fn=cancel_fn,
     )
-    total_tokens += exec_tokens
-    if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", total_tokens
-
-    if log_fn:
-        log_fn("info", "━━━ Validation phase ━━━")
-        log_fn("thinking", "Validating implementation…")
-    val_summary, val_tokens = _openrouter_loop(
-        _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
-    )
-    total_tokens += val_tokens
-    if cancel_fn and cancel_fn():
-        return val_summary or exec_summary, total_tokens
-
-    if _validation_needs_fix_pass(val_summary):
-        if log_fn:
-            log_fn("info", "━━━ Post-validation fix pass ━━━")
-            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
-        fix_summary, fix_tokens = _openrouter_loop(
-            _UPDATE_SYSTEM, workspace,
-            _make_fix_prompt(val_summary), log_fn, cancel_fn, max_iterations=_ITERS_FIX,
-        )
-        total_tokens += fix_tokens
-        val_summary = fix_summary
-        if cancel_fn and cancel_fn():
-            return val_summary or exec_summary, total_tokens
-
-    if not _should_skip_security(plan):
-        if log_fn:
-            log_fn("info", "━━━ Security review phase ━━━")
-            log_fn("thinking", "Reviewing for security issues…")
-        _sec_summary, sec_tokens = _openrouter_loop(
-            _SECURITY_SYSTEM, workspace,
-            _security_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
-        )
-        total_tokens += sec_tokens
-    elif log_fn:
-        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
-
-    return val_summary or exec_summary, total_tokens
 
 
 # ---------------------------------------------------------------------------

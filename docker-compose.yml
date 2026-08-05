@@ -49,8 +49,15 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+
+      # Bot containers join this network so they can reach `api` by name.
+      ZOOM_BOT_NETWORK: ${ZOOM_BOT_NETWORK:-forgefy-backend_default}
     volumes:
       - .:/app
+      # Required only when ZOOM_BOT_PROVIDER=self_hosted: the worker spawns a
+      # bot container per Zoom meeting. NOTE this grants effective root on the
+      # host — drop this line to run Zoom through Recall instead.
+      - /var/run/docker.sock:/var/run/docker.sock
     command: >
       celery -A app.workers.celery_app worker
       --loglevel=info
@@ -73,6 +80,16 @@ services:
     volumes:
       - .:/app
     command: celery -A app.workers.celery_app beat --loglevel=info
+
+  # Self-hosted Zoom bot image. Never started by `docker compose up` — the
+  # worker creates one container per meeting from this image. It exists here
+  # so `docker compose --profile build-only build zoom-bot` produces it.
+  # Requires the Zoom Meeting SDK unpacked into zoom-bot/lib/zoomsdk first;
+  # see zoom-bot/README.md.
+  zoom-bot:
+    build: ./zoom-bot
+    image: forgefy-zoom-bot:latest
+    profiles: ["build-only"]
 
   # ollama:
   #   image: ollama/ollama

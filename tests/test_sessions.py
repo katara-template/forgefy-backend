@@ -235,7 +235,7 @@ class TestEndSessionFromBot:
 
         with (
             patch("app.workers.blueprint_worker.generate_blueprint") as mock_bp,
-            patch("app.workers.connector_worker.recall_remove_bot") as mock_remove,
+            patch("app.workers.zoom_bot_worker.remove_bot_for_session") as mock_remove,
         ):
             result = await service.end_session_from_bot(sess.id)
 
@@ -275,7 +275,7 @@ class TestEndSessionService:
 
         with (
             patch("app.workers.blueprint_worker.generate_blueprint") as mock_bp,
-            patch("app.workers.connector_worker.recall_remove_bot") as mock_remove,
+            patch("app.workers.zoom_bot_worker.remove_bot_for_session") as mock_remove,
         ):
             result = await service.end_session(sess.id, sess.user_id)
 
@@ -307,3 +307,88 @@ class TestEndSessionService:
 
         with pytest.raises(ValidationError):
             await service.end_session(sess.id, sess.user_id)
+
+
+class TestRegenerateBlueprint:
+    """Retrying a failed blueprint reruns aggregation only — the meeting is
+    not re-ended, so end_time and the bot lifecycle stay untouched."""
+
+    async def test_failed_session_is_requeued(self) -> None:
+        sess = _session(status=SessionStatus.FAILED)
+        db = _mock_db(_session_doc(sess))
+        service = _service_with_transition(db, sess)
+
+        with patch("app.workers.blueprint_worker.generate_blueprint") as mock_bp:
+            result = await service.regenerate_blueprint(sess.id, sess.user_id)
+
+        assert result.status == SessionStatus.PROCESSING
+        service._sm.transition.assert_awaited_once_with(sess.id, SessionStatus.PROCESSING)
+        mock_bp.apply_async.assert_called_once_with(
+            args=[str(sess.id)], queue="meeting.extract"
+        )
+
+    async def test_end_time_is_not_touched(self) -> None:
+        """The distinction from /end: a retry must not rewrite when the
+        meeting actually finished."""
+        sess = _session(status=SessionStatus.FAILED)
+        db = _mock_db(_session_doc(sess))
+        service = _service_with_transition(db, sess)
+
+        with patch("app.workers.blueprint_worker.generate_blueprint"):
+            await service.regenerate_blueprint(sess.id, sess.user_id)
+
+        db.collection.return_value.document.return_value.update.assert_not_awaited()
+
+    async def test_no_bot_removal_is_dispatched(self) -> None:
+        sess = _session(status=SessionStatus.FAILED)
+        service = _service_with_transition(_mock_db(_session_doc(sess)), sess)
+
+        with (
+            patch("app.workers.blueprint_worker.generate_blueprint"),
+            patch("app.workers.zoom_bot_worker.remove_bot_for_session") as mock_remove,
+        ):
+            await service.regenerate_blueprint(sess.id, sess.user_id)
+
+        mock_remove.apply_async.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            SessionStatus.WAITING,
+            SessionStatus.LISTENING,
+            SessionStatus.PROCESSING,
+            SessionStatus.BLUEPRINT_READY,
+            SessionStatus.BUILDING,
+        ],
+    )
+    async def test_rejects_sessions_that_have_not_failed(
+        self, status: SessionStatus
+    ) -> None:
+        from app.core.exceptions import ValidationError
+
+        sess = _session(status=status)
+        service = _service_with_transition(_mock_db(_session_doc(sess)), sess)
+
+        with pytest.raises(ValidationError):
+            await service.regenerate_blueprint(sess.id, sess.user_id)
+
+    async def test_another_users_session_is_not_found(self) -> None:
+        """Ownership is enforced before status, so a stranger cannot even
+        learn whether the session failed."""
+        from app.core.exceptions import NotFoundError
+
+        sess = _session(status=SessionStatus.FAILED)
+        service = _service_with_transition(_mock_db(_session_doc(sess)), sess)
+
+        with pytest.raises(NotFoundError):
+            await service.regenerate_blueprint(sess.id, uuid.uuid4())
+
+    async def test_missing_session_is_not_found(self) -> None:
+        from app.core.exceptions import NotFoundError
+
+        doc = MagicMock()
+        doc.exists = False
+        service = _service_with_transition(_mock_db(doc), _session())
+
+        with pytest.raises(NotFoundError):
+            await service.regenerate_blueprint(uuid.uuid4(), uuid.uuid4())

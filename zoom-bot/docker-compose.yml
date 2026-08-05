@@ -1,0 +1,45 @@
+# Standalone compose for the Zoom bot, independent of the main backend stack.
+#
+# The bot is NOT a long-running service — one container is created per meeting
+# and destroyed when it ends. This file exists to build the image and to give
+# `docker compose run` a convenient way to launch a single bot by hand.
+#
+#   docker compose build                 # produce forgefy-zoom-bot:latest
+#   docker compose run --rm bot          # join a meeting using .env values
+#
+# For scripted local runs prefer ../scripts/run_local.py, which mints the SDK
+# JWT for you. This file requires ZOOM_SDK_JWT to already be set.
+
+services:
+  bot:
+    build:
+      context: .
+    image: forgefy-zoom-bot:latest
+    # Never started by `docker compose up` — only by an explicit `run`.
+    profiles: ["manual"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Minted by the orchestrator (or scripts/run_local.py) — the bot never
+      # holds the SDK client secret itself.
+      ZOOM_SDK_JWT: ${ZOOM_SDK_JWT:?set ZOOM_SDK_JWT, e.g. via scripts/run_local.py}
+      ZOOM_MEETING_NUMBER: ${ZOOM_MEETING_NUMBER:?set the numeric meeting ID}
+      ZOOM_MEETING_PASSWORD: ${ZOOM_MEETING_PASSWORD:-}
+      ZOOM_DISPLAY_NAME: ${ZOOM_DISPLAY_NAME:-Forgefy Notetaker}
+      ZOOM_JOIN_TOKEN: ${ZOOM_JOIN_TOKEN:-}
+
+      FORGEFY_SESSION_ID: ${FORGEFY_SESSION_ID:-local-test}
+      FORGEFY_REQUIRE_HOST_CONSENT: ${FORGEFY_REQUIRE_HOST_CONSENT:-true}
+      FORGEFY_LEAVE_AFTER_SILENCE_SECS: ${FORGEFY_LEAVE_AFTER_SILENCE_SECS:-0}
+      FORGEFY_WEBHOOK_URL: ${FORGEFY_WEBHOOK_URL:-http://host.docker.internal:8080/webhook}
+      FORGEFY_WEBHOOK_SECRET: ${FORGEFY_WEBHOOK_SECRET:-devsecret}
+
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:?set your Deepgram API key}
+      DEEPGRAM_MODEL: ${DEEPGRAM_MODEL:-nova-3}
+    extra_hosts:
+      # Lets the container reach a mock backend on the host, on Linux too.
+      - "host.docker.internal:host-gateway"
+    mem_limit: 1g
+    # A bot must never be restarted into a meeting that has moved on.
+    restart: "no"

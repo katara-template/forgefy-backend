@@ -105,6 +105,35 @@ class TestTransition:
         with pytest.raises(InvalidStateTransition):
             await MeetingStateMachine(db).transition(session_id, SessionStatus.APPROVED)
 
+    async def test_failed_can_retry_into_processing(self) -> None:
+        """FAILED is recoverable: the user can rerun blueprint generation
+        without starting a new session."""
+        session_id, user_id = uuid.uuid4(), uuid.uuid4()
+        db = _db_with(SessionStatus.FAILED, session_id, user_id)
+
+        result = await MeetingStateMachine(db).transition(session_id, SessionStatus.PROCESSING)
+
+        assert result.status == SessionStatus.PROCESSING
+
+    async def test_failed_cannot_skip_straight_to_blueprint_ready(self) -> None:
+        """Retrying must re-enter PROCESSING so the work actually reruns."""
+        session_id, user_id = uuid.uuid4(), uuid.uuid4()
+        db = _db_with(SessionStatus.FAILED, session_id, user_id)
+
+        with pytest.raises(InvalidStateTransition):
+            await MeetingStateMachine(db).transition(
+                session_id, SessionStatus.BLUEPRINT_READY
+            )
+
+    async def test_processing_can_fail_again_after_a_retry(self) -> None:
+        """A retry that fails must land back in FAILED, so the button returns."""
+        session_id, user_id = uuid.uuid4(), uuid.uuid4()
+        db = _db_with(SessionStatus.PROCESSING, session_id, user_id)
+
+        result = await MeetingStateMachine(db).transition(session_id, SessionStatus.FAILED)
+
+        assert result.status == SessionStatus.FAILED
+
     async def test_not_found_raises(self) -> None:
         session_id, user_id = uuid.uuid4(), uuid.uuid4()
         db = _db_with(None, session_id, user_id)

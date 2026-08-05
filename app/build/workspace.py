@@ -617,6 +617,47 @@ def _find_package_root(path: Path) -> Path:
     return path
 
 
+def install_dependencies_at(path: Path, template_key: str, log_fn=None) -> bool:
+    """Resolve the workspace's dependencies. Returns True on success.
+
+    This has to happen BEFORE the agent phases run. A freshly cloned template has
+    no node_modules and no resolved Dart packages, so the validator's analyze_code()
+    tool ('dart analyze' / 'tsc --noEmit') reports every single import as
+    unresolved — errors the validator then reads as real, and the fix pass tries to
+    "fix" by rewriting working code.
+
+    build_artifacts_at() installs too, but that runs after the agent has finished.
+    Installing here is not duplicated work: the later install sees a warm tree and
+    returns quickly.
+
+    Never fatal — noisy analysis is worse than no build, but not worth failing over.
+    """
+    try:
+        if template_key == "flutter":
+            logger.info("Flutter: pub get (pre-agent) path=%s", path)
+            _run(["flutter", "pub", "get"], cwd=path, timeout=300)
+        elif template_key in ("next", "react_native"):
+            root = _find_package_root(path)
+            logger.info("npm install (pre-agent) path=%s", root)
+            _run(["npm", "install", "--legacy-peer-deps"], cwd=root, timeout=420)
+        else:
+            logger.warning("No dependency install defined for template=%s", template_key)
+            return False
+    except Exception as exc:
+        logger.warning("Pre-agent dependency install failed (%s): %s", template_key, exc)
+        if log_fn:
+            log_fn(
+                "warning",
+                "Dependency install failed — static analysis may report import errors "
+                "that are not real.",
+            )
+        return False
+
+    if log_fn:
+        log_fn("info", "Dependencies installed.")
+    return True
+
+
 def build_artifacts_at(path: Path, template_key: str) -> Path | None:
     """Compile and return the artifact path for the given workspace directory."""
     if template_key == "flutter":
