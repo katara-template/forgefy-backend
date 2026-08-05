@@ -75,6 +75,62 @@ class Settings(BaseSettings):
     # Relative paths resolve against the backend root. Skipped if missing.
     RECALL_BOT_AVATAR_PATH: str = "assets/bot_avatar.jpg"
 
+    # ── Zoom bot provider ────────────────────────────────────────────────────
+    # Which bot joins Zoom meetings: "recall" (cloud, billed per bot-hour) or
+    # "self_hosted" (our own Meeting SDK container — see zoom-bot/README.md).
+    # Affects Zoom only; Meet and Teams always use Recall.
+    ZOOM_BOT_PROVIDER: str = "recall"
+
+    # Meeting SDK app credentials from marketplace.zoom.us. The secret is used
+    # only to sign the bot's JWT — it never enters the bot container, which
+    # joins untrusted meetings.
+    ZOOM_SDK_CLIENT_ID: str = ""
+    ZOOM_SDK_CLIENT_SECRET: str = ""
+
+    # OAuth credentials for minting per-meeting OBF tokens, which Zoom has
+    # required since 2026-03-02 to join meetings hosted on other accounts.
+    # Leave blank when the Marketplace app provides both features under one
+    # Client ID — the ZOOM_SDK_* values are used as the fallback.
+    ZOOM_OAUTH_CLIENT_ID: str = ""
+    ZOOM_OAUTH_CLIENT_SECRET: str = ""
+
+    # Image each per-meeting container is launched from. Build it with
+    # `docker compose --profile build-only build zoom-bot`.
+    ZOOM_BOT_IMAGE: str = "forgefy-zoom-bot:latest"
+
+    # Docker network the bot joins. It must be able to reach the API by name;
+    # blank means Docker's default bridge, which usually cannot.
+    ZOOM_BOT_NETWORK: str = ""
+
+    # Where the bot posts transcript and lifecycle events. Internal by default:
+    # unlike Recall this needs no publicly reachable URL and no tunnel.
+    ZOOM_BOT_CALLBACK_URL: str = "http://api:5000"
+
+    # Shown in the participant list — the bot's primary disclosure to everyone
+    # in the meeting, so keep it self-describing.
+    ZOOM_BOT_DISPLAY_NAME: str = "Forgefy Notetaker"
+
+    # Require the host to grant local recording privilege before any audio is
+    # captured. Zoom enforces this regardless; setting it false only stops the
+    # bot from *asking*, which then requires a pre-authorized join token.
+    ZOOM_BOT_REQUIRE_HOST_CONSENT: bool = True
+
+    # Leave once no other participant remains, so an abandoned meeting cannot
+    # hold a container open indefinitely. 0 disables the watchdog.
+    ZOOM_BOT_LEAVE_AFTER_SILENCE_SECS: int = 120
+
+    @field_validator("ZOOM_BOT_PROVIDER")
+    @classmethod
+    def _known_zoom_provider(cls, v: str) -> str:
+        """Fail at startup rather than at the first meeting on a typo."""
+        allowed = {"recall", "self_hosted"}
+        value = v.strip().lower()
+        if value not in allowed:
+            raise ValueError(
+                f"ZOOM_BOT_PROVIDER must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return value
+
     # Cloudinary (APK / bundle storage)
     CLOUDINARY_CLOUD_NAME: str = ""
     CLOUDINARY_API_KEY: str = ""
@@ -127,6 +183,13 @@ class Settings(BaseSettings):
     TEMPLATE_FLUTTER: str = "https://github.com/katara-template/flutter-clean-bloc.git"
     TEMPLATE_REACT_NATIVE: str = "https://github.com/katara-template/rn-redux.git"
     TEMPLATE_NEXT: str = "https://github.com/katara-template/next-ts.git"
+
+    # ElevenLabs Conversational AI (voice chat)
+    ELEVENLABS_API_KEY: str = ""
+    ELEVENLABS_AGENT_ID: str = ""
+    # Shared secret used to sign voice session tokens so the /voice/llm
+    # endpoint can verify calls originated from a valid signed session.
+    ELEVENLABS_VOICE_SECRET: str = "changeme-voice-secret"
 
     # fal.ai (image + video generation)
     FAL_API_KEY: str = ""

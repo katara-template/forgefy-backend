@@ -24,8 +24,18 @@ DELETE_MEDIA_COUNTDOWN_SECONDS = 120
     acks_late=True,
     reject_on_worker_lost=True,
 )
-def dispatch_connector(session_id: str, platform: str, meeting_url: str | None) -> None:
-    """Create a Recall.ai bot to join the meeting (non-blocking HTTP call)."""
+def dispatch_connector(
+    session_id: str,
+    platform: str,
+    meeting_url: str | None,
+    user_id: str | None = None,
+) -> None:
+    """Send a bot to join the meeting.
+
+    Which bot depends on platform and ZOOM_BOT_PROVIDER — for Recall this is a
+    non-blocking HTTP call, for a self-hosted Zoom bot it launches a container.
+    user_id is optional so tasks queued before it was added still run.
+    """
     from app.db.models.enums import Platform
 
     try:
@@ -35,14 +45,17 @@ def dispatch_connector(session_id: str, platform: str, meeting_url: str | None) 
         return
 
     try:
-        connector = get_connector(plat)
+        connector = get_connector(plat, user_id=user_id)
     except (NotImplementedError, RuntimeError) as exc:
         logger.warning("No connector for session=%s: %s", session_id, exc)
         return
 
     try:
         connector.join(meeting_url or "", session_id)
-        logger.info("Recall bot dispatched session=%s platform=%s", session_id, platform)
+        logger.info(
+            "Bot dispatched session=%s platform=%s via=%s",
+            session_id, platform, type(connector).__name__,
+        )
     except Exception as exc:
         logger.error("Connector error session=%s: %s", session_id, exc, exc_info=True)
 

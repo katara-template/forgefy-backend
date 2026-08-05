@@ -7,6 +7,7 @@ import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from app.config import get_settings
 from app.workers.celery_app import celery_app
@@ -14,6 +15,17 @@ from app.workers.celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 _TEMPLATE_KEYS = frozenset({"flutter", "react_native", "next"})
+
+
+def _label(item: Any, key: str) -> str:
+    """Render a blueprint feature/entity as a short log label.
+
+    Blueprint items are dicts, but older sessions stored bare strings — handle
+    both so a build log never dumps a raw dict at the user.
+    """
+    if isinstance(item, dict):
+        return str(item.get(key) or item.get("name") or item.get("title") or "").strip() or "?"
+    return str(item)
 
 
 class _BuildFixExhausted(RuntimeError):
@@ -659,12 +671,12 @@ async def _run(session_id: str, project_id: str) -> dict:
     log_fn("started", f"Starting build for {app_name} ({template_key})")
 
     # Log the feature plan so users immediately see what will be built
-    features: list[str] = json_output.get("features") or []
-    entities: list[str] = json_output.get("entities") or []
+    features: list[Any] = json_output.get("features") or []
+    entities: list[Any] = json_output.get("entities") or []
     if features:
-        log_fn("info", f"Features to build: {', '.join(str(f) for f in features[:12])}")
+        log_fn("info", f"Features to build: {', '.join(_label(f, 'title') for f in features[:12])}")
     if entities:
-        log_fn("info", f"Data models: {', '.join(str(e) for e in entities[:8])}")
+        log_fn("info", f"Data models: {', '.join(_label(e, 'name') for e in entities[:8])}")
     stack_label = {"flutter": "Flutter", "react_native": "React Native", "next": "Next.js"}.get(template_key, template_key)
     log_fn("info", f"Stack: {stack_label} · scaffolding project structure…")
 
@@ -715,6 +727,13 @@ async def _run(session_id: str, project_id: str) -> dict:
         except Exception as _ds_exc:
             logger.warning("Design system generation failed (non-fatal): %s", _ds_exc)
             log_fn("info", "Design system generation skipped — build agent will create styles.")
+
+        # 8.6 Install dependencies before the agent runs. Without this the
+        # validator's analyze_code() sees every import as unresolved and the fix
+        # pass burns iterations chasing errors that don't exist.
+        log_fn("info", "Installing dependencies…")
+        from app.build.workspace import install_dependencies_at
+        install_dependencies_at(workspace.path, template_key, log_fn=log_fn)
 
         log_fn("info", "Running build agent…")
 

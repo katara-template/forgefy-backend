@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 from google.cloud.firestore import AsyncClient
 
+from app.core.dispatch import dispatch
 from app.core.exceptions import NotFoundError, ValidationError
 from app.db.models.enums import Platform, SessionStatus
 from app.db.models.meeting_event import MeetingEvent
@@ -144,7 +145,14 @@ class VoxaService:
         if session.platform != Platform.PHYSICAL:
             from app.workers.connector_worker import dispatch_connector
             dispatch_connector.apply_async(
-                args=[str(session_id), session.platform.value, session.meeting_url],
+                # user_id lets a self-hosted Zoom bot mint the OBF token it
+                # needs from this user's Zoom grant; Recall ignores it.
+                args=[
+                    str(session_id),
+                    session.platform.value,
+                    session.meeting_url,
+                    str(session.user_id),
+                ],
                 queue="meeting.audio",
             )
         return session
@@ -227,6 +235,37 @@ class VoxaService:
         except InvalidStateTransition:
             return None
 
+    async def regenerate_blueprint(
+        self,
+        session_id: uuid.UUID,
+        user_id: uuid.UUID,
+    ) -> MeetingSession:
+        """Re-run blueprint generation for a session whose last attempt failed.
+
+        The transcript and extracted requirements are already stored, so only
+        the aggregation step repeats — the meeting is not rejoined and
+        end_time is left as originally recorded.
+        """
+        session = await self._require_owned(session_id, user_id)
+
+        if session.status != SessionStatus.FAILED:
+            raise ValidationError(
+                f"Can only retry blueprint generation for a failed session, "
+                f"not one in '{session.status.value}' state"
+            )
+
+        session = await self._sm.transition(session_id, SessionStatus.PROCESSING)
+
+        from app.workers.blueprint_worker import generate_blueprint
+        await dispatch(
+            generate_blueprint,
+            args=[str(session_id)],
+            queue="meeting.extract",
+        )
+
+        logger.info("Blueprint regeneration requested session=%s", session_id)
+        return session
+
     async def get_session(
         self,
         session_id: uuid.UUID,
@@ -284,8 +323,14 @@ class VoxaService:
         session.end_time = end_time
 
         if remove_bot and platform != Platform.PHYSICAL:
-            from app.workers.connector_worker import recall_remove_bot
-            recall_remove_bot.apply_async(args=[str(session_id)], queue="meeting.audio")
+            # Dispatches on which bot actually served this session (Recall or a
+            # self-hosted Zoom container) rather than on current config, so a
+            # session started before ZOOM_BOT_PROVIDER changed is still torn
+            # down by the connector that created it.
+            from app.workers.zoom_bot_worker import remove_bot_for_session
+            remove_bot_for_session.apply_async(
+                args=[str(session_id)], queue="meeting.audio"
+            )
 
         from app.workers.blueprint_worker import generate_blueprint
         generate_blueprint.apply_async(

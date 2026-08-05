@@ -116,6 +116,23 @@ async def start_live_transcription(
     return SessionOut.model_validate(session)
 
 
+@router.post("/{session_id}/regenerate-blueprint", response_model=SessionOut)
+async def regenerate_blueprint(
+    session_id: uuid.UUID,
+    db: DBSession,
+    user: CurrentUser,
+) -> SessionOut:
+    """Retry blueprint generation after a failed attempt.
+
+    Distinct from /end, which ends a live meeting: this reruns only the
+    aggregation step over the transcript already captured, so end_time and the
+    bot lifecycle are left untouched.
+    """
+    service = VoxaService(db)
+    session = await service.regenerate_blueprint(session_id, user.id)
+    return SessionOut.model_validate(session)
+
+
 @router.get("/{session_id}/transcript")
 async def get_session_transcript(
     session_id: uuid.UUID,

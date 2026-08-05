@@ -106,6 +106,7 @@ class TestRunExtraction:
             patch("app.ai.pipeline.question_detector.run", _agent_stub({"questions": []})),
             patch("app.ai.pipeline.conflict_detector.run", _agent_stub({"conflicts": []})),
             patch("app.ai.pipeline.action_item_extractor.run", _agent_stub({"action_items": []})),
+            patch("app.ai.pipeline.data_model_extractor.run", _agent_stub({"entities": []})),
         ):
             events = run_pipeline("transcript", "fake", "m")
 

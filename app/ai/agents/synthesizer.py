@@ -9,6 +9,13 @@ from app.ai.agents.base import _load_prompt, call_claude
 
 _SYSTEM = _load_prompt("synthesizer")
 
+# The Anthropic API requires max_tokens — unlike Gemini it cannot be omitted —
+# so this is a deliberately generous ceiling rather than no ceiling. Output
+# here scales with how much the meeting covered, and truncation mid-JSON fails
+# the whole blueprint, so the budget must clear any realistic transcript.
+# Must not exceed the configured model's own output limit.
+_SYNTHESIS_MAX_TOKENS = 32000
+
 
 def run(transcript: str, api_key: str, model: str) -> list[dict]:
     """Return a flat list of extraction events from a single Claude call.
@@ -16,7 +23,9 @@ def run(transcript: str, api_key: str, model: str) -> list[dict]:
     Each event has ``sub_state`` (FEATURE_FOUND etc.) and ``payload`` matching
     the same schema used by the per-segment pipeline.
     """
-    result = call_claude(_SYSTEM, transcript, api_key, model, max_tokens=2048)
+    result = call_claude(
+        _SYSTEM, transcript, api_key, model, max_tokens=_SYNTHESIS_MAX_TOKENS
+    )
 
     events: list[dict] = []
     if app_name := result.get("app_name", ""):

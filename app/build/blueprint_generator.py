@@ -1,9 +1,9 @@
 """BlueprintAggregator — assembles extraction events into a structured blueprint.
 
 Reads FEATURE_FOUND / QUESTION_FOUND / CONFLICT_FOUND / ACTION_ITEM_FOUND /
-APP_DESCRIPTION events from the session's events subcollection, structures them
-into a JSON document, saves a Blueprint document, and transitions the session
-to BLUEPRINT_READY.
+ENTITY_FOUND / APP_DESCRIPTION events from the session's events subcollection,
+structures them into a JSON document, saves a Blueprint document, and
+transitions the session to BLUEPRINT_READY.
 
 If no extraction events exist, falls back to synthesising from raw
 transcript.segment events stored by the extraction worker.
@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -71,7 +72,10 @@ def _name_from_description(description: str) -> str:
 
 
 _EXTRACTION_TYPES = frozenset(
-    {"APP_DESCRIPTION", "FEATURE_FOUND", "QUESTION_FOUND", "CONFLICT_FOUND", "ACTION_ITEM_FOUND"}
+    {
+        "APP_DESCRIPTION", "FEATURE_FOUND", "QUESTION_FOUND", "CONFLICT_FOUND",
+        "ACTION_ITEM_FOUND", "ENTITY_FOUND",
+    }
 )
 
 # Keyword sets for platform inference.  Multi-word phrases rank higher
@@ -89,6 +93,69 @@ _MOBILE_PHRASES = frozenset({
     "app store", "play store", "push notification", "native app", "flutter",
     "ios", "android",
 })
+
+
+def _merge_entities(payloads: Iterable[dict]) -> list[dict]:
+    """Union ENTITY_FOUND payloads into one entity list, deduped by name.
+
+    The pipeline runs per transcript segment, so one entity ("Invoice") is
+    typically reported many times, each with whatever fields that segment
+    happened to mention. Appending them verbatim would hand the build agent a
+    dozen partial Invoices; merging gives it one entity with the union of the
+    fields.
+
+    Field-level conflicts resolve conservatively: the first type seen wins
+    (later segments are usually vaguer, not more precise), and `required` is
+    sticky — if any segment says a field is required, it stays required.
+    """
+    merged: dict[str, dict] = {}
+
+    for payload in payloads:
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.casefold()
+
+        entity = merged.setdefault(
+            key,
+            {"name": name, "description": "", "fields": [], "relationships": []},
+        )
+
+        if not entity["description"]:
+            entity["description"] = str(payload.get("description") or "").strip()
+
+        fields_by_name = {f["name"]: f for f in entity["fields"]}
+        for field in payload.get("fields") or []:
+            fname = str(field.get("name") or "").strip()
+            if not fname:
+                continue
+            existing = fields_by_name.get(fname)
+            if existing is None:
+                new_field = {
+                    "name": fname,
+                    "type": str(field.get("type") or "text"),
+                    "required": bool(field.get("required")),
+                    "notes": str(field.get("notes") or ""),
+                }
+                entity["fields"].append(new_field)
+                fields_by_name[fname] = new_field
+            else:
+                existing["required"] = existing["required"] or bool(field.get("required"))
+                if not existing["notes"]:
+                    existing["notes"] = str(field.get("notes") or "")
+
+        seen_rels = {(r["kind"], r["target"].casefold()) for r in entity["relationships"]}
+        for rel in payload.get("relationships") or []:
+            kind = str(rel.get("kind") or "").strip()
+            target = str(rel.get("target") or "").strip()
+            if not kind or not target or (kind, target.casefold()) in seen_rels:
+                continue
+            entity["relationships"].append(
+                {"kind": kind, "target": target, "notes": str(rel.get("notes") or "")}
+            )
+            seen_rels.add((kind, target.casefold()))
+
+    return list(merged.values())
 
 
 def _detect_platform(json_output: dict) -> str:
@@ -297,6 +364,9 @@ class BlueprintAggregator:
                     model=settings.ANTHROPIC_MODEL,
                     max_tokens=1024,
                     system=_SYSTEM,
+                    # Sonnet 5+ thinks by default; thinking blocks lead `content`, so
+                    # content[0].text below would hit a ThinkingBlock. JSON-only call.
+                    thinking={"type": "disabled"},
                     messages=[{"role": "user", "content": f"App description:\n{description}"}],
                 )
                 features = _json.loads(msg.content[0].text.strip())
@@ -371,6 +441,9 @@ class BlueprintAggregator:
                     model=settings.ANTHROPIC_MODEL,
                     max_tokens=32,
                     system=_NAME_SYSTEM,
+                    # Sonnet 5+ thinks by default, and a 32-token budget would be spent
+                    # entirely on thinking — leaving no answer at all.
+                    thinking={"type": "disabled"},
                     messages=[{"role": "user", "content": content}],
                 )
                 text = msg.content[0].text.strip()
@@ -462,6 +535,9 @@ class BlueprintAggregator:
                     model=settings.ANTHROPIC_MODEL,
                     max_tokens=1024,
                     system=_SYSTEM,
+                    # Sonnet 5+ thinks by default; thinking blocks lead `content`, so
+                    # content[0].text below would hit a ThinkingBlock. JSON-only call.
+                    thinking={"type": "disabled"},
                     messages=[{"role": "user", "content": content}],
                 )
                 raw = (msg.content[0].text or "").strip()
@@ -527,6 +603,12 @@ class BlueprintAggregator:
         questions = [e["payload"] for e in events if e["sub_state"] == "QUESTION_FOUND"]
         conflicts = [e["payload"] for e in events if e["sub_state"] == "CONFLICT_FOUND"]
         action_items = [e["payload"] for e in events if e["sub_state"] == "ACTION_ITEM_FOUND"]
+        # Synthesis backends (Qwen/Gemini/Claude whole-transcript) do not emit
+        # ENTITY_FOUND — only the LangGraph pipeline does. Absent here means
+        # "no schema signal", and _merge_entities handles the empty list.
+        entities = _merge_entities(
+            e["payload"] for e in events if e["sub_state"] == "ENTITY_FOUND"
+        )
 
         return {
             "version": "1.0",
@@ -539,6 +621,7 @@ class BlueprintAggregator:
             "open_questions": questions,
             "conflicts": conflicts,
             "action_items": action_items,
+            "entities": entities,
             "requirements_count": len(features) + len(questions) + len(conflicts) + len(action_items),
         }
 
@@ -558,6 +641,9 @@ def _build_blueprint_json(
     questions = [e["payload"] for e in events if e.get("event_type") == "QUESTION_FOUND" and e.get("payload")]
     conflicts = [e["payload"] for e in events if e.get("event_type") == "CONFLICT_FOUND" and e.get("payload")]
     action_items = [e["payload"] for e in events if e.get("event_type") == "ACTION_ITEM_FOUND" and e.get("payload")]
+    entities = _merge_entities(
+        e["payload"] for e in events if e.get("event_type") == "ENTITY_FOUND" and e.get("payload")
+    )
 
     return {
         "version": "1.0",
@@ -570,6 +656,7 @@ def _build_blueprint_json(
         "open_questions": questions,
         "conflicts": conflicts,
         "action_items": action_items,
+        "entities": entities,
         "requirements_count": len(features) + len(questions) + len(conflicts) + len(action_items),
     }
 
@@ -630,6 +717,9 @@ async def classify_needs_database(description: str, features: list[dict]) -> tup
                 model=settings.ANTHROPIC_MODEL,
                 max_tokens=256,
                 system=_DB_NEED_SYSTEM,
+                # Sonnet 5+ thinks by default; thinking blocks lead `content`, so
+                # content[0].text below would hit a ThinkingBlock. JSON-only call.
+                thinking={"type": "disabled"},
                 messages=[{"role": "user", "content": content}],
             )
             result = _json.loads(msg.content[0].text.strip())

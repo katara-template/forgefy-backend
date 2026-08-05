@@ -105,7 +105,15 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
 
     try:
         workspace.ensure()
-        log_fn("info", "Workspace ready, running update agent…")
+
+        # Install before the agent runs — analyze_code() reports every import as
+        # unresolved in a tree with no node_modules / resolved Dart packages, and
+        # the validator reads those as real errors.
+        log_fn("info", "Workspace ready, installing dependencies…")
+        from app.build.workspace import install_dependencies_at
+        install_dependencies_at(workspace.path, template_key, log_fn=log_fn)
+
+        log_fn("info", "Running update agent…")
 
         from app.core.build_model import get_effective_build_model
         build_model = await get_effective_build_model(db, settings, user_id=user_id)

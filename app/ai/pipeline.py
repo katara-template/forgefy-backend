@@ -9,6 +9,7 @@ Graph topology (parallel fan-out):
           ──→ question_detector     ──→ END
           ──→ conflict_detector     ──→ END
           ──→ action_item_extractor ──→ END
+          ──→ data_model_extractor  ──→ END
 
 Two entry points:
   run_pipeline    — events only; used by the meeting extraction worker.
@@ -27,6 +28,7 @@ from langgraph.graph import END, START, StateGraph
 from app.ai.agents import (
     action_item_extractor,
     conflict_detector,
+    data_model_extractor,
     feature_extractor,
     question_detector,
 )
@@ -39,6 +41,7 @@ EXTRACTORS: dict[str, str] = {
     "questions": "question_detector",
     "conflicts": "conflict_detector",
     "action_items": "action_item_extractor",
+    "entities": "data_model_extractor",
 }
 
 # Event sub_state → public extractor/group name (the inverse mapping, used to
@@ -48,14 +51,16 @@ SUB_STATE_TO_GROUP: dict[str, str] = {
     "QUESTION_FOUND": "questions",
     "CONFLICT_FOUND": "conflicts",
     "ACTION_ITEM_FOUND": "action_items",
+    "ENTITY_FOUND": "entities",
 }
 
 
 def group_events(events: Iterable[dict], requested: Iterable[str] | None = None) -> dict:
     """Group extraction events by public extractor name, dropping unrequested ones.
 
-    Returns ``{"features": [...], "questions": [...], ...}`` — always all four
-    keys, empty lists for groups with no events or not in ``requested``.
+    Returns ``{"features": [...], "questions": [...], ...}`` — always every
+    key in EXTRACTORS, empty lists for groups with no events or not in
+    ``requested``.
     """
     wanted = set(requested) if requested is not None else set(EXTRACTORS)
     groups: dict[str, list[dict]] = {name: [] for name in EXTRACTORS}
@@ -116,6 +121,9 @@ _NODES = {
     "action_item_extractor": _make_node(
         action_item_extractor, "action_items", "ACTION_ITEM_FOUND", "action_item_extractor"
     ),
+    "data_model_extractor": _make_node(
+        data_model_extractor, "entities", "ENTITY_FOUND", "data_model_extractor"
+    ),
 }
 
 
@@ -126,7 +134,7 @@ def build_pipeline(extractors: Iterable[str] | None = None) -> Any:
     """Compile and return the LangGraph extraction pipeline (parallel fan-out).
 
     ``extractors`` takes public names from EXTRACTORS (e.g. ["features"]);
-    None means all four.
+    None means all of them.
     """
     if extractors is None:
         node_names = list(_NODES)
@@ -157,8 +165,8 @@ def run_extraction(
     """Run the pipeline and return events, aggregate token usage, and errors.
 
     Returns ``{"events": [...], "usage": {"input_tokens", "output_tokens"},
-    "errors": [...]}``. Each event has ``sub_state`` (one of the four FOUND
-    types) and ``payload``.
+    "errors": [...]}``. Each event has ``sub_state`` (one of the FOUND types
+    in SUB_STATE_TO_GROUP) and ``payload``.
     """
     pipeline = build_pipeline(extractors)
     final_state = pipeline.invoke(
@@ -192,6 +200,7 @@ def run_extraction(
 def run_pipeline(transcript: str, api_key: str, model: str) -> list[dict]:
     """Run the extraction pipeline and return a list of extraction events.
 
-    Each event has ``sub_state`` (one of the four FOUND types) and ``payload``.
+    Each event has ``sub_state`` (one of the FOUND types in SUB_STATE_TO_GROUP)
+    and ``payload``.
     """
     return run_extraction(transcript, api_key, model)["events"]

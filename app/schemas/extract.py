@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, field_validator
 
-Extractor = Literal["features", "questions", "conflicts", "action_items"]
+Extractor = Literal["features", "questions", "conflicts", "action_items", "entities"]
 JobStatus = Literal["queued", "processing", "done", "failed"]
 
 # ~2-3 hours of speech; anything longer belongs on the async jobs endpoint,
@@ -22,7 +22,7 @@ _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 class ExtractRequest(BaseModel):
     transcript: str
-    extractors: list[Extractor] | None = None  # None → all four
+    extractors: list[Extractor] | None = None  # None → all of them
     model_tier: Literal["standard", "economy"] = "standard"
 
     @field_validator("transcript")
@@ -58,6 +58,7 @@ class ExtractResponse(BaseModel):
     questions: list[dict] = []
     conflicts: list[dict] = []
     action_items: list[dict] = []
+    entities: list[dict] = []
     usage: ExtractUsage
 
 
@@ -66,7 +67,7 @@ class ExtractResponse(BaseModel):
 
 class ExtractJobRequest(BaseModel):
     transcript: str
-    extractors: list[Extractor] | None = None  # None → all four
+    extractors: list[Extractor] | None = None  # None → all of them
     model_tier: Literal["standard", "economy"] = "standard"
     webhook_url: str | None = None  # POSTed the result when the job finishes
 

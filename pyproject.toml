@@ -44,6 +44,9 @@ dependencies = [
     # Browser automation
     "playwright>=1.49.0",
 
+    # Spawning self-hosted Zoom bot containers (ZOOM_BOT_PROVIDER=self_hosted)
+    "docker>=7.1.0",
+
     # HTTP client
     "httpx>=0.27.0",
 
