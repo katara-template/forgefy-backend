@@ -147,13 +147,14 @@ def _run_agent_fix(
                 log_fn=log_fn,
             )
         else:
+            from app.ai.ollama_http import ollama_base_url, ollama_build_model
             summary, _ = run_fix_agent_ollama(
                 workspace=workspace_path,
                 prompt=fix_prompt,
                 app_name=app_name,
                 template_key=template_key,
-                base_url=settings.OLLAMA_URL,
-                model=settings.OLLAMA_MODEL,
+                base_url=ollama_base_url(settings),
+                model=ollama_build_model(settings),
                 timeout=settings.OLLAMA_TIMEOUT,
                 log_fn=log_fn,
             )
@@ -751,13 +752,14 @@ async def _run(session_id: str, project_id: str) -> dict:
                     log_fn=log_fn,
                 )
             else:
+                from app.ai.ollama_http import ollama_base_url, ollama_build_model
                 summary, tokens_used = run_build_agent_ollama(
                     workspace=workspace.path,
                     blueprint=json_output,
                     app_name=app_name,
                     template_key=template_key,
-                    base_url=settings.OLLAMA_URL,
-                    model=settings.OLLAMA_MODEL,
+                    base_url=ollama_base_url(settings),
+                    model=ollama_build_model(settings),
                     timeout=settings.OLLAMA_TIMEOUT,
                     log_fn=log_fn,
                 )

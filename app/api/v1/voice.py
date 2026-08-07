@@ -369,8 +369,10 @@ async def _call_llm(system: str, message: str, settings) -> str:
                 from app.ai.openrouter import PLAN, chat_openrouter
 
                 return chat_openrouter(system, message, task=PLAN, max_tokens=512)
+            from app.ai.ollama_http import ollama_base_url, ollama_headers
+
             r = _req.post(
-                f"{settings.OLLAMA_URL.rstrip('/')}/api/chat",
+                f"{ollama_base_url(settings)}/api/chat",
                 json={
                     "model": settings.OLLAMA_MODEL,
                     "messages": [
@@ -379,6 +381,7 @@ async def _call_llm(system: str, message: str, settings) -> str:
                     ],
                     "stream": False,
                 },
+                headers=ollama_headers(settings),
                 timeout=60,
             )
             r.raise_for_status()

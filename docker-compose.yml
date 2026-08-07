@@ -58,6 +58,10 @@ services:
       # bot container per Zoom meeting. NOTE this grants effective root on the
       # host — drop this line to run Zoom through Recall instead.
       - /var/run/docker.sock:/var/run/docker.sock
+    # Concurrency comes from CELERY_CONCURRENCY via celery_app.conf, NOT a
+    # --concurrency flag here: the flag overrides config, which is how this and
+    # Dockerfile.worker would drift apart. Scale out with
+    # `docker compose up --scale worker=N` rather than raising it.
     command: >
       celery -A app.workers.celery_app worker
       --loglevel=info

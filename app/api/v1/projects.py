@@ -567,8 +567,10 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
                     from app.ai.openrouter import PLAN, chat_openrouter
                     return chat_openrouter(system, message, task=PLAN, max_tokens=4096)
 
+                from app.ai.ollama_http import ollama_base_url, ollama_headers
+
                 r = _req.post(
-                    f"{settings.OLLAMA_URL.rstrip('/')}/api/chat",
+                    f"{ollama_base_url(settings)}/api/chat",
                     json={
                         "model": settings.OLLAMA_MODEL,
                         "messages": [
@@ -577,6 +579,7 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
                         ],
                         "stream": False,
                     },
+                    headers=ollama_headers(settings),
                     timeout=120,
                 )
                 r.raise_for_status()

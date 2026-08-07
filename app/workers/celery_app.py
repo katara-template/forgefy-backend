@@ -33,6 +33,24 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_track_started=True,
+    # ── Tuning for long tasks ────────────────────────────────────────────────
+    # A build runs for minutes. Celery's default prefetch of 4 has each worker
+    # process reserve four of them up front, so those sit unstarted behind one
+    # running build while other workers idle. For long tasks the only sane
+    # value is 1: take one, finish it, take the next.
+    worker_prefetch_multiplier=1,
+    # Redis re-delivers any acks_late task still running after this window.
+    # Left at the 1h default, a slow build gets handed to a second worker while
+    # the first is still writing — two agents editing one workspace.
+    broker_transport_options={"visibility_timeout": _s.CELERY_VISIBILITY_TIMEOUT},
+    result_backend_transport_options={"visibility_timeout": _s.CELERY_VISIBILITY_TIMEOUT},
+    # Prefork children hold large agent contexts; recycle them so a leak in one
+    # build cannot accumulate across every build that worker ever runs.
+    worker_max_tasks_per_child=_s.CELERY_MAX_TASKS_PER_CHILD,
+    # Single source of truth for concurrency. Both entrypoints (docker-compose
+    # and Dockerfile.worker) deliberately omit --concurrency, which would
+    # override this and let the two drift apart again.
+    worker_concurrency=_s.CELERY_CONCURRENCY,
     task_routes={
         "app.workers.connector_worker.*": {"queue": "meeting.audio"},
         "app.workers.zoom_bot_worker.*": {"queue": "meeting.audio"},

@@ -59,8 +59,10 @@ Copy `.env.example` to `.env` and fill in your values. Below are the variables m
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-5` | Claude model for agent pipeline |
 | `GEMINI_API_KEY` | *(empty)* | Google Gemini API key |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model |
-| `OLLAMA_URL` | `http://ollama:11434` | Ollama endpoint — use `http://localhost:11434` outside Docker |
-| `OLLAMA_MODEL` | `qwen3:8b` | Ollama model tag to use for blueprint generation |
+| `OLLAMA_URL` | `http://ollama:11434` | Ollama endpoint — use `http://localhost:11434` outside Docker. Ignored (defaults to `https://ollama.com`) when `OLLAMA_API_KEY` is set |
+| `OLLAMA_API_KEY` | _(empty)_ | Set to use [Ollama Cloud](https://ollama.com/settings/keys) instead of a local daemon — pair with a `-cloud` model tag |
+| `OLLAMA_MODEL` | `qwen3:8b` | Ollama model tag to use for blueprint generation — e.g. `nemotron-3-super` on Ollama Cloud |
+| `OLLAMA_BUILD_MODEL` | _(empty)_ | Separate model for code generation; falls back to `OLLAMA_MODEL`. Worth setting — see below |
 | `OLLAMA_TIMEOUT` | `300` | Request timeout in seconds — increase for slow hardware or long transcripts |
 | `BP_MODEL` | `claude` | Blueprint generation backend: `claude` / `gemini` / `Qwen3` |
 | `OPENAI_API_KEY` | *(empty)* | OpenAI API key (embeddings) |
@@ -247,6 +249,120 @@ Restart the worker for the change to take effect:
 ```bash
 docker compose restart worker
 ```
+
+### Using Ollama Cloud instead of a local daemon
+
+Set an API key and every Ollama call is sent to `https://ollama.com` with an
+`Authorization: Bearer` header — no GPU, no model pull, no `ollama` container:
+
+```env
+BP_MODEL=Qwen3
+BUILD_MODEL=Qwen3
+OLLAMA_API_KEY=...          # from https://ollama.com/settings/keys
+OLLAMA_MODEL=qwen3.5:cloud  # cloud tags end in -cloud
+```
+
+`OLLAMA_URL` is ignored while it stays at a local default (`http://ollama:11434`
+or `http://localhost:11434`); set it explicitly only for a self-hosted endpoint
+or a proxy. Cloud models keep their full context window, so the `num_ctx=8192`
+cap applied to local models is skipped and the build agent retains more history.
+
+Against `https://ollama.com` the tags are bare names (`nemotron-3-super`), not
+the `-cloud` suffixed form used when a *local* daemon pulls a cloud model. List
+what your key can reach with:
+
+```bash
+curl -s https://ollama.com/api/tags -H "Authorization: Bearer $OLLAMA_API_KEY"
+```
+
+Most models there require a paid plan and return HTTP 403; the free tier covers
+`nemotron-3-super`, `nemotron-3-ultra`, `nemotron-3-nano:30b`, `gpt-oss:20b`,
+`gpt-oss:120b`, `gemma4:31b` and `minimax-m3`. Of those, only
+**`nemotron-3-super`**, `gemma4:31b` and `minimax-m3` support both tool-calling
+(needed by the build agent) and `format=json` (needed by the synthesizer) — the
+`gpt-oss` and nano models do tools but not JSON mode.
+
+**Precedence:** `OLLAMA_API_KEY` wins over `OPENROUTER_API_KEY`, since setting it
+is an explicit request for Ollama Cloud while an OpenRouter key is often a
+leftover in `.env`. Clear `OLLAMA_API_KEY` to fall back to OpenRouter routing.
+
+### Build queue capacity and load shedding
+
+A build is minutes of LLM inference plus a workspace container, so the build
+queue cannot absorb a spike the way a read endpoint can. Three settings keep a
+burst from taking the broker down:
+
+| setting | default | why |
+|---|---|---|
+| `BUILD_QUEUE_MAX_DEPTH` | `500` | Past this backlog, build requests get `429` instead of entering a queue that grows until Redis OOMs. `0` disables. |
+| `CELERY_VISIBILITY_TIMEOUT` | `14400` | Redis re-delivers `acks_late` tasks that outlive this. Below the build duration it hands a running build to a second worker — two agents writing one workspace. Celery's default is 1h. |
+| `CELERY_MAX_TASKS_PER_CHILD` | `50` | Recycles prefork children; agent contexts are large. |
+| `CELERY_CONCURRENCY` | `2` | Concurrent tasks per worker container. Applies to both `docker-compose.yml` and `Dockerfile.worker` — neither passes `--concurrency`, because that flag overrides config and is how the two previously drifted. |
+
+`worker_prefetch_multiplier` is pinned to `1`. Celery's default of 4 has each
+worker process reserve four builds up front, so they sit unstarted behind one
+running build while other workers idle — a well-known pathology for long tasks.
+
+Admission control lives in `dispatch()`, so any new build endpoint inherits it.
+It applies only to the `build` queue: meeting tasks are short and shedding them
+would drop live audio.
+
+**Scaling builds is horizontal, not vertical.** `docker compose up --scale
+worker=N` adds capacity; raising `CELERY_CONCURRENCY` mostly adds memory
+pressure. No amount of either makes builds servable at thousands per second —
+each one is minutes of inference, so the queue bound is what keeps the system
+answering honestly instead of collapsing.
+
+### Project memory (`MEMORY.md`)
+
+Every generated project gets a `MEMORY.md` at its root, maintained by the build
+agent and committed with the rest of the code so it survives across runs.
+
+It holds a bounded change log (last 12 runs: what was asked, what the agent
+reported, which files it touched) plus a `path: symbols` map of the codebase. On
+the next run it is injected into the agent's context up front rather than left
+for the agent to discover, because an optional read is one models routinely skip.
+
+**It reduces exploration, it does not replace reading.** The map records where
+code lives, never what it currently says, so an agent about to edit a file still
+opens that file. Measured on the same task and workspace, with and without a
+seeded memory (two trials each):
+
+| | file reads | directory listings | tokens |
+|---|---|---|---|
+| with `MEMORY.md` | 8, 9 | **1, 1** | 29k, 26k |
+| without | 9, 9 | **7, 5** | 80k, 94k |
+
+Reads are flat; the directory wandering is what disappears. That is the intended
+shape — treating memory as a substitute for reading would turn it into a source
+of stale-code bugs.
+
+Writes happen on a background thread and are deliberately absent from the build
+log: they occur after the user already has their result. Reads *are* logged.
+`Workspace.commit_all` flushes any pending write first, since an uncommitted
+`MEMORY.md` would be lost the next time the workspace is cloned. The update is
+pure file I/O and regex scanning — no LLM call, so it costs no tokens and cannot
+fail in a way that affects a build.
+
+### Picking a build model
+
+Blueprint work and code generation reward different things, so `OLLAMA_BUILD_MODEL`
+overrides `OLLAMA_MODEL` for the build/update/fix agents only. This matters more
+than it sounds — benchmarked on one "add a complete home page" update against an
+identical Next.js workspace, all four free models produced a working page but at
+wildly different cost:
+
+| model | tokens | turns | wall clock |
+|---|---|---|---|
+| `nemotron-3-super` | 415,068 | 35 | 16m 46s |
+| `gpt-oss:120b` | 190,347 | 26 | 2m 48s |
+| `minimax-m3` | **106,493** | 30 | 2m 32s |
+| `gemma4:31b` | 140,421 | **17** | **1m 37s** |
+
+Yet `nemotron-3-super` was the only one to extract an open question during
+blueprint synthesis. Hence the split: nemotron for `OLLAMA_MODEL`, `minimax-m3`
+for `OLLAMA_BUILD_MODEL`. These are single runs on one task — treat them as
+order-of-magnitude guidance, not a ranking.
 
 ### Using a different model
 

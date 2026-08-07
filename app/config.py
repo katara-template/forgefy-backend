@@ -24,6 +24,25 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
 
+    # ── Build queue admission control ────────────────────────────────────────
+    # Builds take minutes each, so the queue cannot absorb a spike. Past this
+    # backlog new build requests are rejected with 429 rather than accepted into
+    # a queue that would grow until Redis OOMs. 0 disables the check.
+    BUILD_QUEUE_MAX_DEPTH: int = 500
+    # Redis re-delivers an acks_late task that outlives this window. It MUST
+    # exceed the longest possible build or a slow build is handed to a second
+    # worker while the first still runs — two agents writing one workspace.
+    CELERY_VISIBILITY_TIMEOUT: int = 14400  # 4h, well past the ~22min worst case
+    # Recycle worker processes periodically: agent contexts are large and a
+    # long-lived prefork child accumulates memory it never returns.
+    CELERY_MAX_TASKS_PER_CHILD: int = 50
+    # Concurrent tasks per worker container. Set here rather than as a CLI flag
+    # so docker-compose and Dockerfile.worker cannot drift apart — a --concurrency
+    # argument overrides this, so neither entrypoint passes one. Kept low on
+    # purpose: a build holds a workspace, a toolchain and a large agent context,
+    # so add capacity with more worker containers, not more processes per box.
+    CELERY_CONCURRENCY: int = 2
+
     # Deepgram
     DEEPGRAM_API_KEY: str = ""
     DEEPGRAM_MODEL: str = "nova-3"
@@ -36,10 +55,19 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash"
 
-    # Ollama (local Qwen3)
+    # Ollama (Qwen3 via a local daemon, or the hosted service at ollama.com)
     OLLAMA_URL: str = "http://ollama:11434"
     OLLAMA_MODEL: str = "qwen3:8b"
     OLLAMA_TIMEOUT: int = 300
+    # Set this to use Ollama Cloud instead of a local daemon: requests gain an
+    # Authorization: Bearer header and OLLAMA_URL defaults to https://ollama.com
+    # (see app/ai/ollama_http.py). Cloud model tags end in '-cloud', so pair it
+    # with e.g. OLLAMA_MODEL=qwen3.5:cloud.
+    OLLAMA_API_KEY: str = ""
+    # Optional separate model for code generation. Blueprint work rewards careful
+    # extraction while build work rewards fast, decisive tool use, and the best
+    # model for one is often the worst for the other. Blank = use OLLAMA_MODEL. kimi-k2.7-code, qwen3.5:397b, deepseek-v4-pro, deepseek-v4-flash, glm-5.1, glm-5.2, kimi-k2.6, kimi-k3, minimax-m2.7, mistral-large-3:675b
+    OLLAMA_BUILD_MODEL: str = ""
 
     # OpenRouter — the hosted backend for the "Qwen3" setting. When
     # OPENROUTER_API_KEY is set, BP_MODEL/BUILD_MODEL="Qwen3" routes each action
