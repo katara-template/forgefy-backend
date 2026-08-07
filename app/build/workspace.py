@@ -71,6 +71,11 @@ class Workspace:
 
     def commit_all(self, message: str) -> bool:
         """Stage all changes and commit. Returns False (no-op) if nothing staged."""
+        # MEMORY.md is written on a background thread; let it land first or it
+        # misses this commit and is lost when the workspace is next re-cloned.
+        from app.build.project_memory import flush_project_memory
+        flush_project_memory()
+
         _run(["git", "add", "-A"], cwd=self.path)
         nothing_staged = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],

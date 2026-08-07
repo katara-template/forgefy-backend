@@ -59,4 +59,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 RUN playwright install chromium --with-deps
 
 COPY . .
-CMD ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=info", "-Q", "meeting.audio,meeting.transcribe,meeting.extract,build", "-B", "-s", "/tmp/celerybeat-schedule", "--concurrency=2", "--uid=nobody"]
+# Concurrency is NOT passed here. A --concurrency flag overrides celery_app.conf,
+# which is what let this image and docker-compose.yml drift apart; it now comes
+# from CELERY_CONCURRENCY (default 2, the value this CMD used to hardcode).
+CMD ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=info", "-Q", "meeting.audio,meeting.transcribe,meeting.extract,build", "-B", "-s", "/tmp/celerybeat-schedule", "--uid=nobody"]

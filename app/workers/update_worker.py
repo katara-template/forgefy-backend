@@ -167,6 +167,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
                     cancel_fn=cancel_fn,
                 )
             else:
+                from app.ai.ollama_http import ollama_base_url, ollama_build_model
                 from app.build.build_agent import run_update_agent_ollama
                 summary, tokens_used = run_update_agent_ollama(
                     workspace=workspace.path,
@@ -174,8 +175,8 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
                     blueprint=blueprint_context,
                     app_name=app_name,
                     template_key=template_key,
-                    base_url=settings.OLLAMA_URL,
-                    model=settings.OLLAMA_MODEL,
+                    base_url=ollama_base_url(settings),
+                    model=ollama_build_model(settings),
                     timeout=settings.OLLAMA_TIMEOUT,
                     log_fn=log_fn,
                     cancel_fn=cancel_fn,

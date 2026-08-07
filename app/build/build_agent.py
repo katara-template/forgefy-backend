@@ -13,11 +13,51 @@ import anthropic
 
 from app.build.agent_tools import TOOLS, execute_tool
 from app.build.build_logger import tool_message
+from app.build.project_memory import (
+    MEMORY_FILENAME,
+    memory_context_block,
+    read_project_memory,
+    update_project_memory_async,
+)
 
 logger = logging.getLogger(__name__)
 
 _MAX_ITERATIONS = 80
 _WARN_AT_ITERATION = 50
+# Cap on "you haven't written anything yet" pushbacks. Without a cap these
+# consume every iteration when a model won't emit tool calls at all.
+_MAX_NUDGES = 2
+# Tools that only observe the workspace. Repeating one with identical arguments
+# cannot produce a new answer until something mutates the workspace, so repeats
+# are served a short notice instead of being re-executed — otherwise the agent
+# can spend its whole iteration budget re-reading the same files.
+_READ_ONLY_TOOLS = frozenset({"read_file", "list_files", "analyze_code"})
+# Consecutive tool-only turns without a write before we push the agent to act.
+_MAX_EXPLORE_STREAK = 12
+
+# Tool results are echoed back into context every turn, so they are capped.
+# 1500 chars is ~375 tokens — smaller than a typical component file, so
+# read_file (which advertises "the full text content") returned a fragment and
+# the agent re-read the same file over and over trying to see the rest.
+# Large-context backends can afford far more.
+_TOOL_RESULT_LIMIT_SMALL_CTX = 1500
+_TOOL_RESULT_LIMIT_LARGE_CTX = 24000
+
+
+def _truncate_tool_result(result: str, limit: int) -> str:
+    """Cap a tool result, saying plainly that re-reading will not help.
+
+    A bare "…[truncated]" invites the model to try again for the rest; it then
+    gets the identical fragment and loops.
+    """
+    if len(result) <= limit:
+        return result
+    return (
+        result[:limit]
+        + f"\n…[TRUNCATED: showing the first {limit:,} of {len(result):,} characters. "
+        "Reading this file again returns exactly this same fragment — do not "
+        "retry. Work from what is shown above.]"
+    )
 
 # ---------------------------------------------------------------------------
 # Template-specific directory / component scaffolding guidance
@@ -1404,6 +1444,8 @@ def _call_planner(
                 raw = chat_openrouter(_PLANNER_SYSTEM, planner_input, task=PLAN, max_tokens=4096)
             else:
                 import requests as _req
+
+                from app.ai.ollama_http import ollama_headers
                 r = _req.post(
                     f"{base_url.rstrip('/')}/api/chat",
                     json={
@@ -1414,6 +1456,7 @@ def _call_planner(
                         ],
                         "stream": False,
                     },
+                    headers=ollama_headers(),
                     timeout=ollama_timeout,
                 )
                 r.raise_for_status()
@@ -2239,34 +2282,99 @@ def _ollama_loop(
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
 ) -> tuple[str, int]:
+    """Run the agent, then record what it did in the project's MEMORY.md.
+
+    The memory update is fired after the summary is in hand and is not awaited:
+    the caller's result must not wait on bookkeeping.
+    """
+    written: list[str] = []
+    summary, tokens = _ollama_agent_turns(
+        base_url, model, system, workspace, initial_user_msg,
+        timeout, log_fn, cancel_fn, max_iterations, written,
+    )
+    if written:
+        update_project_memory_async(workspace, initial_user_msg, summary, written)
+    return summary, tokens
+
+
+def _ollama_agent_turns(
+    base_url: str,
+    model: str,
+    system: str,
+    workspace: Path,
+    initial_user_msg: str,
+    timeout: int = 300,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+    max_iterations: int = _MAX_ITERATIONS,
+    written: list[str] | None = None,
+) -> tuple[str, int]:
     """Ollama tool-use agent loop. Returns (summary, total_tokens).
 
     Token counts come from each response's final chunk (prompt_eval_count +
-    eval_count), so local Ollama builds/updates are billed like the other backends.
+    eval_count), so Ollama builds/updates are billed like the other backends.
+    Targets a local daemon or Ollama Cloud depending on OLLAMA_API_KEY.
     """
     import requests as _req
 
+    from app.ai.ollama_http import (
+        auth_error_hint,
+        missing_model_hint,
+        ollama_headers,
+        ollama_options,
+        using_cloud,
+    )
+
     # Keep tool results short so the context doesn't balloon across iterations.
-    _TOOL_RESULT_LIMIT = 1500
+    # Cloud models run with their full context window, so they get the larger
+    # cap — the small one truncates mid-file and strands the agent.
+    _TOOL_RESULT_LIMIT = (
+        _TOOL_RESULT_LIMIT_LARGE_CTX if using_cloud() else _TOOL_RESULT_LIMIT_SMALL_CTX
+    )
     # Sliding window: system + first user msg are always kept; only the last N
     # assistant/tool pairs are retained so the context stays within num_ctx.
-    _HISTORY_PAIRS = 6  # = 12 messages max in the rolling window
+    # Cloud models have a far larger window, so keep more of the build history.
+    _HISTORY_PAIRS = 20 if using_cloud() else 6
 
     url = f"{base_url.rstrip('/')}/api/chat"
+    headers = ollama_headers()
+    options = ollama_options(num_ctx=8192, num_predict=4096)
     ollama_tools = _tools_to_ollama_format(TOOLS)
-    # Slot 0 = system, slot 1 = initial user task — never dropped.
-    anchor: list[dict[str, Any]] = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": initial_user_msg},
-    ]
+
+    # Prior runs' notes, if any. Injected rather than left for the agent to find:
+    # an optional read is a read the model usually skips, and the whole point is
+    # to start with the layout already known. Logged, unlike the write-back.
+    memory = read_project_memory(workspace)
+    if memory and log_fn:
+        log_fn("tool", f"Reading `{MEMORY_FILENAME}`")
+
+    # Anchor slots are never dropped by the sliding window.
+    anchor: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    if memory:
+        anchor.append({"role": "user", "content": memory_context_block(memory)})
+    anchor.append({"role": "user", "content": initial_user_msg})
     history: list[dict[str, Any]] = []  # assistant + tool messages, pruned each turn
     last_text = ""
     write_calls = 0  # track whether the agent actually wrote any files
     total_tokens = 0
+    nudges = 0  # bounded pushbacks when the agent talks instead of writing
+    # Read-only calls already answered since the last workspace mutation.
+    seen_reads: set[str] = set()
+    explore_streak = 0  # consecutive turns of tool use with no write_file
 
     def _trimmed_messages() -> list[dict[str, Any]]:
-        """Return anchor + the last _HISTORY_PAIRS*2 history messages."""
-        return anchor + history[-(_HISTORY_PAIRS * 2):]
+        """Return anchor + a rolling window that never orphans a tool result.
+
+        Slicing purely by count can start the window on a `tool` message whose
+        `assistant` tool_calls message was just dropped. Models handle that
+        badly — it reads as a result to a question never asked — and it shows
+        up as the agent re-running tools it has already run.
+        """
+        window = history[-(_HISTORY_PAIRS * 2):]
+        start = 0
+        while start < len(window) and window[start].get("role") == "tool":
+            start += 1
+        return anchor + window[start:]
 
     for iteration in range(max_iterations):
         if cancel_fn and cancel_fn():
@@ -2287,14 +2395,16 @@ def _ollama_loop(
                     "messages": _trimmed_messages(),
                     "tools": ollama_tools,
                     "stream": True,
-                    "options": {
-                        "num_ctx": 8192,
-                        "num_predict": 4096,
-                    },
+                    "options": options,
                 },
+                headers=headers,
                 timeout=(30, timeout),
                 stream=True,
             ) as resp:
+                if resp.status_code == 404:
+                    raise RuntimeError(missing_model_hint(model))
+                if hint := auth_error_hint(resp.status_code):
+                    raise RuntimeError(hint)
                 resp.raise_for_status()
                 content_parts: list[str] = []
                 tool_calls: list[dict] = []
@@ -2342,8 +2452,15 @@ def _ollama_loop(
                                 log_fn("text", stream_buf.strip())
                                 stream_buf = ""
 
+                    # ── Tool calls ─────────────────────────────────────────────
+                    # These stream in on an intermediate chunk (done=False) and
+                    # the final done chunk carries an empty message, so collect
+                    # them as they arrive. Reading them off the done chunk drops
+                    # every call and leaves the agent looping on the same tool.
+                    if chunk_calls := msg.get("tool_calls"):
+                        tool_calls.extend(chunk_calls)
+
                     if chunk.get("done"):
-                        tool_calls = msg.get("tool_calls") or []
                         # Final chunk carries token counts for this turn.
                         total_tokens += chunk.get("prompt_eval_count", 0) + chunk.get("eval_count", 0)
                         if log_fn:
@@ -2367,8 +2484,9 @@ def _ollama_loop(
         if content_text:
             last_text = content_text
             if "DONE" in content_text.upper():
-                if write_calls == 0:
-                    # Agent claimed done without writing anything — push back once
+                if write_calls == 0 and nudges < _MAX_NUDGES:
+                    # Agent claimed done without writing anything — push back
+                    nudges += 1
                     if log_fn:
                         log_fn("info", "Agent said DONE without writing files — asking it to implement…")
                     # assistant message already appended above — only add the user pushback
@@ -2385,11 +2503,14 @@ def _ollama_loop(
                 return content_text, total_tokens
 
         if not tool_calls:
-            if write_calls == 0 and last_text:
-                # No tool calls and no writes — push back once to get actual file output
+            if write_calls == 0 and last_text and nudges < _MAX_NUDGES:
+                # No tool calls and no writes — push back to get actual file
+                # output. Bounded: an unbounded nudge burns every iteration
+                # re-asking a model that isn't going to comply.
+                nudges += 1
                 if log_fn:
                     log_fn("info", "No files written yet — asking agent to write the code…")
-                history.append({"role": "assistant", "content": last_text})
+                # assistant message already appended above — only add the pushback
                 history.append({
                     "role": "user",
                     "content": (
@@ -2401,6 +2522,7 @@ def _ollama_loop(
             # Don't emit done here — update_worker will use the returned summary
             return last_text or "Done.", total_tokens
 
+        wrote_this_turn = False
         for call in tool_calls:
             func = call.get("function", {})
             tool_name = func.get("name", "")
@@ -2412,16 +2534,70 @@ def _ollama_loop(
                     tool_input = {}
             if tool_name == "write_file":
                 write_calls += 1
+                wrote_this_turn = True
+                if written is not None and (p := tool_input.get("path")):
+                    written.append(str(p))
                 if log_fn:
                     log_fn("file_written", tool_input.get("path", ""))
+
+            call_key = f"{tool_name}:{json.dumps(tool_input, sort_keys=True, default=str)}"
+            is_repeat = tool_name in _READ_ONLY_TOOLS and call_key in seen_reads
             if log_fn:
-                log_fn("tool", tool_message(tool_name, tool_input))
-            result = execute_tool(tool_name, tool_input, workspace, log_fn)
+                # Mark repeats explicitly — an identical-looking log line for a
+                # suppressed call makes a stuck agent impossible to spot.
+                label = tool_message(tool_name, tool_input)
+                log_fn("tool", f"{label} — already read, skipping" if is_repeat else label)
+
+            if is_repeat:
+                # Serving this from a notice rather than re-running it is the
+                # point: re-executing costs a full tool result in context every
+                # time and teaches the model nothing new.
+                result = (
+                    f"[You already ran {tool_name} with these exact arguments and "
+                    "the workspace has not changed since. The result is the same. "
+                    "Stop inspecting and make the change now with write_file.]"
+                )
+            else:
+                result = execute_tool(tool_name, tool_input, workspace, log_fn)
+                if tool_name in _READ_ONLY_TOOLS:
+                    seen_reads.add(call_key)
+                else:
+                    # The workspace changed, so earlier reads may be stale.
+                    seen_reads.clear()
             # Truncate large results (e.g. read_file on a big file) so they
             # don't blow up the context window on the next iteration.
-            if len(result) > _TOOL_RESULT_LIMIT:
-                result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
-            history.append({"role": "tool", "content": result})
+            result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
+            # tool_name is required — without it the model cannot tell which
+            # call a result answers and tends to just issue the call again.
+            history.append({"role": "tool", "tool_name": tool_name, "content": result})
+
+        # Bounded exploration: a run of tool-only turns with nothing written
+        # means the agent is stuck surveying. Push it to act, once per streak.
+        explore_streak = 0 if wrote_this_turn else explore_streak + 1
+        if explore_streak >= _MAX_EXPLORE_STREAK:
+            if nudges < _MAX_NUDGES:
+                nudges += 1
+                explore_streak = 0
+                if log_fn:
+                    log_fn("info", "Agent is still exploring — asking it to start writing…")
+                history.append({
+                    "role": "user",
+                    "content": (
+                        f"You have used {_MAX_EXPLORE_STREAK} turns inspecting the project "
+                        "without writing anything. You have enough context. Implement the "
+                        "change now with write_file, then reply DONE."
+                    ),
+                })
+            else:
+                # Pushed to act and still only surveying. Every further turn
+                # re-sends the whole context for no progress, which is how a
+                # single request burns hundreds of thousands of tokens.
+                if log_fn:
+                    log_fn("warning", "Agent kept exploring without making changes — stopping.")
+                return (
+                    last_text or "Agent stopped: explored the project without making changes.",
+                    total_tokens,
+                )
 
     if log_fn:
         log_fn("warning", "Agent reached iteration limit.")
@@ -3257,8 +3433,7 @@ def _gemini_loop(
             if log_fn:
                 log_fn("tool", tool_message(tool_name, tool_input))
             result = execute_tool(tool_name, tool_input, workspace, log_fn)
-            if len(result) > _TOOL_RESULT_LIMIT:
-                result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
+            result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
             tool_responses.append({"functionResponse": {"name": tool_name, "response": {"output": result}}})
 
         if tool_responses:
@@ -3427,8 +3602,7 @@ def _openai_loop(
             if log_fn:
                 log_fn("tool", tool_message(tool_name, tool_input))
             result = execute_tool(tool_name, tool_input, workspace, log_fn)
-            if len(result) > _TOOL_RESULT_LIMIT:
-                result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
+            result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     if log_fn:
@@ -3745,8 +3919,7 @@ def _openrouter_loop(
             if log_fn:
                 log_fn("tool", tool_message(tool_name, tool_input))
             result = execute_tool(tool_name, tool_input, workspace, log_fn)
-            if len(result) > _TOOL_RESULT_LIMIT:
-                result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
+            result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
         # Break read-only stalls: if the agent has explored for many turns without
