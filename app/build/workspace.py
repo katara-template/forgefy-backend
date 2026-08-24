@@ -2,29 +2,85 @@
 from __future__ import annotations
 
 import logging
-import os
+import re
 import shutil
 import subprocess
 import uuid
 from pathlib import Path
 
+from app.build.subprocess_env import build_subprocess_env
+
 logger = logging.getLogger(__name__)
 
 WORKSPACE_ROOT = Path("/tmp/forgefy_workspaces")
 
+# Git authenticates over HTTPS by embedding the credential in the URL
+# (https://<token>@github.com/...). Anything derived from such a command — an
+# exception message, a log line, a Sentry event — carries a working credential
+# unless it is scrubbed first.
+_CREDENTIAL_IN_URL = re.compile(r"(https://)[^/\s@]+@")
+
+
+def _npm_install_args() -> list[str]:
+    """Argv for `npm install`, optionally refusing package lifecycle scripts.
+
+    `npm install` runs preinstall/postinstall hooks out of a package.json the
+    model wrote, which is arbitrary code execution on the worker. --ignore-scripts
+    closes that, but it also breaks any dependency that genuinely needs a
+    postinstall step to fetch or compile a native binary (esbuild and sharp both
+    do), so it is off unless an operator has confirmed their templates survive it.
+    The scrubbed subprocess environment is the mitigation that always applies.
+    """
+    from app.config import get_settings
+
+    args = ["npm", "install", "--legacy-peer-deps"]
+    if get_settings().NPM_IGNORE_SCRIPTS:
+        args.append("--ignore-scripts")
+    return args
+
+
+def _kill_workspace_jobs(path: Path) -> None:
+    """Stop any background jobs the agent started in this workspace.
+
+    Imported lazily and never allowed to raise: cleanup runs on the failure path
+    too, and a bookkeeping error must not mask the original build error.
+    """
+    try:
+        from app.build.jobs import kill_all_jobs
+
+        kill_all_jobs(path)
+    except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
+        logger.warning("Could not stop background jobs for %s: %s", path, exc)
+
+
+def _redact(text: str) -> str:
+    """Strip credentials embedded in any https:// URL in `text`."""
+    return _CREDENTIAL_IN_URL.sub(r"\1***@", text)
+
 
 def _run(args: list[str], cwd: Path | None = None, timeout: int = 600) -> str:
-    """Run a subprocess; return stdout; raise RuntimeError on failure."""
-    env = os.environ.copy()
-    # Never prompt for git credentials — fail fast instead of hanging on missing /dev/tty
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    """Run a subprocess; return stdout; raise RuntimeError on failure.
+
+    The raised message is redacted: `args` routinely contains a token-bearing
+    clone/push URL, and this exception reaches the logs and Sentry.
+    """
+    # A scrubbed environment, not os.environ: this helper runs `npm install`,
+    # `npm run build` and `flutter build` against a manifest the model wrote, and
+    # the worker's own environment carries ANTHROPIC_API_KEY, Firebase
+    # credentials, GitHub tokens and the database URL. Git keeps working because
+    # its credentials travel in the remote URL, not the environment.
+    env = build_subprocess_env({
+        # Never prompt for git credentials — fail fast instead of hanging on missing /dev/tty
+        "GIT_TERMINAL_PROMPT": "0",
+    })
     result = subprocess.run(
         args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env
     )
     if result.returncode != 0:
         # Combine stdout + stderr: Flutter/Gradle print the Dart error on stdout
         combined = (result.stdout + "\n" + result.stderr).strip()
-        raise RuntimeError(f"{' '.join(args)} failed:\n{combined}")
+        # Redact both halves: git echoes the remote URL back in its own errors.
+        raise RuntimeError(f"{_redact(' '.join(args))} failed:\n{_redact(combined)}")
     return result.stdout
 
 
@@ -79,7 +135,7 @@ class Workspace:
         _run(["git", "add", "-A"], cwd=self.path)
         nothing_staged = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
-            cwd=self.path, capture_output=True,
+            cwd=self.path, capture_output=True, env=build_subprocess_env(),
         ).returncode == 0
         if nothing_staged:
             logger.info("commit_all: nothing to commit — skipping")
@@ -96,8 +152,24 @@ class Workspace:
             _run(["git", "remote", "set-url", "origin", remote_url], cwd=self.path)
         _run(["git", "push", "-u", "origin", "main"], cwd=self.path)
 
+    def sync_to_github(self, commit_message: str, push_url: str) -> bool:
+        """Commit and push; no-op when the tree is clean. Returns True if pushed.
+
+        Same shape as EditWorkspace.sync_to_github so WorkspaceAutoSync can drive
+        either. No rebase here: this workspace owns a repo it just created, so
+        nothing else is pushing to it concurrently.
+        """
+        if not self.commit_all(commit_message):
+            return False
+        self.push(push_url)
+        return True
+
     def cleanup(self) -> None:
         """Delete the workspace directory."""
+        # Kill first: a surviving `npm install` holds file handles inside the
+        # directory we are about to remove, and keeps running against a path that
+        # no longer exists.
+        _kill_workspace_jobs(self.path)
         if self.path.exists():
             shutil.rmtree(self.path)
             logger.info("Workspace removed: %s", self.path)
@@ -644,7 +716,7 @@ def install_dependencies_at(path: Path, template_key: str, log_fn=None) -> bool:
         elif template_key in ("next", "react_native"):
             root = _find_package_root(path)
             logger.info("npm install (pre-agent) path=%s", root)
-            _run(["npm", "install", "--legacy-peer-deps"], cwd=root, timeout=420)
+            _run(_npm_install_args(), cwd=root, timeout=420)
         else:
             logger.warning("No dependency install defined for template=%s", template_key)
             return False
@@ -679,7 +751,7 @@ def build_artifacts_at(path: Path, template_key: str) -> Path | None:
     if template_key == "react_native":
         root = _find_package_root(path)
         logger.info("React Native: npm install + expo export path=%s", root)
-        _run(["npm", "install", "--legacy-peer-deps"], cwd=root, timeout=300)
+        _run(_npm_install_args(), cwd=root, timeout=300)
         try:
             _run(["npx", "expo", "export", "--platform", "web"], cwd=root, timeout=300)
             dist = root / "dist"
@@ -700,7 +772,7 @@ def build_artifacts_at(path: Path, template_key: str) -> Path | None:
     if template_key == "next":
         root = _find_package_root(path)
         logger.info("Next.js: npm install + Cloudflare Pages build path=%s", root)
-        _run(["npm", "install", "--legacy-peer-deps"], cwd=root, timeout=300)
+        _run(_npm_install_args(), cwd=root, timeout=300)
         _patch_next_config(root)
         _patch_tsconfig(root)
 
@@ -834,12 +906,12 @@ class EditWorkspace:
         # can now stage it as a regular file.
         subprocess.run(
             ["git", "rm", "--cached", "--ignore-unmatch", ".env"],
-            cwd=self.path, capture_output=True,
+            cwd=self.path, capture_output=True, env=build_subprocess_env(),
         )
         _run(["git", "add", "-A"], cwd=self.path)
         nothing_staged = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
-            cwd=self.path, capture_output=True,
+            cwd=self.path, capture_output=True, env=build_subprocess_env(),
         ).returncode == 0
         if nothing_staged:
             logger.info("No changes to commit in edit workspace")
@@ -862,7 +934,7 @@ class EditWorkspace:
             # then force-push the agent's version — agent output takes precedence.
             subprocess.run(
                 ["git", "rebase", "--abort"],
-                cwd=self.path, capture_output=True,
+                cwd=self.path, capture_output=True, env=build_subprocess_env(),
             )
             logger.warning(
                 "Rebase conflict for %s — using force-with-lease to push agent changes",
@@ -893,6 +965,7 @@ class EditWorkspace:
 
     def cleanup(self) -> None:
         """Delete the workspace directory to free disk space."""
+        _kill_workspace_jobs(self.path)
         if self.path.exists():
             shutil.rmtree(self.path)
             logger.info("Edit workspace removed: %s", self.path)

@@ -245,8 +245,23 @@ def tool_message(tool_name: str, inputs: dict) -> str:
         case "write_file":
             return _describe_write(inputs.get("path", ""))
 
+        case "edit_file":
+            path = inputs.get("path", "")
+            scope = "all occurrences" if inputs.get("replace_all") else "1 change"
+            return f"Editing `{path}` · {scope}"
+
         case "read_file":
-            return f"Reading `{inputs.get('path', '')}`"
+            path = inputs.get("path", "")
+            if offset := inputs.get("offset"):
+                return f"Reading `{path}` from line {offset}"
+            return f"Reading `{path}`"
+
+        case "grep":
+            where = inputs.get("glob") or inputs.get("path") or "the project"
+            return f"Searching for `{inputs.get('pattern', '')}` in {where}"
+
+        case "glob":
+            return f"Finding files matching `{inputs.get('pattern', '')}`"
 
         case "list_files":
             p = inputs.get("path", ".")
@@ -261,6 +276,36 @@ def tool_message(tool_name: str, inputs: dict) -> str:
 
         case "move_file":
             return f"Moving `{inputs.get('source', '')}` → `{inputs.get('destination', '')}`"
+
+        case "run_command":
+            cmd = " ".join(str(a) for a in (inputs.get("command") or []))
+            note = inputs.get("description") or ""
+            return f"Running `{cmd}`" + (f" · {note}" if note else "")
+
+        case "job_start":
+            cmd = " ".join(str(a) for a in (inputs.get("command") or []))
+            note = inputs.get("description") or ""
+            return f"Starting `{cmd}` in the background" + (f" · {note}" if note else "")
+
+        case "job_output":
+            return f"Checking background job {inputs.get('job_id', '')}"
+
+        case "job_kill":
+            return f"Stopping background job {inputs.get('job_id', '')}"
+
+        case "todo_write":
+            todos = inputs.get("todos") or []
+            done = sum(1 for t in todos if isinstance(t, dict) and t.get("status") == "completed")
+            current = next(
+                (
+                    t.get("active_form") or t.get("content")
+                    for t in todos
+                    if isinstance(t, dict) and t.get("status") == "in_progress"
+                ),
+                "",
+            )
+            label = f"Task list · {done}/{len(todos)} done"
+            return f"{label} · {current}" if current else label
 
         case "generate_image":
             return f"Generating image · {inputs.get('filename', '')}"
@@ -289,6 +334,11 @@ def make_log_publisher(project_id: str, redis_url: str):
 
     Event JSON:  { "type": "<event_type>", "message": "<text>" }
     Event types: started | info | thinking | tool | text | warning | error | done
+                 | file_written | todo
+
+    `todo` carries a JSON array of {content, status, active_form} objects — the
+    agent's current task list, replacing whatever it sent before, so the client
+    can render a live checklist rather than a spinner.
     """
     channel = f"build:{project_id}:logs"
     history_key = f"build:{project_id}:log_history"

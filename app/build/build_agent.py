@@ -11,7 +11,15 @@ from typing import Any
 
 import anthropic
 
-from app.build.agent_tools import TOOLS, execute_tool
+from app.build.agent_tools import (
+    _FINDING_SEVERITIES,
+    REPORT_FINDINGS_TOOL,
+    TOOLS,
+    execute_tool,
+    missing_report,
+    reset_report,
+    take_report,
+)
 from app.build.build_logger import tool_message
 from app.build.project_memory import (
     MEMORY_FILENAME,
@@ -31,7 +39,14 @@ _MAX_NUDGES = 2
 # cannot produce a new answer until something mutates the workspace, so repeats
 # are served a short notice instead of being re-executed — otherwise the agent
 # can spend its whole iteration budget re-reading the same files.
-_READ_ONLY_TOOLS = frozenset({"read_file", "list_files", "analyze_code"})
+_READ_ONLY_TOOLS = frozenset({
+    "read_file", "list_files", "analyze_code", "grep", "glob",
+})
+# Tools that count as the agent actually producing code. edit_file belongs here
+# alongside write_file: an agent that implements a change entirely through edits
+# has done the work, and treating it as "no files written" would nudge it and
+# then trip the exploration breaker on an agent that is making real progress.
+_WRITE_TOOLS = frozenset({"write_file", "edit_file"})
 # Consecutive tool-only turns without a write before we push the agent to act.
 _MAX_EXPLORE_STREAK = 12
 
@@ -42,6 +57,32 @@ _MAX_EXPLORE_STREAK = 12
 # Large-context backends can afford far more.
 _TOOL_RESULT_LIMIT_SMALL_CTX = 1500
 _TOOL_RESULT_LIMIT_LARGE_CTX = 24000
+
+# Per-response output cap for the Anthropic loop. The old value (8096) was both a
+# typo for 8192 and far too small: a single large write_file payload plus thinking
+# tokens overran it and the file arrived truncated mid-generation. claude-sonnet-5
+# reports max_tokens=128000 via the Models API; 32000 leaves generous headroom for
+# a big file without letting one runaway turn spend the whole budget.
+_MAX_OUTPUT_TOKENS = 32000
+# Chat-completions backends (OpenAI, OpenRouter) are separate providers with their
+# own, much lower ceilings — 16384 is the documented cap for gpt-4o-mini and a safe
+# value across the OpenRouter chain.
+_MAX_OUTPUT_TOKENS_CHAT = 16384
+
+# Anthropic sliding window, in assistant/tool-result pairs. Claude's context is
+# large, so this is generous — it exists to stop an 80-iteration build from
+# resending every turn forever, not to squeeze into a small window.
+_ANTHROPIC_HISTORY_PAIRS = 20
+
+_CACHE_CONTROL: dict[str, Any] = {"type": "ephemeral"}
+
+# Adaptive thinking with a summarised display, so the build feed can narrate the
+# agent's reasoning the way the Ollama path does. On claude-sonnet-5 thinking is
+# already on by default and `display` only controls whether the summary text is
+# returned, so this surfaces reasoning without buying extra thinking.
+_THINKING_CONFIG: dict[str, Any] = {"type": "adaptive", "display": "summarized"}
+# Flipped off permanently if the configured model rejects the parameter.
+_thinking_supported = True
 
 
 def _truncate_tool_result(result: str, limit: int) -> str:
@@ -58,6 +99,124 @@ def _truncate_tool_result(result: str, limit: int) -> str:
         "Reading this file again returns exactly this same fragment — do not "
         "retry. Work from what is shown above.]"
     )
+
+
+# ---------------------------------------------------------------------------
+# Anthropic prompt caching
+#
+# Render order is tools → system → messages, and caching is a prefix match: any
+# byte change invalidates everything after it. Every `system` string reaching
+# _loop is a module-level constant or _build_system(template_key), so the whole
+# prefix is already stable within a run — the volatile parts (project map, git
+# log, change request) live in the user message, after the breakpoint.
+#
+# Four breakpoints are allowed per request and all four are used: one on the last
+# tool, one on the system block, and a rolling pair on the conversation so the
+# growing tool-result history is re-read from cache instead of re-billed in full
+# on every iteration.
+# ---------------------------------------------------------------------------
+
+def _cached_system(system: str) -> list[dict[str, Any]]:
+    """The system prompt as one cacheable content block."""
+    return [{"type": "text", "text": system, "cache_control": dict(_CACHE_CONTROL)}]
+
+
+def _cached_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tool definitions with a cache breakpoint on the last one.
+
+    Tools render before the system prompt, so this breakpoint keeps the tool
+    array cached across phases even though each phase has its own system prompt.
+    """
+    if not tools:
+        return list(tools)
+    cached = [dict(t) for t in tools]
+    cached[-1]["cache_control"] = dict(_CACHE_CONTROL)
+    return cached
+
+
+# Built once so the bytes are identical on every request — rebuilding per call
+# would be equivalent here, but a single object makes accidental drift impossible.
+_CACHED_TOOLS = _cached_tools(TOOLS)
+
+# Cached per tool set, keyed by the tool names it contains. Phases advertise
+# different tool lists (only the reviewing phases get report_findings), and the
+# tools array renders before everything else, so each variant has to be one
+# byte-identical object or its cache entry is rewritten on every request.
+_CACHED_TOOL_SETS: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+
+
+def _cached_tools_for(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Return the cache-annotated form of `tools`, stable across calls."""
+    resolved = tools if tools is not None else TOOLS
+    key = tuple(t["name"] for t in resolved)
+    if key not in _CACHED_TOOL_SETS:
+        _CACHED_TOOL_SETS[key] = _cached_tools(resolved)
+    return _CACHED_TOOL_SETS[key]
+
+
+def _block_type(block: Any) -> str | None:
+    """Content-block type, for blocks that may be dicts or SDK objects."""
+    if isinstance(block, dict):
+        return block.get("type")
+    return getattr(block, "type", None)
+
+
+def _mark_message_breakpoints(messages: list[dict[str, Any]]) -> None:
+    """Keep cache_control on the last two dict-content message blocks.
+
+    The conversation is what actually grows during a build — by iteration 40 the
+    tool-result history dwarfs the system prompt. Marking the newest turn makes
+    the next request read all of it from cache; keeping the previous mark as well
+    leaves a valid read point, since a breakpoint only looks back about 20 blocks
+    for a prior entry.
+
+    Only blocks we construct ourselves (tool_result dicts) are marked; assistant
+    turns hold SDK objects and are left untouched.
+    """
+    markable = [
+        msg["content"][-1]
+        for msg in messages
+        if isinstance(msg.get("content"), list)
+        and msg["content"]
+        and isinstance(msg["content"][-1], dict)
+    ]
+    for block in markable[:-2]:
+        block.pop("cache_control", None)
+    for block in markable[-2:]:
+        block["cache_control"] = dict(_CACHE_CONTROL)
+
+
+def _usage_tokens(usage: Any) -> int:
+    """Total prompt+completion tokens for one turn, including cached input.
+
+    `input_tokens` counts only the uncached remainder once caching is on, so
+    summing it alone would make builds look dramatically cheaper than they are.
+    Adding the cached halves back keeps this number comparable with the
+    pre-caching figures the other backends still report.
+    """
+    return (
+        (getattr(usage, "input_tokens", 0) or 0)
+        + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        + (getattr(usage, "cache_read_input_tokens", 0) or 0)
+        + (getattr(usage, "output_tokens", 0) or 0)
+    )
+
+
+def _log_cache_usage(usage: Any) -> None:
+    """Record the cache split so the saving is measurable rather than assumed.
+
+    This goes to the application log, not log_fn: the build feed is a user-facing
+    narration of the work, and per-iteration cache accounting is operator
+    telemetry.
+    """
+    logger.info(
+        "anthropic usage: input=%d cache_creation=%d cache_read=%d output=%d",
+        getattr(usage, "input_tokens", 0) or 0,
+        getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        getattr(usage, "cache_read_input_tokens", 0) or 0,
+        getattr(usage, "output_tokens", 0) or 0,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Template-specific directory / component scaffolding guidance
@@ -1027,10 +1186,53 @@ def _update_structure_rules(template_key: str) -> str:
     return rules
 
 
+# Tool-usage rules every phase needs. Kept in one constant and appended to each
+# phase's system prompt: the design, schema, validator, test and security agents
+# each have their own prompt, and guidance that lives in only one of them is
+# guidance four agents never see. Byte-stable, so it does not disturb caching.
+_TOOL_RULES = """
+
+══════════════════════════════════════════
+HOW TO USE THE FILE TOOLS
+══════════════════════════════════════════
+EDITING — use edit_file, not write_file
+  • New file, or a deliberate full rewrite → write_file
+  • Any change to a file that already exists → edit_file
+  • edit_file replaces one exact string and leaves the rest of the file alone.
+    Rewriting a whole file to change a few lines burns output tokens and is how
+    long files end up truncated or silently missing code.
+  • old_string must match the file exactly, including indentation. read_file
+    returns numbered lines — copy the text to replace straight out of it.
+  • If edit_file reports an ambiguous match, add surrounding lines to old_string.
+    Do not fall back to write_file.
+
+DO NOT RE-READ A FILE YOU JUST EDITED
+  • edit_file returns a diff of exactly what changed. That diff is your
+    confirmation — you do not need to read the file again to verify it.
+  • Read a file ONCE, then make ALL of your changes to it. Repeatedly reading the
+    same file between edits wastes the entire phase and changes nothing.
+  • Only re-read a file if a tool told you your edit failed.
+
+FINDING THINGS — search before you read
+  • grep searches file CONTENTS by regex — use it to find where something is
+    defined or used.
+  • glob finds files by NAME pattern, e.g. 'src/**/*.tsx'.
+  • Opening files one at a time to look for something is the slowest and most
+    expensive way to search. Search first, then read only what matched.
+"""
+
+
+def _with_tool_rules(system: str) -> str:
+    """Append the shared tool-usage rules to a phase's system prompt."""
+    return system + _TOOL_RULES
+
+
 def _build_system(template_key: str) -> str:
     structure = _STRUCTURE_MAP.get(template_key, _NEXT_STRUCTURE)
     ui = _UI_GUIDANCE_MAP.get(template_key, "") if _ui_enabled() else ""
-    return _DESIGN_MANDATE + _BUILD_PREAMBLE + structure + ui + _BUILD_SUFFIX
+    return _with_tool_rules(
+        _DESIGN_MANDATE + _BUILD_PREAMBLE + structure + ui + _BUILD_SUFFIX
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2281,6 +2483,7 @@ def _ollama_loop(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
     """Run the agent, then record what it did in the project's MEMORY.md.
 
@@ -2290,7 +2493,7 @@ def _ollama_loop(
     written: list[str] = []
     summary, tokens = _ollama_agent_turns(
         base_url, model, system, workspace, initial_user_msg,
-        timeout, log_fn, cancel_fn, max_iterations, written,
+        timeout, log_fn, cancel_fn, max_iterations, written, tools,
     )
     if written:
         update_project_memory_async(workspace, initial_user_msg, summary, written)
@@ -2308,6 +2511,7 @@ def _ollama_agent_turns(
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
     written: list[str] | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
     """Ollama tool-use agent loop. Returns (summary, total_tokens).
 
@@ -2339,7 +2543,7 @@ def _ollama_agent_turns(
     url = f"{base_url.rstrip('/')}/api/chat"
     headers = ollama_headers()
     options = ollama_options(num_ctx=8192, num_predict=4096)
-    ollama_tools = _tools_to_ollama_format(TOOLS)
+    ollama_tools = _tools_to_ollama_format(tools if tools is not None else TOOLS)
 
     # Prior runs' notes, if any. Injected rather than left for the agent to find:
     # an optional read is a read the model usually skips, and the whole point is
@@ -2532,7 +2736,7 @@ def _ollama_agent_turns(
                     tool_input = json.loads(tool_input)
                 except json.JSONDecodeError:
                     tool_input = {}
-            if tool_name == "write_file":
+            if tool_name in _WRITE_TOOLS:
                 write_calls += 1
                 wrote_this_turn = True
                 if written is not None and (p := tool_input.get("path")):
@@ -3017,25 +3221,69 @@ def _should_skip_security(plan: dict[str, Any] | None) -> bool:
     return bool(plan.get("skip_security_agent"))
 
 
-def _validation_needs_fix_pass(val_summary: str) -> bool:
-    """Return True when the validator did not emit a clean VALIDATED: report.
+# Phases that review rather than build, and so must file a structured report.
+_REPORTING_PHASES = ("validate", "test", "security")
+# The tool set those phases get: everything, plus the reporting tool.
+_REVIEW_TOOLS = [*TOOLS, REPORT_FINDINGS_TOOL]
 
-    A clean report means the validator finished its workflow and signed off with
-    a VALIDATED: line. Anything else (role explanation, timeout, error dump) means
-    the executor should get a targeted fix pass with the validator's findings.
+# Appended to a reviewing phase's system prompt. The instruction has to be
+# explicit and last, because the whole fix-pass decision now rests on the call
+# being made — a phase that forgets is treated as unresolved.
+_REPORT_INSTRUCTION = """
+
+══════════════════════════════════════════
+YOU MUST REPORT YOUR RESULT
+══════════════════════════════════════════
+Before your final message, call report_findings exactly once.
+  • Nothing needs fixing → status='clean', findings=[]
+  • Something is genuinely broken → status='issues_found' with one entry per
+    problem, each naming the file it is in.
+  • Anything you already fixed during this phase is NOT a finding. Report the
+    state of the code as you are leaving it, not the problems you solved.
+This call, not your prose, decides whether an expensive fix pass runs. Failing to
+call it is treated as an unresolved failure.
+"""
+
+
+def _needs_fix_pass(report: dict[str, Any]) -> bool:
+    """Return True when the validator's structured report says work remains.
+
+    Reads a field the validator set deliberately, rather than sniffing its prose
+    for a "VALIDATED:" prefix. The old test called a clean review dirty whenever
+    the model phrased its sign-off naturally, signed off with DONE, or returned
+    an empty summary — each of which spent a 100-iteration fix pass on code that
+    was already correct.
     """
-    vs = val_summary.lower().strip()
-    if "all checks passed" in vs:
-        return False
-    return not (vs.startswith("validated:") or "\nvalidated:" in vs)
+    return report.get("status") != "clean"
 
 
-def _make_fix_prompt(val_summary: str) -> str:
+def _format_findings(findings: list[dict[str, Any]]) -> str:
+    """Render findings as an ordered, addressable list for the fix pass."""
+    if not findings:
+        return "(no individual findings were listed)"
+    order = {sev: i for i, sev in enumerate(_FINDING_SEVERITIES)}
+    ranked = sorted(findings, key=lambda f: order.get(f.get("severity", ""), 99))
+    lines = []
+    for i, finding in enumerate(ranked, 1):
+        where = finding.get("file") or "(file not specified)"
+        if line := finding.get("line"):
+            where += f":{line}"
+        lines.append(
+            f"{i}. [{finding.get('severity', 'medium')}] {where} — {finding.get('summary', '')}"
+        )
+    return "\n".join(lines)
+
+
+def _make_fix_prompt(report: dict[str, Any]) -> str:
+    findings = report.get("findings") or []
+    summary = report.get("summary") or ""
     return (
         "The validator reviewed the implementation and found unresolved issues.\n\n"
-        f"Validator findings:\n{val_summary}\n\n"
-        "Fix every problem described above. Read each affected file first, then apply "
-        "the minimum change needed. Do not re-explain issues — just fix them."
+        f"Validator summary: {summary}\n\n"
+        f"Findings to fix:\n{_format_findings(findings)}\n\n"
+        "Fix every finding above. Each one names the file it is in — read that file "
+        "first, then apply the minimum change needed. Work through them in order and "
+        "do not re-explain the issues, just fix them."
     )
 
 
@@ -3065,6 +3313,34 @@ def _run_update_sequence(
     arguments are backend-specific.
     """
     total_tokens = 0
+
+    # Every phase gets the shared tool-usage rules. Wrapping here rather than at
+    # each call site means a new phase cannot be added without them.
+    def _phase(system: str, user_msg: str, iters: int) -> tuple[str, int]:
+        return run_phase(_with_tool_rules(system), user_msg, iters)
+
+    def _review_phase(
+        name: str, system: str, user_msg: str, iters: int,
+    ) -> tuple[str, int, dict[str, Any]]:
+        """Run a reviewing phase and collect its structured report.
+
+        The report travels through a per-workspace store rather than the return
+        value because ``run_phase`` returns (summary, tokens) across five
+        backends; changing that contract would mean changing all five.
+        """
+        reset_report(workspace)
+        summary, tokens = run_phase(
+            _with_tool_rules(system) + _REPORT_INSTRUCTION, user_msg, iters, _REVIEW_TOOLS,
+        )
+        report = take_report(workspace) or missing_report(name)
+        findings = report.get("findings") or []
+        logger.info(
+            "phase=%s status=%s findings=%d reported=%s",
+            name, report.get("status"), len(findings), report.get("reported"),
+        )
+        if log_fn and not report.get("reported"):
+            log_fn("warning", f"{name.title()} phase ended without a result — treating as unresolved.")
+        return summary, tokens, report
 
     def _cancelled() -> bool:
         return bool(cancel_fn and cancel_fn())
@@ -3101,14 +3377,14 @@ def _run_update_sequence(
         if log_fn:
             log_fn("info", f"━━━ {label} phase ━━━")
             log_fn("thinking", thinking)
-        briefs[key], tokens = run_phase(system, make_msg(), iters)
+        briefs[key], tokens = _phase(system, make_msg(), iters)
         total_tokens += tokens
         if _cancelled():
             return briefs[key] or "Stopped by user.", total_tokens
 
     if log_fn:
         log_fn("info", "━━━ Execution phase ━━━")
-    exec_summary, tokens = run_phase(
+    exec_summary, tokens = _phase(
         _UPDATE_SYSTEM,
         _update_user_msg_with_brief(
             app_name, template_key, blueprint, prompt, plan, workspace,
@@ -3123,7 +3399,8 @@ def _run_update_sequence(
     if log_fn:
         log_fn("info", "━━━ Validation phase ━━━")
         log_fn("thinking", "Validating implementation…")
-    val_summary, tokens = run_phase(
+    val_summary, tokens, val_report = _review_phase(
+        "validate",
         _VALIDATOR_SYSTEM,
         _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
         _ITERS_VALIDATE,
@@ -3132,16 +3409,23 @@ def _run_update_sequence(
     if _cancelled():
         return val_summary or exec_summary, total_tokens
 
-    if _validation_needs_fix_pass(val_summary):
+    if _needs_fix_pass(val_report):
+        found = len(val_report.get("findings") or [])
         if log_fn:
             log_fn("info", "━━━ Post-validation fix pass ━━━")
-            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
+            log_fn(
+                "thinking",
+                f"Validator found {found} unresolved issue(s) — running targeted fix pass…"
+                if found else "Validator did not sign off — running targeted fix pass…",
+            )
         # The fix pass replaces the validator's summary — it is the newer account
         # of the same work.
-        val_summary, tokens = run_phase(_UPDATE_SYSTEM, _make_fix_prompt(val_summary), _ITERS_FIX)
+        val_summary, tokens = _phase(_UPDATE_SYSTEM, _make_fix_prompt(val_report), _ITERS_FIX)
         total_tokens += tokens
         if _cancelled():
             return val_summary or exec_summary, total_tokens
+    elif log_fn:
+        log_fn("info", "Validation clean — no fix pass needed.")
 
     # Tests run after the fix pass, so they assert against code that compiles —
     # a test suite written against known-broken code just re-reports the same
@@ -3152,7 +3436,8 @@ def _run_update_sequence(
             log_fn("thinking", "Writing and running tests…")
         # The test brief is surfaced to the user rather than fed forward: it is
         # evidence about the work, not input to a later phase.
-        test_summary, tokens = run_phase(
+        test_summary, tokens, _test_report = _review_phase(
+            "test",
             _TEST_SYSTEM,
             _test_agent_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
             _ITERS_TEST,
@@ -3170,13 +3455,16 @@ def _run_update_sequence(
             log_fn("info", "━━━ Security review phase ━━━")
             log_fn("thinking", "Reviewing for security issues…")
         # The security agent fixes what it finds in place; its prose isn't
-        # surfaced, so only its token cost is kept.
-        _, tokens = run_phase(
+        # surfaced, so only its token cost and finding count are kept.
+        _, tokens, sec_report = _review_phase(
+            "security",
             _SECURITY_SYSTEM,
             _security_user_msg(app_name, template_key, plan, prompt, workspace),
             _ITERS_SECURITY,
         )
         total_tokens += tokens
+        if log_fn and (sec_findings := len(sec_report.get("findings") or [])):
+            log_fn("info", f"Security review: {sec_findings} issue(s) addressed.")
     elif log_fn:
         log_fn("info", "Security phase skipped — no auth/API/storage changes.")
 
@@ -3204,10 +3492,14 @@ def run_update_agent(
     _log_plan(plan, log_fn)
     client = anthropic.Anthropic(api_key=api_key)
 
-    def run_phase(system: str, user_msg: str, iters: int) -> tuple[str, int]:
+    def run_phase(
+        system: str, user_msg: str, iters: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, int]:
         return _loop(
             client, model, system, workspace, user_msg,
             log_fn, cancel_fn, max_iterations=iters,
+            tools=tools,
         )
 
     return _run_update_sequence(
@@ -3238,10 +3530,14 @@ def run_update_agent_ollama(
     )
     _log_plan(plan, log_fn)
 
-    def run_phase(system: str, user_msg: str, iters: int) -> tuple[str, int]:
+    def run_phase(
+        system: str, user_msg: str, iters: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, int]:
         return _ollama_loop(
             base_url, model, system, workspace, user_msg,
             timeout, log_fn, cancel_fn, max_iterations=iters,
+            tools=tools,
         )
 
     return _run_update_sequence(
@@ -3256,12 +3552,86 @@ def run_update_agent_ollama(
 # ---------------------------------------------------------------------------
 
 _GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-_TOOL_RESULT_LIMIT = 1500
+# Gemini 2.5 Flash has a 1M-token context, so the old 1,500-char cap was starving
+# it for no reason: a stylesheet or a component came back as a fragment, and the
+# agent spent its whole phase paging through the same file with read_file offsets
+# trying to see the rest. Use the same large-context cap as the Claude path.
+_TOOL_RESULT_LIMIT = _TOOL_RESULT_LIMIT_LARGE_CTX
+# Rolling window, in model/tool-response pairs, so a long phase stops resending
+# every earlier turn.
+_GEMINI_HISTORY_PAIRS = 20
 
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 _GEMINI_MAX_RETRIES = 4
 _GEMINI_BASE_DELAY_S = 5.0
+
+# Client-side pacing, learned from 429s rather than configured. An agent phase
+# fires requests back to back with no gap, so even a single user can trip a
+# per-minute limit within seconds — it is our own request rate, not anyone
+# else's load. Starts at zero so a key with headroom pays nothing for this; the
+# first rate-limit response sets it, and it decays once requests get through
+# cleanly. Process-local and advisory: worker concurrency is not accounted for.
+_gemini_min_interval_s = 0.0
+_gemini_last_request_at = 0.0
+_GEMINI_MAX_INTERVAL_S = 30.0
+
+
+def _gemini_pace() -> None:
+    """Sleep just long enough to honour the learned minimum request interval."""
+    global _gemini_last_request_at
+    if _gemini_min_interval_s > 0:
+        wait = _gemini_min_interval_s - (time.monotonic() - _gemini_last_request_at)
+        if wait > 0:
+            logger.debug("Gemini pacing: sleeping %.1fs before next request", wait)
+            time.sleep(wait)
+    _gemini_last_request_at = time.monotonic()
+
+
+def _gemini_note_rate_limit(retry_delay: float | None) -> None:
+    """Raise the pacing interval after a rate-limit response."""
+    global _gemini_min_interval_s
+    # Google's own RetryInfo is authoritative when present. The fallback is a
+    # guess at a typical free-tier allowance (~10 requests/minute) used only
+    # until a response tells us better.
+    target = retry_delay if retry_delay and retry_delay > 0 else 6.0
+    _gemini_min_interval_s = min(max(_gemini_min_interval_s, target), _GEMINI_MAX_INTERVAL_S)
+
+
+def _gemini_note_success() -> None:
+    """Relax pacing gradually while requests are getting through."""
+    global _gemini_min_interval_s
+    if _gemini_min_interval_s > 0:
+        _gemini_min_interval_s = max(0.0, _gemini_min_interval_s * 0.9 - 0.1)
+
+
+def _gemini_error_details(resp: Any) -> tuple[float | None, list[str], str]:
+    """Pull (retry_delay_seconds, quota_ids, message) out of a Gemini error body.
+
+    Defensive: an error body that does not match the documented shape yields
+    empty values rather than raising inside the retry loop.
+    """
+    try:
+        error = (resp.json() or {}).get("error") or {}
+    except ValueError:
+        return None, [], resp.text[:300]
+
+    retry_delay: float | None = None
+    quota_ids: list[str] = []
+    for detail in error.get("details") or []:
+        kind = str(detail.get("@type", ""))
+        if kind.endswith("RetryInfo"):
+            raw = str(detail.get("retryDelay", "")).rstrip("s")
+            try:
+                retry_delay = float(raw)
+            except ValueError:
+                retry_delay = None
+        elif kind.endswith("QuotaFailure"):
+            quota_ids += [
+                str(v.get("quotaId") or v.get("quotaMetric") or "")
+                for v in detail.get("violations") or []
+            ]
+    return retry_delay, quota_ids, str(error.get("message") or "")[:300]
 
 
 def _gemini_post_with_retry(
@@ -3282,38 +3652,80 @@ def _gemini_post_with_retry(
 
     delay = _GEMINI_BASE_DELAY_S
     last_exc: Exception | None = None
+    told_user = False
+    hit_rate_limit = False
 
     for attempt in range(_GEMINI_MAX_RETRIES + 1):
+        _gemini_pace()
         try:
             resp = _req.post(url, params={"key": api_key}, json=payload, timeout=timeout)
         except _req.exceptions.RequestException as exc:
             last_exc = exc
+            # A connection error is a local/network problem, never someone
+            # else's load — say so rather than blaming demand.
+            if log_fn and not told_user:
+                told_user = True
+                log_fn("warning", "Cannot reach the Gemini API — checking the connection…")
         else:
             if resp.status_code not in _RETRYABLE_STATUS_CODES:
                 resp.raise_for_status()
+                # Only a clean first-try success is evidence the limit has
+                # lifted. A success that happened *because* we just backed off
+                # is evidence the backoff worked, so it must not undo it.
+                if not hit_rate_limit:
+                    _gemini_note_success()
                 return resp.json()
-            # 429 covers both "too many requests" (worth retrying) and
-            # depleted prepaid credits (RESOURCE_EXHAUSTED — retrying is
-            # futile, it'll return the exact same response every time).
-            if "RESOURCE_EXHAUSTED" in resp.text and "credit" in resp.text.lower():
-                raise RuntimeError(
-                    "Gemini prepayment credits are depleted. Add credits at "
-                    "https://ai.studio/projects, or switch BUILD_MODEL to "
-                    "'claude' or 'gpt' in .env."
+
+            retry_delay, quota_ids, message = _gemini_error_details(resp)
+            quota_blob = " ".join(quota_ids).lower()
+
+            if resp.status_code == 429:
+                # Depleted prepaid credits: retrying returns the identical
+                # response every time, so fail immediately with the real fix.
+                if "credit" in resp.text.lower():
+                    raise RuntimeError(
+                        "Gemini prepayment credits are depleted. Add credits at "
+                        "https://ai.studio/projects, or switch BUILD_MODEL to "
+                        "'claude' or 'gpt' in .env."
+                    )
+                # A per-DAY quota will not clear within this build either.
+                if "perday" in quota_blob.replace("_", ""):
+                    raise RuntimeError(
+                        "Gemini daily request quota is exhausted for this API key "
+                        f"({', '.join(quota_ids) or 'per-day limit'}). It resets at "
+                        "midnight Pacific. Enable billing on the key, or switch "
+                        "BUILD_MODEL to 'claude' or 'gpt' in .env."
+                    )
+                # Per-minute limit: genuinely transient, and it is our own
+                # request rate. Pace subsequent calls so we stop causing it.
+                hit_rate_limit = True
+                _gemini_note_rate_limit(retry_delay)
+                if log_fn and not told_user:
+                    told_user = True
+                    log_fn(
+                        "warning",
+                        "Hitting the Gemini per-minute rate limit — slowing down. "
+                        "Enable billing on the API key to remove this limit.",
+                    )
+                logger.info(
+                    "Gemini 429 (%s) — pacing to %.1fs between requests: %s",
+                    ", ".join(quota_ids) or "rate limit", _gemini_min_interval_s, message,
                 )
+            elif log_fn and not told_user:
+                # 5xx really is Google's problem — the original wording fits here.
+                told_user = True
+                log_fn("thinking", "High demand right now — taking a short pause, hang tight…")
+
             last_exc = _req.exceptions.HTTPError(
-                f"{resp.status_code} {resp.reason} for {url}: {resp.text[:300]}"
+                f"{resp.status_code} {resp.reason} for {url}: {message or resp.text[:300]}"
             )
+            if retry_delay and retry_delay > 0:
+                # Google told us exactly how long to wait; guessing is worse.
+                delay = max(delay, retry_delay)
 
         if attempt < _GEMINI_MAX_RETRIES:
-            # Tell the user once, in plain words — not one warning per attempt.
-            # The retry mechanics (attempt count, backoff seconds) belong in the
-            # server log, not the user's build feed; the frontend spinner on the
-            # last line already shows something is in progress.
-            if log_fn and attempt == 0:
-                log_fn("thinking", "High demand right now — taking a short pause, hang tight…")
             logger.info(
-                "Gemini busy — retry %d/%d in %.0fs", attempt + 1, _GEMINI_MAX_RETRIES, delay
+                "Gemini retry %d/%d in %.0fs", attempt + 1, _GEMINI_MAX_RETRIES, delay
             )
             time.sleep(delay)
             delay *= 2
@@ -3341,15 +3753,32 @@ def _gemini_loop(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
     """Gemini tool-use agent loop via REST API. Returns (summary, total_tokens)."""
     url = _GEMINI_URL.format(model=model)
-    gemini_tools = _tools_to_gemini_format(TOOLS)
+    gemini_tools = _tools_to_gemini_format(tools if tools is not None else TOOLS)
     contents: list[dict[str, Any]] = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
     last_text = ""
     write_calls = 0
-    pushback_sent = False
+    nudges = 0  # bounded pushbacks when the agent talks instead of writing
     total_tokens = 0
+    # Read-only calls already answered since the last workspace mutation.
+    seen_reads: set[str] = set()
+    explore_streak = 0  # consecutive turns of tool use with no write
+
+    def _trimmed_contents() -> list[dict[str, Any]]:
+        """First user turn + a window that never orphans a functionResponse.
+
+        Gemini rejects a functionResponse whose functionCall is no longer in the
+        history, so the window advances to the next model turn rather than
+        slicing blindly by count.
+        """
+        window = contents[1:][-(_GEMINI_HISTORY_PAIRS * 2):]
+        start = 0
+        while start < len(window) and window[start].get("role") != "model":
+            start += 1
+        return contents[:1] + window[start:]
 
     for iteration in range(max_iterations):
         if cancel_fn and cancel_fn():
@@ -3365,7 +3794,7 @@ def _gemini_loop(
             api_key,
             {
                 "system_instruction": {"parts": [{"text": system}]},
-                "contents": contents,
+                "contents": _trimmed_contents(),
                 "tools": gemini_tools,
                 "generationConfig": {"maxOutputTokens": 8192},
             },
@@ -3400,8 +3829,8 @@ def _gemini_loop(
                 tool_calls.append(part["functionCall"])
 
         if done_text is not None and not tool_calls:
-            if write_calls == 0 and not pushback_sent:
-                pushback_sent = True
+            if write_calls == 0 and nudges < _MAX_NUDGES:
+                nudges += 1
                 if log_fn:
                     log_fn("info", "Agent said DONE without writing files — asking it to implement…")
                 contents.append({"role": "user", "parts": [{"text": (
@@ -3412,8 +3841,8 @@ def _gemini_loop(
             return done_text, total_tokens
 
         if finish_reason in ("STOP", "MAX_TOKENS") and not tool_calls:
-            if write_calls == 0 and not pushback_sent:
-                pushback_sent = True
+            if write_calls == 0 and nudges < _MAX_NUDGES:
+                nudges += 1
                 if log_fn:
                     log_fn("info", "No files written yet — asking agent to write the code…")
                 contents.append({"role": "user", "parts": [{"text": (
@@ -3423,21 +3852,67 @@ def _gemini_loop(
             return last_text or "Done.", total_tokens
 
         tool_responses: list[dict] = []
+        wrote_this_turn = False
         for call in tool_calls:
             tool_name = call.get("name", "")
             tool_input = call.get("args", {})
-            if tool_name == "write_file":
+            if tool_name in _WRITE_TOOLS:
                 write_calls += 1
+                wrote_this_turn = True
                 if log_fn:
                     log_fn("file_written", tool_input.get("path", ""))
+
+            call_key = f"{tool_name}:{json.dumps(tool_input, sort_keys=True, default=str)}"
+            is_repeat = tool_name in _READ_ONLY_TOOLS and call_key in seen_reads
             if log_fn:
-                log_fn("tool", tool_message(tool_name, tool_input))
-            result = execute_tool(tool_name, tool_input, workspace, log_fn)
+                # Mark repeats explicitly — an identical-looking log line for a
+                # suppressed call makes a stuck agent impossible to spot.
+                label = tool_message(tool_name, tool_input)
+                log_fn("tool", f"{label} — already read, skipping" if is_repeat else label)
+
+            if is_repeat:
+                result = (
+                    f"[You already ran {tool_name} with these exact arguments and "
+                    "the workspace has not changed since. The result is the same. "
+                    "Stop inspecting and make the change now.]"
+                )
+            else:
+                result = execute_tool(tool_name, tool_input, workspace, log_fn)
+                if tool_name in _READ_ONLY_TOOLS:
+                    seen_reads.add(call_key)
+                else:
+                    # The workspace changed, so earlier reads may be stale.
+                    seen_reads.clear()
             result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
             tool_responses.append({"functionResponse": {"name": tool_name, "response": {"output": result}}})
 
-        if tool_responses:
-            contents.append({"role": "user", "parts": tool_responses})
+        if not tool_responses:
+            continue
+        contents.append({"role": "user", "parts": tool_responses})
+
+        # Bounded exploration: a run of tool-only turns with nothing written
+        # means the agent is stuck surveying. Push it to act, once per streak.
+        explore_streak = 0 if wrote_this_turn else explore_streak + 1
+        if explore_streak >= _MAX_EXPLORE_STREAK:
+            if nudges < _MAX_NUDGES:
+                nudges += 1
+                explore_streak = 0
+                if log_fn:
+                    log_fn("info", "Agent is still exploring — asking it to start writing…")
+                # Appended to the same turn as the tool responses: a functionResponse
+                # must be answered in the turn directly after its functionCall.
+                tool_responses.append({"text": (
+                    f"You have used {_MAX_EXPLORE_STREAK} turns inspecting the project "
+                    "without writing anything. You have enough context. Implement the "
+                    "change now, then reply DONE."
+                )})
+            else:
+                if log_fn:
+                    log_fn("warning", "Agent kept exploring without making changes — stopping.")
+                return (
+                    last_text or "Agent stopped: explored the project without making changes.",
+                    total_tokens,
+                )
 
     if log_fn:
         log_fn("warning", "Agent reached iteration limit.")
@@ -3483,10 +3958,14 @@ def run_update_agent_gemini(
     )
     _log_plan(plan, log_fn)
 
-    def run_phase(system: str, user_msg: str, iters: int) -> tuple[str, int]:
+    def run_phase(
+        system: str, user_msg: str, iters: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, int]:
         return _gemini_loop(
             api_key, model, system, workspace, user_msg,
             log_fn, cancel_fn, max_iterations=iters,
+            tools=tools,
         )
 
     return _run_update_sequence(
@@ -3509,12 +3988,14 @@ def _openai_loop(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
     """OpenAI tool-use agent loop. Returns (summary, total_tokens)."""
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key)
-    openai_tools = _tools_to_ollama_format(TOOLS)  # same OpenAI-compatible format
+    # same OpenAI-compatible format
+    openai_tools = _tools_to_ollama_format(tools if tools is not None else TOOLS)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
         {"role": "user", "content": initial_user_msg},
@@ -3539,7 +4020,7 @@ def _openai_loop(
                 messages=messages,
                 tools=openai_tools,
                 tool_choice="auto",
-                max_tokens=8096,
+                max_tokens=_MAX_OUTPUT_TOKENS_CHAT,
             )
         except Exception as exc:
             raise RuntimeError(f"OpenAI agent request failed: {exc}") from exc
@@ -3595,7 +4076,7 @@ def _openai_loop(
                 tool_input = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
                 tool_input = {}
-            if tool_name == "write_file":
+            if tool_name in _WRITE_TOOLS:
                 write_calls += 1
                 if log_fn:
                     log_fn("file_written", tool_input.get("path", ""))
@@ -3649,10 +4130,14 @@ def run_update_agent_openai(
     )
     _log_plan(plan, log_fn)
 
-    def run_phase(system: str, user_msg: str, iters: int) -> tuple[str, int]:
+    def run_phase(
+        system: str, user_msg: str, iters: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, int]:
         return _openai_loop(
             api_key, model, system, workspace, user_msg,
             log_fn, cancel_fn, max_iterations=iters,
+            tools=tools,
         )
 
     return _run_update_sequence(
@@ -3778,7 +4263,7 @@ def _openrouter_chat_turn(
                     messages=messages,
                     tools=tools,
                     tool_choice="auto",
-                    max_tokens=8096,  # headroom: reasoning tokens are billed here too
+                    max_tokens=_MAX_OUTPUT_TOKENS_CHAT,  # headroom: reasoning tokens are billed here too
                 )
                 if idx > 0:
                     chain.insert(0, chain.pop(idx))
@@ -3802,6 +4287,7 @@ def _openrouter_loop(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
     """Tool-use agent loop for the hosted Qwen3 backend (OpenRouter).
 
@@ -3820,7 +4306,8 @@ def _openrouter_loop(
 
     client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
     chain = code_models()  # ordered, tool-capable; mutated in place by failover
-    openrouter_tools = _tools_to_ollama_format(TOOLS)  # OpenAI-compatible schema
+    # OpenAI-compatible schema
+    openrouter_tools = _tools_to_ollama_format(tools if tools is not None else TOOLS)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
         {"role": "user", "content": initial_user_msg},
@@ -3911,7 +4398,7 @@ def _openrouter_loop(
                 tool_input = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
                 tool_input = {}
-            if tool_name == "write_file":
+            if tool_name in _WRITE_TOOLS:
                 write_calls += 1
                 wrote_this_turn = True
                 if log_fn:
@@ -3997,10 +4484,14 @@ def run_update_agent_openrouter(
     # surface usage — its (small) tokens aren't counted; the tool-loop phases
     # below are the bulk of the cost.
 
-    def run_phase(system: str, user_msg: str, iters: int) -> tuple[str, int]:
+    def run_phase(
+        system: str, user_msg: str, iters: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, int]:
         return _openrouter_loop(
             system, workspace, user_msg,
             log_fn, cancel_fn, max_iterations=iters,
+            tools=tools,
         )
 
     return _run_update_sequence(
@@ -4014,6 +4505,80 @@ def run_update_agent_openrouter(
 # Core loop
 # ---------------------------------------------------------------------------
 
+def _stream_turn(
+    client: anthropic.Anthropic,
+    model: str,
+    system_blocks: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+    log_fn: Callable[[str, str], None] | None,
+    tool_blocks: list[dict[str, Any]],
+) -> Any:
+    """Run one streamed Anthropic turn and return the accumulated final message.
+
+    Streaming is what keeps the build feed alive: on a non-streamed call the UI
+    sits silent for the whole generation and then receives the turn in one lump.
+    Text is flushed at sentence / newline / 120-char boundaries and thinking at
+    120 chars, matching the Ollama path so the feed reads identically across
+    providers.
+    """
+    global _thinking_supported
+
+    def _run(thinking: dict[str, Any] | None) -> Any:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": _MAX_OUTPUT_TOKENS,
+            "system": system_blocks,
+            "tools": tool_blocks,
+            "messages": messages,
+        }
+        if thinking:
+            kwargs["thinking"] = thinking
+
+        stream_buf = ""  # content tokens awaiting a flush boundary
+        think_buf = ""   # thinking tokens, flushed separately
+        with client.messages.stream(**kwargs) as stream:
+            for event in stream:
+                if event.type != "content_block_delta":
+                    continue
+                delta = event.delta
+                if delta.type == "text_delta":
+                    stream_buf += delta.text
+                    if log_fn and (
+                        "\n" in stream_buf
+                        or stream_buf.endswith((".", "!", "?", "…"))
+                        or len(stream_buf) >= 120
+                    ):
+                        if stream_buf.strip():
+                            log_fn("text", stream_buf.strip())
+                        stream_buf = ""
+                elif delta.type == "thinking_delta":
+                    think_buf += delta.thinking
+                    if log_fn and len(think_buf) >= 120:
+                        log_fn("thinking", think_buf.strip())
+                        think_buf = ""
+            if log_fn:
+                if think_buf.strip():
+                    log_fn("thinking", think_buf.strip())
+                if stream_buf.strip():
+                    log_fn("text", stream_buf.strip())
+            return stream.get_final_message()
+
+    if _thinking_supported:
+        try:
+            return _run(_THINKING_CONFIG)
+        except anthropic.BadRequestError as exc:
+            if "thinking" not in str(exc).lower():
+                raise
+            # Adaptive thinking is rejected by pre-4.6 models. ANTHROPIC_MODEL is
+            # operator-configurable, so degrade for the rest of the process
+            # instead of failing every Claude build on a pinned older model.
+            _thinking_supported = False
+            logger.warning(
+                "Model %s rejected adaptive thinking — continuing without it: %s", model, exc,
+            )
+    return _run(None)
+
+
 def _loop(
     client: anthropic.Anthropic,
     model: str,
@@ -4023,67 +4588,121 @@ def _loop(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
-    """Agent tool loop. Returns (summary, total_tokens_used)."""
+    """Agent tool loop. Returns (summary, total_tokens_used).
+
+    Carries the same context-control guards as the Ollama path — truncated tool
+    results, a rolling window that never orphans a tool_result, repeat-read
+    suppression and a bounded-exploration breaker — plus prompt caching, which
+    only pays off because the system prompt and tool array are byte-stable
+    across every iteration of a phase.
+    """
     messages: list[dict[str, Any]] = [{"role": "user", "content": initial_user_msg}]
+    system_blocks = _cached_system(system)
+    tool_blocks = _cached_tools_for(tools)
     total_tokens = 0
     write_calls = 0
-    pushback_sent = False
+    nudges = 0  # bounded pushbacks when the agent talks instead of writing
+    # Read-only calls already answered since the last workspace mutation.
+    seen_reads: set[str] = set()
+    explore_streak = 0  # consecutive turns of tool use with no write_file
+    last_text = ""
+
+    def _trimmed_messages() -> list[dict[str, Any]]:
+        """First user message + a rolling window that starts on an assistant turn.
+
+        Slicing purely by count can start the window on the user message holding
+        a tool_result whose tool_use was just dropped. Anthropic rejects that
+        outright, so this is a correctness fix and not only a cost one; advancing
+        to the next assistant turn is the only position a conversation can safely
+        resume from, and it also avoids leaving two user messages adjacent.
+        """
+        window = messages[1:][-(_ANTHROPIC_HISTORY_PAIRS * 2):]
+        start = 0
+        while start < len(window) and window[start].get("role") != "assistant":
+            start += 1
+        return messages[:1] + window[start:]
 
     for iteration in range(max_iterations):
         if cancel_fn and cancel_fn():
             if log_fn:
                 log_fn("warning", "Agent stopped by user.")
-            return "Stopped by user.", 0
+            return "Stopped by user.", total_tokens
         warn_at = max(1, max_iterations - 10)
         if iteration == warn_at and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
-        response = client.messages.create(
-            model=model,
-            max_tokens=8096,
-            system=system,
-            tools=TOOLS,
-            messages=messages,
+        _mark_message_breakpoints(messages)
+        response = _stream_turn(
+            client, model, system_blocks, _trimmed_messages(), log_fn, tool_blocks,
         )
 
-        total_tokens += response.usage.input_tokens + response.usage.output_tokens
+        total_tokens += _usage_tokens(response.usage)
+        _log_cache_usage(response.usage)
         messages.append({"role": "assistant", "content": response.content})
 
+        if response.stop_reason == "max_tokens" and log_fn:
+            log_fn("warning", "Response hit the output limit — the last file may be incomplete.")
+
         tool_results: list[dict[str, Any]] = []
-        last_text = ""
         done_text: str | None = None
+        wrote_this_turn = False
 
         for block in response.content:
             if block.type == "text":
-                last_text = block.text
+                # Already streamed to the feed above; only the bookkeeping here.
+                if block.text.strip():
+                    last_text = block.text
                 logger.debug("Agent text: %s", block.text[:120])
-                if log_fn and block.text.strip():
-                    preview = block.text.strip()[:160]
-                    if len(block.text.strip()) > 160:
-                        preview += "…"
-                    log_fn("text", preview)
                 if "DONE" in block.text.upper():
                     done_text = block.text
 
             elif block.type == "tool_use":
-                if block.name == "write_file":
+                tool_input = block.input or {}
+                if block.name in _WRITE_TOOLS:
                     write_calls += 1
+                    wrote_this_turn = True
                     if log_fn:
-                        log_fn("file_written", (block.input or {}).get("path", ""))
-                msg = tool_message(block.name, block.input)
-                logger.debug("Tool %s → %s", block.name, msg)
+                        log_fn("file_written", tool_input.get("path", ""))
+
+                call_key = f"{block.name}:{json.dumps(tool_input, sort_keys=True, default=str)}"
+                is_repeat = block.name in _READ_ONLY_TOOLS and call_key in seen_reads
                 if log_fn:
-                    log_fn("tool", msg)
-                result = execute_tool(block.name, block.input, workspace, log_fn)
+                    # Mark repeats explicitly — an identical-looking log line for
+                    # a suppressed call makes a stuck agent impossible to spot.
+                    label = tool_message(block.name, tool_input)
+                    log_fn("tool", f"{label} — already read, skipping" if is_repeat else label)
+
+                if is_repeat:
+                    # Serving this from a notice rather than re-running it is the
+                    # point: re-executing costs a full tool result in context
+                    # every time and teaches the model nothing new.
+                    result = (
+                        f"[You already ran {block.name} with these exact arguments and "
+                        "the workspace has not changed since. The result is the same. "
+                        "Stop inspecting and make the change now.]"
+                    )
+                else:
+                    result = execute_tool(block.name, tool_input, workspace, log_fn)
+                    if block.name in _READ_ONLY_TOOLS:
+                        seen_reads.add(call_key)
+                    else:
+                        # The workspace changed, so earlier reads may be stale.
+                        seen_reads.clear()
+                # Cap large results so they don't blow up the context window on
+                # the next iteration. Claude's context is large — use the big cap.
+                result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT_LARGE_CTX)
                 tool_results.append(
                     {"type": "tool_result", "tool_use_id": block.id, "content": result}
                 )
 
-        # If agent said DONE but hasn't written any files, push back once
+        # If agent said DONE but hasn't written any files, push back — bounded,
+        # because an unbounded nudge burns every iteration re-asking a model that
+        # isn't going to comply.
         if done_text is not None and not tool_results:
-            if write_calls == 0 and not pushback_sent:
-                pushback_sent = True
+            if write_calls == 0 and nudges < _MAX_NUDGES:
+                nudges += 1
                 if log_fn:
                     log_fn("info", "Agent said DONE without writing files — asking it to implement…")
                 messages.append({
@@ -4098,9 +4717,8 @@ def _loop(
             return done_text, total_tokens
 
         if response.stop_reason == "end_turn":
-            if write_calls == 0 and not pushback_sent:
-                # Agent stopped without writing any files — push back once
-                pushback_sent = True
+            if write_calls == 0 and nudges < _MAX_NUDGES:
+                nudges += 1
                 if log_fn:
                     log_fn("info", "No files written yet — asking agent to write the code…")
                 messages.append({
@@ -4115,8 +4733,40 @@ def _loop(
                 continue
             return last_text or "Done.", total_tokens
 
-        if tool_results:
-            messages.append({"role": "user", "content": tool_results})
+        if not tool_results:
+            continue
+        messages.append({"role": "user", "content": tool_results})
+
+        # Bounded exploration: a run of tool-only turns with nothing written
+        # means the agent is stuck surveying. Push it to act, once per streak.
+        explore_streak = 0 if wrote_this_turn else explore_streak + 1
+        if explore_streak >= _MAX_EXPLORE_STREAK:
+            if nudges < _MAX_NUDGES:
+                nudges += 1
+                explore_streak = 0
+                if log_fn:
+                    log_fn("info", "Agent is still exploring — asking it to start writing…")
+                # Appended to the tool_result message rather than sent as its own
+                # user turn: tool results must be answered in the message that
+                # directly follows the tool_use, and a text block may trail them.
+                tool_results.append({
+                    "type": "text",
+                    "text": (
+                        f"You have used {_MAX_EXPLORE_STREAK} turns inspecting the project "
+                        "without writing anything. You have enough context. Implement the "
+                        "change now with write_file, then reply DONE."
+                    ),
+                })
+            else:
+                # Pushed to act and still only surveying. Every further turn
+                # re-sends the whole context for no progress, which is how a
+                # single request burns hundreds of thousands of tokens.
+                if log_fn:
+                    log_fn("warning", "Agent kept exploring without making changes — stopping.")
+                return (
+                    last_text or "Agent stopped: explored the project without making changes.",
+                    total_tokens,
+                )
 
     if log_fn:
         log_fn("warning", "Agent reached iteration limit.")

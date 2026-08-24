@@ -89,6 +89,14 @@ class Settings(BaseSettings):
     # App build backend (code generation): "claude" | "gemini" | "Qwen3" | "gpt"
     BUILD_MODEL: str = "gemini"
 
+    # Pass --ignore-scripts to `npm install` in build workspaces. This stops
+    # preinstall/postinstall hooks in a model-authored package.json from running
+    # arbitrary code on the worker, but it also breaks dependencies that need a
+    # postinstall step to fetch or compile a native binary (esbuild, sharp).
+    # Off by default; turn it on once your templates are confirmed to install
+    # cleanly without lifecycle scripts.
+    NPM_IGNORE_SCRIPTS: bool = False
+
     # Embeddings
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_API_KEY: str = ""

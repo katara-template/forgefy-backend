@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from app.build.auto_sync import WorkspaceAutoSync
 from app.config import get_settings
 from app.workers.celery_app import celery_app
 
@@ -114,6 +115,20 @@ def _make_fix_prompt_with_hint(error_msg: str, template_key: str, retry_hint: bo
         "  • Verify all imports resolve to real files in the workspace\n\n"
     )
     return warning + base
+
+
+def _kill_agent_jobs(workspace_path: Path) -> None:
+    """Stop background jobs the agent started, on the build's way out.
+
+    Best-effort: this runs on cancel and failure paths, where an exception here
+    would replace the real reason the build ended.
+    """
+    try:
+        from app.build.jobs import kill_all_jobs
+
+        kill_all_jobs(workspace_path)
+    except Exception as exc:  # noqa: BLE001 — cleanup must never mask the outcome
+        logger.warning("Could not stop background jobs: %s", exc)
 
 
 def _run_agent_fix(
@@ -685,7 +700,17 @@ async def _run(session_id: str, project_id: str) -> dict:
     repo_url: str = ""
     repo_full_name: str = ""
 
-    workspace = Workspace(uuid.UUID(session_id), template_key, template_url, git_token=github_token)
+    # The template lives in Forgefy's own private org, so it must be cloned with
+    # the PLATFORM token. github_token above is the user's personal token when
+    # they have connected GitHub — that token cannot see katara-template/*, and
+    # GitHub answers 404 "Repository not found" rather than 403 for private repos
+    # you lack access to. It stays reserved for creating and pushing THEIR repo.
+    workspace = Workspace(
+        uuid.UUID(session_id), template_key, template_url, git_token=settings.GITHUB_TOKEN
+    )
+    # Assigned once the repo exists and push_url is known. Declared here so the
+    # error handlers below can reach it after a failure that happens earlier.
+    syncer: WorkspaceAutoSync | None = None
     try:
         # 7. Clone template
         workspace.clone()
@@ -694,13 +719,21 @@ async def _run(session_id: str, project_id: str) -> dict:
 
         # 8. Create GitHub repo and push template code immediately so it's live on GitHub
         gh = GitHubClient(github_token)
-        repo_data = gh.create_repo(
+        # Suffixes the name (app → app-2 → app-3 → app-<random>) when it is
+        # already taken. Rebuilding an app you have built before is normal, and
+        # previously failed the whole build with "rename your app and try again".
+        repo_data = gh.create_repo_unique(
             name=app_name,
             description=(json_output.get("app_description") or "")[:100],
             private=True,
         )
         repo_url = repo_data["html_url"]
         repo_full_name = repo_data["full_name"]
+        # app_name stays the user's chosen name; only the repo carries the
+        # suffix. Tell them when the two diverge so the GitHub link is not a
+        # surprise.
+        if repo_data["name"] != app_name:
+            log_fn("info", f"'{app_name}' was taken on GitHub — using '{repo_data['name']}'.")
         push_url = gh.get_push_url(repo_full_name)
 
         workspace.commit_all("chore: initial template")
@@ -737,6 +770,14 @@ async def _run(session_id: str, project_id: str) -> dict:
         install_dependencies_at(workspace.path, template_key, log_fn=log_fn)
 
         log_fn("info", "Running build agent…")
+
+        # Checkpoint the workspace to GitHub while the agent works. A build that
+        # dies partway — exhausted budget, OOM kill, timeout — otherwise loses
+        # everything to the workspace.cleanup() in `finally`, even though the
+        # repo already exists and could have held the partial code.
+        # Started here: the repo and push_url exist, and the template is pushed.
+        syncer = WorkspaceAutoSync(workspace, push_url, label="build", log_fn=log_fn)
+        syncer.start()
 
         # 9. Run build agent — model selected by BUILD_MODEL (independent of BP_MODEL)
         if settings.BUILD_MODEL == "Qwen3":
@@ -827,10 +868,11 @@ async def _run(session_id: str, project_id: str) -> dict:
         from app.core.usage import record_usage
         await record_usage(db, owner_id, tokens_used, is_build=True)
 
-        # 10. Push agent changes on top of the template commit
+        # 10. Push agent changes on top of the template commit.
+        # Through the syncer so it cannot interleave with a checkpoint; stopping
+        # it first also guarantees no further checkpoints during the deploy steps.
         log_fn("info", "Pushing agent changes to GitHub…")
-        workspace.commit_all(f"feat: initial build by Forgefy\n\n{summary[:400]}")
-        workspace.push(push_url)
+        syncer.stop(f"feat: initial build by Forgefy\n\n{summary[:400]}")
 
         # 11. Preview + artifact (all non-fatal)
         artifact_url: str | None = None
@@ -854,6 +896,9 @@ async def _run(session_id: str, project_id: str) -> dict:
             while True:
                 if is_cancelled(settings.REDIS_URL, session_id):
                     clear_cancel(settings.REDIS_URL, session_id)
+                    # Cancelling the loop does not stop what the agent spawned;
+                    # an orphaned npm install would outlive the build.
+                    _kill_agent_jobs(workspace.path)
                     log_fn("warning", "Build stopped by user.")
                     return {}
                 try:
@@ -973,6 +1018,8 @@ async def _run(session_id: str, project_id: str) -> dict:
     except _BuildFixExhausted as exc:
         # Auto-fix ran out of attempts — code is on GitHub but wouldn't compile.
         # Do NOT say "the agent will attempt to fix" — it already tried and stopped.
+        if syncer is not None:
+            syncer.stop("chore: build stopped after auto-fix attempts")
         user_msg = (
             "The preview couldn't be compiled automatically. "
             "Your code is saved on GitHub — send a chat message like "
@@ -996,6 +1043,13 @@ async def _run(session_id: str, project_id: str) -> dict:
         return {}
 
     except Exception as exc:
+        # Last chance to save the agent's work: `finally` deletes the workspace.
+        # No-op when the failure happened before the repo existed.
+        if syncer is not None:
+            saved = syncer.stop("chore: partial build (run did not complete)")
+            if saved or syncer.pushed_anything:
+                log_fn("info", "Partial code was saved to GitHub before the failure.")
+
         from app.core.build_errors import GENERIC_OPERATOR_MESSAGE, sanitize_build_error
         build_err = sanitize_build_error(exc)
         logger.error("Build FAILED session=%s: %s", session_id, exc, exc_info=True)
@@ -1093,8 +1147,12 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
 
     workspace = EditWorkspace(uuid.UUID(project_id), repo_full_name, github_token)
     push_url = f"https://{github_token}@github.com/{repo_full_name}.git"
+    # The auto-fix loop below runs a code-writing agent, so this path can lose
+    # work the same way a build or update can.
+    syncer = WorkspaceAutoSync(workspace, push_url, label="preview", log_fn=log_fn)
     try:
         workspace.ensure()
+        syncer.start()
 
         # If a database is connected for this project, keep .env in sync with
         # the real values (see app/build/workspace.py) — a prior commit may
@@ -1130,6 +1188,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         while True:
             if is_cancelled(settings.REDIS_URL, project_id):
                 clear_cancel(settings.REDIS_URL, project_id)
+                _kill_agent_jobs(workspace.path)
                 log_fn("warning", "Build stopped by user.")
                 return {}
             try:
@@ -1154,10 +1213,9 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
                 logger.warning("Auto-fix triggered project=%s attempt=%d streak=%d: %s", project_id, _fix_attempt, _same_err_streak, _err[:200])
                 fix_summary = _run_agent_fix(workspace.path, _err, template_key, app_name, blueprint, settings, log_fn, retry_hint=_same_err_streak > 0)
                 hit_limit = "iteration limit" in fix_summary.lower()
-                workspace.sync_to_github(
-                    commit_message="fix: auto-fix compilation errors",
-                    push_url=push_url,
-                )
+                # Through the syncer so it shares the lock with the background
+                # checkpoints and cannot run git concurrently with one.
+                syncer.sync_now("fix: auto-fix compilation errors")
                 if hit_limit:
                     _hit_limit_streak += 1
                     if _hit_limit_streak >= _MAX_HIT_LIMIT_STREAK:
@@ -1205,10 +1263,12 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         if artifact_url:
             updates["artifact_url"] = artifact_url
 
+        syncer.stop()
         await db.collection("projects").document(project_id).update(updates)
         return {"preview_url": preview_url, "artifact_url": artifact_url}
 
     except _BuildFixExhausted as exc:
+        syncer.stop("chore: preview stopped after auto-fix attempts")
         user_msg = (
             "The preview couldn't be compiled automatically. "
             "Send a chat message like 'Fix the build errors' and the agent will try again."
@@ -1224,6 +1284,10 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         return {}
 
     except Exception as exc:
+        # `finally` deletes the workspace — save any fix-agent output first.
+        if syncer.stop("chore: partial preview fixes (run did not complete)") or syncer.pushed_anything:
+            log_fn("info", "Partial fixes were saved to GitHub before the failure.")
+
         from app.core.build_errors import GENERIC_OPERATOR_MESSAGE, sanitize_build_error
         build_err = sanitize_build_error(exc)
         logger.error("Preview build FAILED project=%s: %s", project_id, exc, exc_info=True)
