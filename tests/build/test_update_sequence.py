@@ -9,11 +9,18 @@ run_phase records the system prompt of each phase, which is what identifies it.
 """
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from app.build.agent_tools import TOOLS, execute_tool
 from app.build.build_agent import (
     _DESIGN_AGENT_SYSTEM,
+    _REPORT_INSTRUCTION,
     _SCHEMA_SYSTEM,
     _SECURITY_SYSTEM,
     _TEST_SYSTEM,
+    _TOOL_RULES,
     _UPDATE_SYSTEM,
     _VALIDATOR_SYSTEM,
     _run_update_sequence,
@@ -35,21 +42,70 @@ _LABELS = {
 _CLEAN = "VALIDATED: all good"
 
 
-class _Recorder:
-    """Fake run_phase that records calls and returns scripted summaries."""
+# Reviewing phases file their result through a per-workspace store, so the fake
+# needs a real directory to key it by. One shared dir is safe: each reviewing
+# phase resets the store before it runs.
+_WS = Path(tempfile.mkdtemp(prefix="forgefy_seq_"))
 
-    def __init__(self, summaries: dict[str, str] | None = None, tokens: int = 10):
+_REVIEWING = ("validate", "test", "security")
+
+
+class _Recorder:
+    """Fake run_phase that records calls and returns scripted summaries.
+
+    `reports` maps a reviewing phase's label to what it should file:
+      omitted / "clean" -> a clean report (the common case)
+      list[dict]        -> those findings, i.e. issues_found
+      None              -> file nothing, simulating a phase that forgot
+    """
+
+    def __init__(
+        self,
+        summaries: dict[str, str] | None = None,
+        tokens: int = 10,
+        reports: dict[str, Any] | None = None,
+    ):
         self.calls: list[tuple[str, str, int]] = []  # (label, user_msg, iters)
+        self.tools_seen: dict[str, list[str]] = {}
         self._summaries = summaries or {}
         self._tokens = tokens
+        self._reports = reports or {}
 
-    def __call__(self, system: str, user_msg: str, iters: int) -> tuple[str, int]:
-        label = _LABELS.get(system, "?")
+    def __call__(
+        self, system: str, user_msg: str, iters: int, tools: list[dict] | None = None,
+    ) -> tuple[str, int]:
+        # Every phase is dispatched with the shared tool-usage rules appended, so
+        # the design/schema/test/security agents all learn to prefer edit_file
+        # and not to re-read a file they just edited.
+        base = system
+        if base.endswith(_REPORT_INSTRUCTION):
+            base = base[: -len(_REPORT_INSTRUCTION)]
+        assert base.endswith(_TOOL_RULES), "phase dispatched without the tool rules"
+        label = _LABELS.get(base[: -len(_TOOL_RULES)], "?")
         # The fix pass reuses _UPDATE_SYSTEM; it is the second "exec" seen.
         if label == "exec" and any(c[0] in ("exec", "fix") for c in self.calls):
             label = "fix"
         self.calls.append((label, user_msg, iters))
+        self.tools_seen[label] = [t["name"] for t in (tools or TOOLS)]
+
+        if label in _REVIEWING:
+            self._file_report(label)
         return self._summaries.get(label, f"{label} done"), self._tokens
+
+    def _file_report(self, label: str) -> None:
+        spec = self._reports.get(label, "clean")
+        if spec is None:
+            return  # phase forgot to report
+        findings = [] if spec == "clean" else spec
+        execute_tool(
+            "report_findings",
+            {
+                "status": "clean" if not findings else "issues_found",
+                "findings": findings,
+                "summary": f"{label} report",
+            },
+            _WS,
+        )
 
     @property
     def phases(self) -> list[str]:
@@ -59,10 +115,14 @@ class _Recorder:
         return next(c[1] for c in self.calls if c[0] == label)
 
 
+_A_FINDING = [{"severity": "high", "file": "app/page.tsx", "line": 12,
+               "summary": "Missing import for Card"}]
+
+
 def _run(recorder: _Recorder, plan: dict | None, blueprint: dict | None = None, **kw):
     return _run_update_sequence(
         recorder,
-        workspace=None,  # every user-msg builder tolerates a None workspace
+        workspace=_WS,
         prompt="add invoices",
         blueprint=blueprint if blueprint is not None else {},
         app_name="Acme",
@@ -103,7 +163,7 @@ class TestPhaseOrder:
         assert rec.phases == ["schema", "design", "exec", "validate", "test", "security"]
 
     def test_fix_pass_runs_when_validator_is_not_clean(self):
-        rec = _Recorder({"validate": "I am the validation agent. My role is..."})
+        rec = _Recorder(reports={"validate": _A_FINDING})
 
         _run(rec, {"skip_schema_agent": True, "skip_security_agent": True})
 
@@ -132,7 +192,7 @@ class TestTestPhase:
 
     def test_runs_after_the_fix_pass_not_before(self):
         """Tests must assert against code that already compiles."""
-        rec = _Recorder({"validate": "unresolved issues remain"})
+        rec = _Recorder(reports={"validate": _A_FINDING})
 
         _run(rec, {"skip_schema_agent": True, "skip_security_agent": True})
 
@@ -207,7 +267,7 @@ class TestTokensAndReturn:
         assert summary == _CLEAN
 
     def test_fix_summary_supersedes_validator_summary(self):
-        rec = _Recorder({"validate": "not clean", "fix": "FIXED: done"})
+        rec = _Recorder({"fix": "FIXED: done"}, reports={"validate": _A_FINDING})
         summary, _ = _run(rec, {"skip_schema_agent": True, "skip_security_agent": True, "skip_test_agent": True})
         assert summary == "FIXED: done"
 

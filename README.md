@@ -96,7 +96,7 @@ Download a service-account key from Firebase Console → Project settings → Se
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-API docs at [http://localhost:8000/docs](http://localhost:8000/docs) in development (disabled in production).
+API docs at [http://localhost:5000/docs](http://localhost:5000/docs) in development (disabled in production).
 
 ### 5. Start Celery workers (separate terminals)
 

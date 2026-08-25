@@ -590,22 +590,24 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
         elif settings.BUILD_MODEL == "gemini":
             import asyncio
 
-            import requests as _req
-
             def _gemini_classify():
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.GEMINI_MODEL}:generateContent"
-                r = _req.post(
+                # Same transport the Gemini build loop uses: client-side pacing
+                # learned from 429s plus RetryInfo-aware backoff, so a free-tier
+                # per-minute limit costs a short wait instead of failing the chat.
+                from app.build.build_agent import _GEMINI_URL, _gemini_post_with_retry
+
+                url = _GEMINI_URL.format(model=settings.GEMINI_MODEL)
+                data = _gemini_post_with_retry(
                     url,
-                    params={"key": settings.GEMINI_API_KEY},
-                    json={
+                    settings.GEMINI_API_KEY,
+                    {
                         "system_instruction": {"parts": [{"text": system}]},
                         "contents": [{"role": "user", "parts": [{"text": message}]}],
                         "generationConfig": {"maxOutputTokens": 1024},
                     },
                     timeout=60,
                 )
-                r.raise_for_status()
-                parts = (r.json().get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+                parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
                 return "".join(p.get("text", "") for p in parts).strip()
 
             raw = await asyncio.to_thread(_gemini_classify)

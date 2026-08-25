@@ -44,6 +44,22 @@ def using_openrouter() -> bool:
     return bool((get_settings().OPENROUTER_API_KEY or "").strip())
 
 
+def fallback_to_openrouter_enabled() -> bool:
+    """True when a failing Ollama run may switch to OpenRouter mid-build.
+
+    This is the automatic escape hatch for the opposite case of
+    ``using_openrouter``: an OLLAMA_API_KEY that picks Ollama as primary, but
+    whose endpoint rate-limits (Ollama Cloud 429s without warning) or is down.
+    Requires OPENROUTER_API_KEY; without it there is nowhere to fall back to.
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+    if not settings.QWEN_FALLBACK_TO_OPENROUTER:
+        return False
+    return bool((settings.OPENROUTER_API_KEY or "").strip())
+
+
 def call_qwen(
     system_prompt: str,
     user_content: str,

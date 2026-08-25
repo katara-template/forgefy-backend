@@ -30,7 +30,7 @@ class Forgefy:
                          base_url="https://your-forgefy-host")
         result = client.extract("We need Google login...", extractors=["features"])
 
-    ``base_url`` falls back to ``$FORGEFY_API_URL``, then ``http://localhost:8000``.
+    ``base_url`` falls back to ``$FORGEFY_API_URL``, then ``http://localhost:5000``.
     """
 
     def __init__(
@@ -47,7 +47,7 @@ class Forgefy:
             raise ValueError("Forgefy: api_key is required")
         self._api_key = api_key
         self._base_url = (
-            base_url or os.environ.get("FORGEFY_API_URL") or "http://localhost:8000"
+            base_url or os.environ.get("FORGEFY_API_URL") or "http://localhost:5000"
         ).rstrip("/")
         self._max_retries = max_retries
         self._retry_delay = retry_delay
