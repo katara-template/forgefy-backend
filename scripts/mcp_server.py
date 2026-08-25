@@ -10,7 +10,7 @@ You don't run this yourself — the MCP client spawns it over stdio. Setup:
 Claude Code:
     claude mcp add forgefy \
       -e FORGEFY_API_KEY=fgy_live_... \
-      -e FORGEFY_API_URL=https://your-forgefy-host \
+      -e FORGEFY_API_URL=https://forgefy.com \
       -- python /path/to/mcp_server.py
 
 Claude Desktop / Cursor: add the equivalent {command, args, env} entry to the

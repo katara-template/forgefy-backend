@@ -243,6 +243,57 @@ class TestLogin:
 
         assert resp.status_code == 429
 
+    async def test_login_survives_redis_outage(
+        self, client: AsyncClient, mock_db: MagicMock, mock_redis: AsyncMock, firebase_settings
+    ) -> None:
+        """An unreachable Redis must not break authentication.
+
+        Regression: a deleted Redis instance let ConnectionError escape
+        check_not_locked_out, turning every login into a 500.
+        """
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        doc = _user_doc(email="test@example.com")
+        _set_email_query_result(mock_db, [doc])
+        outage = RedisConnectionError("Error -2 connecting to redis:6379. Name or service not known.")
+        mock_redis.get.side_effect = outage
+        mock_redis.delete.side_effect = outage
+
+        with patch(
+            "app.api.v1.auth._firebase_password_signin",
+            new=AsyncMock(return_value=doc.id),
+        ):
+            resp = await client.post(
+                "/api/v1/auth/login",
+                json={"email": "test@example.com", "password": "correct_password"},
+            )
+
+        assert resp.status_code == 200
+        assert "access_token" in resp.json()
+
+    async def test_bad_credentials_still_401_during_redis_outage(
+        self, client: AsyncClient, mock_db: MagicMock, mock_redis: AsyncMock, firebase_settings
+    ) -> None:
+        """Failing open on the counter must not turn a rejection into a 500."""
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        doc = _user_doc(email="test@example.com")
+        _set_email_query_result(mock_db, [doc])
+        outage = RedisConnectionError("Name or service not known.")
+        mock_redis.get.side_effect = outage
+        mock_redis.incr.side_effect = outage
+
+        with patch(
+            "app.api.v1.auth._firebase_password_signin",
+            new=AsyncMock(return_value=None),
+        ):
+            resp = await client.post(
+                "/api/v1/auth/login",
+                json={"email": "test@example.com", "password": "wrong_password"},
+            )
+
+        assert resp.status_code == 401
+
     async def test_firestore_quota_error_returns_429(
         self, client: AsyncClient, mock_db: MagicMock, mock_redis: AsyncMock, firebase_settings
     ) -> None:
