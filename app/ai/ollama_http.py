@@ -11,9 +11,12 @@ only changes where the request lands. OpenRouter still wins when both are set.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 CLOUD_URL = "https://ollama.com"
+
+logger = logging.getLogger(__name__)
 
 # URLs that mean "the local daemon" — a cloud key alongside any of these is a
 # leftover from the local setup rather than a deliberate choice.
@@ -118,3 +121,87 @@ def auth_error_hint(status_code: int) -> str | None:
         f"Ollama returned HTTP {status_code}. If this endpoint is the hosted "
         "service or an authenticating proxy, set OLLAMA_API_KEY."
     )
+
+
+# ── Retrying /api/chat transport ─────────────────────────────────────────────
+# Ollama Cloud rate-limits without warning (429), and a build phase fires
+# requests back to back — a single transient response used to kill the whole
+# task. Both the legacy loop and the provider-adapter path share this opener so
+# there is exactly one backoff policy to reason about.
+
+_RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+_MAX_RETRIES = 4
+_BASE_DELAY_S = 5.0
+
+
+def open_chat_stream(
+    url: str,
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout: int,
+    model: str,
+    log_fn=None,
+):
+    """POST /api/chat with stream=True, retrying rate-limit/overload responses.
+
+    Returns an open streamed ``requests`` response ready for ``iter_lines()``.
+    Non-retryable failures raise immediately with an actionable hint; a
+    retryable status is retried with exponential backoff, honouring any
+    Retry-After header Ollama sends.
+    """
+    import time as _time
+
+    import requests as _req
+
+    delay = _BASE_DELAY_S
+    last_exc: Exception | None = None
+    told_user = False
+
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            resp = _req.post(
+                url, json=payload, headers=headers, timeout=(30, timeout), stream=True,
+            )
+        except _req.exceptions.RequestException as exc:
+            # A connection error is local/network, never someone else's load.
+            last_exc = exc
+            if log_fn and not told_user:
+                told_user = True
+                # User-facing wording stays provider-agnostic; the name and the
+                # error live in the worker log only.
+                log_fn("warning", "The AI service is briefly unreachable — checking the connection…")
+            logger.warning("Ollama unreachable at %s: %s", url, exc)
+        else:
+            if resp.status_code == 404:
+                raise RuntimeError(missing_model_hint(model))
+            if hint := auth_error_hint(resp.status_code):
+                raise RuntimeError(hint)
+            if resp.status_code not in _RETRYABLE_STATUS:
+                resp.raise_for_status()
+                return resp
+
+            # Retryable: prefer Ollama's own Retry-After over our guess.
+            retry_after = resp.headers.get("retry-after")
+            try:
+                delay = max(delay, float(retry_after or 0))
+            except (TypeError, ValueError):
+                pass
+            last_exc = RuntimeError(f"{resp.status_code} {resp.reason} for {url}")
+            if log_fn and not told_user:
+                told_user = True
+                # Provider-agnostic on purpose: users should never see which
+                # backend is serving their build.
+                log_fn(
+                    "thinking",
+                    "The AI is in high demand right now — backing off briefly, hang tight…"
+                    if resp.status_code == 429
+                    else "High demand right now — taking a short pause…",
+                )
+
+        if attempt < _MAX_RETRIES:
+            logger.info("Ollama retry %d/%d in %.0fs", attempt + 1, _MAX_RETRIES, delay)
+            _time.sleep(delay)
+            delay *= 2
+
+    raise RuntimeError(f"Ollama agent request failed after {_MAX_RETRIES + 1} attempts: {last_exc}")

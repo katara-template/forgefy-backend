@@ -747,6 +747,20 @@ async def _run(session_id: str, project_id: str) -> dict:
             "repo_owner": "platform" if using_platform_github else "user",
             "updated_at": now,
         })
+
+        # Resumability (Part: continue-after-interrupt). From this point the
+        # project has a GitHub repo that auto-sync keeps current, so an
+        # interrupted run is continuable from any device: this in-progress
+        # record says WHAT was being built, a later record (or clear) says how
+        # it ended. A bare "continue" in chat picks it up.
+        from app.build import resume_state as _resume_state
+        await db.collection("projects").document(project_id).update(
+            _resume_state.record(
+                _resume_state.build_request(json_output, app_name),
+                "error",  # placeholder until the run's real outcome overwrites it
+                kind="build",
+            )
+        )
         log_fn("info", f"Repository live on GitHub ({repo_url}). Generating design system…")
 
         # 8.5 Phase 0.5 — materialise design system files before the build agent reads them
@@ -776,7 +790,7 @@ async def _run(session_id: str, project_id: str) -> dict:
         # everything to the workspace.cleanup() in `finally`, even though the
         # repo already exists and could have held the partial code.
         # Started here: the repo and push_url exist, and the template is pushed.
-        syncer = WorkspaceAutoSync(workspace, push_url, label="build", log_fn=log_fn)
+        syncer = WorkspaceAutoSync(workspace, push_url, label="build")
         syncer.start()
 
         # 9. Run build agent — model selected by BUILD_MODEL (independent of BP_MODEL)
@@ -864,6 +878,38 @@ async def _run(session_id: str, project_id: str) -> dict:
                 "appId": proj_data.get("firebase_app_id"),
             })
 
+        # 9.5 Deterministic demo-screen guard. The prompt asks the agent to
+        # replace the template's demo launch page and the validator re-checks;
+        # both are LLM-driven and can be ignored. This scan is not: if the entry
+        # file still carries template-demo markers, force a targeted fix pass
+        # BEFORE anything is pushed, so a preview never opens on demo content.
+        try:
+            from app.build.demo_guard import demo_screen_present
+
+            _demo_hit, _demo_evidence = demo_screen_present(workspace.path, template_key)
+        except Exception as _dg_exc:  # a guard must never fail the build
+            logger.warning("demo guard error (non-fatal): %s", _dg_exc)
+            _demo_hit, _demo_evidence = False, ""
+        if _demo_hit:
+            log_fn("warning", "The launch page still shows template demo content — fixing…")
+            await _run_agent_fix(
+                workspace_path=workspace.path,
+                error_msg=(
+                    "The app's launch/entry screen still contains TEMPLATE DEMO content "
+                    f"({_demo_evidence}). Replace it with this application's real home "
+                    "screen built from the blueprint, delete or stop routing the demo "
+                    "screen, and make sure the router/navigator opens on real content."
+                ),
+                template_key=template_key,
+                app_name=app_name,
+                blueprint=json_output,
+                settings=settings,
+                log_fn=log_fn,
+            )
+            _still_hit, _ = demo_screen_present(workspace.path, template_key)
+            if _still_hit:
+                logger.warning("demo guard: fix pass did not clear the launch page session=%s", session_id)
+
         # Record usage against the user's monthly quota
         from app.core.usage import record_usage
         await record_usage(db, owner_id, tokens_used, is_build=True)
@@ -871,7 +917,7 @@ async def _run(session_id: str, project_id: str) -> dict:
         # 10. Push agent changes on top of the template commit.
         # Through the syncer so it cannot interleave with a checkpoint; stopping
         # it first also guarantees no further checkpoints during the deploy steps.
-        log_fn("info", "Pushing agent changes to GitHub…")
+        # Silent to the user: pushing is background bookkeeping, not build work.
         syncer.stop(f"feat: initial build by Forgefy\n\n{summary[:400]}")
 
         # 11. Preview + artifact (all non-fatal)
@@ -997,6 +1043,9 @@ async def _run(session_id: str, project_id: str) -> dict:
             "build_error": None,
             "updated_at": now,
         }
+        # Build completed — nothing is outstanding, so drop the resume record.
+        from app.build import resume_state as _resume_state
+        proj_update.update(_resume_state.clear())
         if env_local_content is not None:
             proj_update["env_local_template"] = env_local_content
         await db.collection("projects").document(project_id).update(proj_update)
@@ -1038,6 +1087,14 @@ async def _run(session_id: str, project_id: str) -> dict:
             proj_err["github_url"] = repo_url
             proj_err["repo_full_name"] = repo_full_name
             proj_err["repo_owner"] = "platform" if using_platform_github else "user"
+        # Auto-fix exhausted — the build itself is unfinished and continuable.
+        from app.build import resume_state as _resume_state
+        proj_err.update(_resume_state.record(
+            _resume_state.build_request(json_output, app_name),
+            "error",
+            progress=str(locals().get("summary", "") or ""),
+            kind="build",
+        ))
         await db.collection("projects").document(project_id).update(proj_err)
         log_fn("warning", user_msg)
         return {}
@@ -1149,7 +1206,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
     push_url = f"https://{github_token}@github.com/{repo_full_name}.git"
     # The auto-fix loop below runs a code-writing agent, so this path can lose
     # work the same way a build or update can.
-    syncer = WorkspaceAutoSync(workspace, push_url, label="preview", log_fn=log_fn)
+    syncer = WorkspaceAutoSync(workspace, push_url, label="preview")
     try:
         workspace.ensure()
         syncer.start()

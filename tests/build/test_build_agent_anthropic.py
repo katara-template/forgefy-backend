@@ -166,7 +166,7 @@ class TestPromptCaching:
             {"role": "user", "content": [{"type": "tool_result", "content": "c"}]},
         ]
 
-        _mark_message_breakpoints(messages)
+        _mark_message_breakpoints(messages, build_agent._ANCHOR_END, trimming=False)
 
         marked = [
             i for i, m in enumerate(messages)
@@ -178,7 +178,7 @@ class TestPromptCaching:
         messages: list[dict[str, Any]] = [{"role": "user", "content": "start"}]
         for turn in range(4):
             messages.append({"role": "user", "content": [{"type": "tool_result", "content": str(turn)}]})
-            _mark_message_breakpoints(messages)
+            _mark_message_breakpoints(messages, build_agent._ANCHOR_END, trimming=False)
 
         marked = [
             m["content"][-1]["content"] for m in messages
@@ -221,6 +221,120 @@ class TestPromptCaching:
 
     def test_usage_tokens_tolerates_a_backend_without_cache_fields(self):
         assert _usage_tokens(SimpleNamespace(input_tokens=5, output_tokens=3)) == 8
+
+
+# ── Part E: the caching/trimming interaction ──────────────────────────────────
+
+
+def _long_run(tmp_path, turns: int, **kw):
+    """Drive the loop for `turns` tool-using iterations, then DONE."""
+    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+    script = [
+        _message([_tool(f"t{i}", "read_file", path="a.txt")]) for i in range(turns)
+    ]
+    script.append(_message([_text("DONE")], stop_reason="end_turn"))
+    client = _FakeClient(script)
+    trace: list[dict[str, Any]] = []
+    _loop(
+        client, "claude-sonnet-5", "SYSTEM PROMPT", tmp_path, "build it",
+        max_iterations=turns + 2, cache_trace=trace, **kw,
+    )
+    return client, trace
+
+
+def _marked(call: dict[str, Any]) -> list[int]:
+    """Indices of messages carrying a cache breakpoint."""
+    out = []
+    for i, msg in enumerate(call["messages"]):
+        content = msg.get("content")
+        if (
+            isinstance(content, list)
+            and content
+            and isinstance(content[-1], dict)
+            and "cache_control" in content[-1]
+        ):
+            out.append(i)
+    return out
+
+
+class TestAnchorAndTrimming:
+    def test_the_anchor_is_never_trimmed_away(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
+        client, _ = _long_run(tmp_path, 14)
+
+        for call in client.messages.calls:
+            assert call["messages"][0]["content"] == "build it"
+            # The opening turns stay in view for the whole phase.
+            assert len(call["messages"]) >= min(
+                build_agent._ANCHOR_END, len(call["messages"])
+            )
+
+    def test_once_trimming_starts_the_only_breakpoint_is_in_the_anchor(
+        self, tmp_path, monkeypatch,
+    ):
+        """A breakpoint above the trim point can never match a stored prefix, so
+        leaving one there pays the cache-write premium for nothing."""
+        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
+        client, trace = _long_run(tmp_path, 14)
+
+        trimming = [t["iteration"] for t in trace if t["trimmed"]]
+        assert trimming, "the window never slid — test is not exercising the case"
+        for i in trimming:
+            marks = _marked(client.messages.calls[i])
+            assert len(marks) == 1, f"iteration {i} marked {len(marks)} message blocks"
+            assert marks[0] < build_agent._ANCHOR_END
+
+    def test_before_trimming_the_two_newest_turns_are_marked(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 20)
+        client, trace = _long_run(tmp_path, 5)
+
+        assert all(t["trimmed"] == 0 for t in trace), "unexpected trim"
+        # By the third iteration there are two markable turns to carry marks.
+        assert len(_marked(client.messages.calls[3])) == 2
+
+    def test_breakpoints_never_exceed_the_api_limit(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
+        client, _ = _long_run(tmp_path, 14)
+
+        for call in client.messages.calls:
+            total = sum("cache_control" in t for t in call["tools"])
+            total += sum("cache_control" in b for b in call["system"])
+            total += len(_marked(call))
+            assert total <= 4
+
+    def test_trimming_never_orphans_a_tool_result(self, tmp_path, monkeypatch):
+        """The anchor introduces a gap in the history; the window must still
+        resume on an assistant turn."""
+        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
+        client, _ = _long_run(tmp_path, 14)
+
+        for call in client.messages.calls:
+            _assert_no_orphaned_tool_results(call["messages"])
+
+    def test_no_two_adjacent_user_messages_across_the_gap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
+        client, _ = _long_run(tmp_path, 14)
+
+        for call in client.messages.calls:
+            roles = [m["role"] for m in call["messages"]]
+            for a, b in zip(roles, roles[1:], strict=False):
+                assert not (a == "user" and b == "user"), f"adjacent user turns: {roles}"
+
+    def test_cache_trace_records_every_iteration(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
+        client, trace = _long_run(tmp_path, 14)
+
+        assert len(trace) == len(client.messages.calls)
+        assert {"iteration", "trimmed", "messages_sent", "cache_read_input_tokens"} <= set(
+            trace[0]
+        )
+
+    def test_trim_counts_grow_monotonically_once_started(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
+        _, trace = _long_run(tmp_path, 14)
+
+        trims = [t["trimmed"] for t in trace if t["trimmed"]]
+        assert trims == sorted(trims), "the window should slide, not jump around"
 
 
 # ── A2: context-control guards ────────────────────────────────────────────────

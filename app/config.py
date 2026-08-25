@@ -88,6 +88,17 @@ class Settings(BaseSettings):
     BP_MODEL: str = "claude"
     # App build backend (code generation): "claude" | "gemini" | "Qwen3" | "gpt"
     BUILD_MODEL: str = "gemini"
+    # Route all provider build/update/fix loops through the single shared loop
+    # behind a provider adapter (app/build/provider_loop.py) instead of the five
+    # historical per-provider loops. Part J lands this behind a flag with the old
+    # loops intact so both can be run on the same build and diffed before the
+    # originals are removed.
+    UNIFIED_AGENT_LOOP: bool = False
+    # When BUILD_MODEL="Qwen3" resolves to Ollama (OLLAMA_API_KEY set) and that
+    # endpoint keeps failing — Ollama Cloud rate-limits without warning — finish
+    # the run on OpenRouter instead of dying. Needs OPENROUTER_API_KEY. Set false
+    # to keep Ollama failures fatal.
+    QWEN_FALLBACK_TO_OPENROUTER: bool = True
 
     # Pass --ignore-scripts to `npm install` in build workspaces. This stops
     # preinstall/postinstall hooks in a model-authored package.json from running

@@ -73,6 +73,14 @@ _MAX_OUTPUT_TOKENS_CHAT = 16384
 # large, so this is generous — it exists to stop an 80-iteration build from
 # resending every turn forever, not to squeeze into a small window.
 _ANTHROPIC_HISTORY_PAIRS = 20
+# Assistant/tool-result pairs after the first user message that are never
+# trimmed. Everything up to the end of this anchor is byte-stable for the whole
+# phase, which is what lets a cache breakpoint sit there and actually be read;
+# measurement showed that once the window starts sliding, no breakpoint inside it
+# can ever match a stored prefix again. Also keeps the opening of the task in
+# view, which is where the requirements are.
+_ANCHOR_TURNS = 3
+_ANCHOR_END = 1 + _ANCHOR_TURNS * 2
 
 _CACHE_CONTROL: dict[str, Any] = {"type": "ephemeral"}
 
@@ -161,29 +169,61 @@ def _block_type(block: Any) -> str | None:
     return getattr(block, "type", None)
 
 
-def _mark_message_breakpoints(messages: list[dict[str, Any]]) -> None:
-    """Keep cache_control on the last two dict-content message blocks.
+def _markable_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Last content block of each message we built ourselves.
 
-    The conversation is what actually grows during a build — by iteration 40 the
-    tool-result history dwarfs the system prompt. Marking the newest turn makes
-    the next request read all of it from cache; keeping the previous mark as well
-    leaves a valid read point, since a breakpoint only looks back about 20 blocks
-    for a prior entry.
-
-    Only blocks we construct ourselves (tool_result dicts) are marked; assistant
+    Only blocks we construct (tool_result dicts) can carry a marker; assistant
     turns hold SDK objects and are left untouched.
     """
-    markable = [
+    return [
         msg["content"][-1]
         for msg in messages
         if isinstance(msg.get("content"), list)
         and msg["content"]
         and isinstance(msg["content"][-1], dict)
     ]
-    for block in markable[:-2]:
+
+
+def _mark_message_breakpoints(
+    messages: list[dict[str, Any]], anchor_end: int, trimming: bool,
+) -> None:
+    """Place the conversation's cache breakpoints, differently once trimming starts.
+
+    While the whole history still fits, marking the two newest turns caches the
+    entire conversation: each request re-reads everything up to the previous turn.
+    Measured hit rate in that regime is ~50% of message breakpoints, covering all
+    the history.
+
+    Once the window starts sliding, that stops working completely. The window
+    drops one pair per turn, so the message prefix differs on every single
+    request and no message breakpoint can ever match a stored one — measured at
+    0/30. Left alone those markers are worse than useless: each one still pays
+    the 1.25x cache-write premium and never earns a read back.
+
+    So above the trim point the only breakpoint that can pay is one at the end of
+    the immutable anchor, which by construction never changes.
+    """
+    for block in _markable_blocks(messages):
         block.pop("cache_control", None)
-    for block in markable[-2:]:
+
+    if trimming:
+        # Anchor only — the tail is unstable by definition.
+        anchor_blocks = _markable_blocks(messages[:anchor_end])
+        keep = anchor_blocks[-1:]
+    else:
+        keep = _markable_blocks(messages)[-2:]
+
+    for block in keep:
         block["cache_control"] = dict(_CACHE_CONTROL)
+
+
+def _cache_stats(usage: Any) -> tuple[int, int, int]:
+    """(fresh, cache_creation, cache_read) input tokens for one turn."""
+    return (
+        getattr(usage, "input_tokens", 0) or 0,
+        getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        getattr(usage, "cache_read_input_tokens", 0) or 0,
+    )
 
 
 def _usage_tokens(usage: Any) -> int:
@@ -860,6 +900,35 @@ _BUILD_PREAMBLE = """You are the Forgefy Build Agent.
 Your task: implement a complete, working application from the blueprint by writing files in the workspace.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DEMO SCREEN — REMOVE IT FIRST, WIRE AS YOU GO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The template you cloned ships a demo/placeholder home screen (sample content
+that belongs to the template, not to this app). It must NOT survive the build:
+
+1. FIRST TASK — before any feature work: locate the template's demo/placeholder
+   screen (a home/welcome/showcase page full of sample content) and DELETE it or
+   REPLACE it with this app's real home screen. Update the router/navigator so
+   the app opens on real content, not the demo.
+2. ENTRY SCREEN FIRST — the launch page is built before everything else. The
+   entry screen is whatever opens at launch: app/index.tsx or app/(tabs)/index
+   (Expo), app/page.tsx (Next.js), the home widget under lib/ or the initial
+   route in MainNavigator (Flutter). Build its REAL layout and content from the
+   blueprint first, set it as the initial route, then build every other feature
+   in an order that links outward from it. Never start with a leaf screen.
+3. INTEGRATE INCREMENTALLY — after finishing EACH page, screen, component or
+   feature, IMMEDIATELY register it in the router/navigator (add the route, tab
+   entry, or a link from the home screen) BEFORE starting the next one. Never
+   batch navigation wiring until the end.
+4. WHY: previews are compiled from what is committed. If this run stops early
+   (step/token limit), the user sees the last pushed state — it must open on a
+   real launch page with the features you actually finished, never the demo
+   page. A screen that exists on disk but is not routed is invisible to the
+   user.
+
+A build that finishes with the demo screen still showing has failed its first
+task, no matter how many feature files it wrote.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BUILD PHASES — follow in order
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PHASE 0 · Auth Decision  ← do this BEFORE anything else
@@ -977,6 +1046,11 @@ ADDITIONAL REQUIREMENTS
   React Native) for both data and auth — see the "FORGEFY CLIENT SDK" note in the
   structure section above. Firebase-backed apps keep using the Firebase SDK.
 • Implement EVERY feature listed in the blueprint — nothing optional
+• Build the ENTRY SCREEN first — the page users see at launch gets its real
+  layout and content before any other screen, and stays the initial route
+• Remove the template's demo/placeholder home screen (see DEMO SCREEN above) and
+  wire each finished page/screen into the router AS YOU GO — an unwired screen
+  never reaches a preview, so partial builds must still open on real content
 • Handle loading states, empty states, and basic error states in every screen
 • Add input validation where the app collects user data
 • Style the app consistently using the color/theme constants you define
@@ -1219,6 +1293,13 @@ FINDING THINGS — search before you read
   • glob finds files by NAME pattern, e.g. 'src/**/*.tsx'.
   • Opening files one at a time to look for something is the slowest and most
     expensive way to search. Search first, then read only what matched.
+  • A project map (when one is provided) lists where symbols are DEFINED — it
+    cannot show where they are USED. For any change that spans multiple files,
+    or whenever the map does not clearly name the target, run grep first:
+      - "update every call site of X"  → grep X, edit each match
+      - "where do we call this API?"   → grep the endpoint/method name
+      - verifying an edit is complete  → grep for leftovers of the old code
+    Trusting a stale map over grep is how edits end up half-applied.
 """
 
 
@@ -1686,6 +1767,21 @@ read_file, write_file, delete_file, list_files, analyze_code. Use write_file lib
 your job is not just to report problems but to FIX every single one you find.
 NEVER explain your role. NEVER ask questions. NEVER say you cannot make changes.
 Your final output MUST always end with a line starting with "VALIDATED:".
+
+══════════════════════════════════════════
+DEMO SCREEN CHECK (run FIRST — cheap and critical)
+══════════════════════════════════════════
+The template shipped a demo/placeholder home screen. It must NOT remain the app's
+landing point:
+  1. Open the router/navigator (app/_layout, app/(tabs)/_layout, lib/router/…,
+     or MainNavigator) and check what the app opens on.
+  2. If it still points at a demo/welcome/showcase screen full of sample content,
+     FIX IT: delete or replace that screen with the app's real home screen and
+     update the router accordingly.
+  3. Also check that screens for features listed in the plan are actually routed —
+     an implemented-but-unwired screen is invisible to the user in previews.
+  4. Confirm the launch page shows THIS app's real content (per the blueprint) —
+     not demo/sample content and not an empty shell. Fix it if not.
 
 ══════════════════════════════════════════
 DESIGN AUDIT (run BEFORE structural checks)
@@ -2459,6 +2555,36 @@ def run_build_agent(
     return _loop(client, model, system, workspace, user_msg, log_fn)
 
 
+def _safe_args(raw: Any) -> dict[str, Any]:
+    """Parse model-emitted tool arguments, tolerating invalid JSON.
+
+    A lone backslash in a path or regex ('C:\\apps', '\\d+') makes the raw
+    argument string unparseable. Execution can degrade to {} silently; echoing
+    that same string back into history cannot — strict providers reject the
+    whole request with a 400 from then on.
+    """
+    if isinstance(raw, dict):
+        return raw
+    text = raw if isinstance(raw, str) else "{}"
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        # Common slip: backslashes that are not valid JSON escapes. Double them
+        # so a Windows path or regex survives as a parseable string.
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", text)
+        try:
+            parsed = json.loads(repaired)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+
+def _valid_args_json(raw: Any) -> str:
+    """Return tool arguments as a JSON-object string safe to echo into history."""
+    return json.dumps(_safe_args(raw), default=str)
+
+
 def _tools_to_ollama_format(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
@@ -2491,10 +2617,30 @@ def _ollama_loop(
     the caller's result must not wait on bookkeeping.
     """
     written: list[str] = []
-    summary, tokens = _ollama_agent_turns(
-        base_url, model, system, workspace, initial_user_msg,
-        timeout, log_fn, cancel_fn, max_iterations, written, tools,
-    )
+    try:
+        summary, tokens = _ollama_agent_turns(
+            base_url, model, system, workspace, initial_user_msg,
+            timeout, log_fn, cancel_fn, max_iterations, written, tools,
+        )
+    except Exception as exc:
+        # Automatic Qwen3 failover: Ollama Cloud rate-limits without warning and
+        # its retry budget is already spent by the time this fires, so finish the
+        # phase on the OpenRouter CODE chain rather than failing the build.
+        from app.ai.qwen import fallback_to_openrouter_enabled
+
+        if not fallback_to_openrouter_enabled():
+            raise
+        if log_fn:
+            # Provider-agnostic: never name backends or leak exc (it can carry
+            # URLs/keys). Detail goes to the operator log below.
+            log_fn("warning", "The primary AI service is unavailable — switching to a backup automatically…")
+        logger.warning(
+            "qwen: Ollama failed (%s) — falling back to the OpenRouter build loop", exc,
+        )
+        return _openrouter_loop(
+            system, workspace, initial_user_msg,
+            log_fn, cancel_fn, max_iterations, tools,
+        )
     if written:
         update_project_memory_async(workspace, initial_user_msg, summary, written)
     return summary, tokens
@@ -2519,13 +2665,44 @@ def _ollama_agent_turns(
     eval_count), so Ollama builds/updates are billed like the other backends.
     Targets a local daemon or Ollama Cloud depending on OLLAMA_API_KEY.
     """
+    from app.build.provider_loop import OllamaAdapter, run_agent_loop, unified_loop_enabled
+
+    if unified_loop_enabled():
+        adapter: Any = OllamaAdapter(base_url=base_url, model=model, timeout=timeout)
+        # Automatic Qwen3 failover: if this Ollama endpoint keeps failing, finish
+        # the run on the OpenRouter CODE chain instead of dying.
+        try:
+            from app.ai.qwen import fallback_to_openrouter_enabled
+
+            if fallback_to_openrouter_enabled():
+                from app.ai.openrouter import OPENROUTER_BASE_URL, code_models
+                from app.build.provider_loop import OllamaOpenRouterFallback, OpenRouterAdapter
+                from app.config import get_settings
+
+                _s = get_settings()
+                adapter = OllamaOpenRouterFallback(
+                    adapter,
+                    OpenRouterAdapter(
+                        api_key=(_s.OPENROUTER_API_KEY or "").strip(),
+                        base_url=OPENROUTER_BASE_URL,
+                        chain=code_models(),
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001 — fallback is best-effort wiring
+            logger.warning("qwen: OpenRouter fallback unavailable (%s) — Ollama only", exc)
+
+        return run_agent_loop(
+            adapter, system=system, stable=initial_user_msg, workspace=workspace,
+            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
+            tools=tools, written=written,
+        )
+
     import requests as _req
 
     from app.ai.ollama_http import (
-        auth_error_hint,
-        missing_model_hint,
         ollama_headers,
         ollama_options,
+        open_chat_stream,
         using_cloud,
     )
 
@@ -2591,10 +2768,11 @@ def _ollama_agent_turns(
 
         try:
             # stream=True: timeout applies per-chunk, not for the full response,
-            # so long generations don't hit the read timeout.
-            with _req.post(
+            # so long generations don't hit the read timeout. Retries rate-limit /
+            # overload responses (Ollama Cloud 429s without warning) in one place.
+            with open_chat_stream(
                 url,
-                json={
+                payload={
                     "model": model,
                     "messages": _trimmed_messages(),
                     "tools": ollama_tools,
@@ -2602,14 +2780,10 @@ def _ollama_agent_turns(
                     "options": options,
                 },
                 headers=headers,
-                timeout=(30, timeout),
-                stream=True,
+                timeout=timeout,
+                model=model,
+                log_fn=log_fn,
             ) as resp:
-                if resp.status_code == 404:
-                    raise RuntimeError(missing_model_hint(model))
-                if hint := auth_error_hint(resp.status_code):
-                    raise RuntimeError(hint)
-                resp.raise_for_status()
                 content_parts: list[str] = []
                 tool_calls: list[dict] = []
                 stream_buf = ""       # accumulate content tokens until a flush boundary
@@ -3105,7 +3279,10 @@ def _update_user_msg(
             "hooks defined in that file. USE THIS MAP to find the right file to change. Do\n"
             "NOT read files one by one to discover where things are — the map already tells\n"
             "you. Only call read_file when you need a specific file's full contents to edit\n"
-            "it, and prefer reading the 1–3 files the map shows are relevant.\n\n"
+            "it, and prefer reading the 1–3 files the map shows are relevant.\n"
+            "The map shows where symbols are DEFINED, not every place they are USED — for\n"
+            "multi-file changes, or anything the map doesn't clearly name, use grep first\n"
+            "(see HOW TO USE THE FILE TOOLS).\n\n"
             "Before calling write_file for a NEW file:\n"
             "  1. Scan the map for a file with the SAME NAME or SAME PURPOSE\n"
             "     (e.g. auth_service.dart ≈ authentication_service.dart,\n"
@@ -3665,7 +3842,9 @@ def _gemini_post_with_retry(
             # else's load — say so rather than blaming demand.
             if log_fn and not told_user:
                 told_user = True
-                log_fn("warning", "Cannot reach the Gemini API — checking the connection…")
+                # Provider-agnostic: users never see which backend is serving.
+                log_fn("warning", "The AI service is briefly unreachable — checking the connection…")
+            logger.warning("Gemini unreachable for %s", url)
         else:
             if resp.status_code not in _RETRYABLE_STATUS_CODES:
                 resp.raise_for_status()
@@ -3702,13 +3881,15 @@ def _gemini_post_with_retry(
                 _gemini_note_rate_limit(retry_delay)
                 if log_fn and not told_user:
                     told_user = True
+                    # Provider-agnostic for users; the billing hint is operator
+                    # information and stays in the log below.
                     log_fn(
                         "warning",
-                        "Hitting the Gemini per-minute rate limit — slowing down. "
-                        "Enable billing on the API key to remove this limit.",
+                        "The AI is in high demand right now — pacing requests to stay reliable.",
                     )
                 logger.info(
-                    "Gemini 429 (%s) — pacing to %.1fs between requests: %s",
+                    "Gemini 429 (%s) — pacing to %.1fs between requests: %s "
+                    "(hint: enabling billing on the API key removes this limit)",
                     ", ".join(quota_ids) or "rate limit", _gemini_min_interval_s, message,
                 )
             elif log_fn and not told_user:
@@ -3756,6 +3937,16 @@ def _gemini_loop(
     tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
     """Gemini tool-use agent loop via REST API. Returns (summary, total_tokens)."""
+    from app.build.provider_loop import GeminiAdapter, run_agent_loop, unified_loop_enabled
+
+    if unified_loop_enabled():
+        adapter = GeminiAdapter(api_key=api_key, model=model)
+        return run_agent_loop(
+            adapter, system=system, stable=initial_user_msg, workspace=workspace,
+            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
+            tools=tools,
+        )
+
     url = _GEMINI_URL.format(model=model)
     gemini_tools = _tools_to_gemini_format(tools if tools is not None else TOOLS)
     contents: list[dict[str, Any]] = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
@@ -3991,6 +4182,16 @@ def _openai_loop(
     tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
     """OpenAI tool-use agent loop. Returns (summary, total_tokens)."""
+    from app.build.provider_loop import OpenAIAdapter, run_agent_loop, unified_loop_enabled
+
+    if unified_loop_enabled():
+        adapter = OpenAIAdapter(api_key=api_key, model=model)
+        return run_agent_loop(
+            adapter, system=system, stable=initial_user_msg, workspace=workspace,
+            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
+            tools=tools,
+        )
+
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key)
@@ -4029,9 +4230,12 @@ def _openai_loop(
             total_tokens += response.usage.total_tokens
 
         msg = response.choices[0].message
-        # Append as dict so it's serialisable for the next round
+        # Append as dict so it's serialisable for the next round. Arguments are
+        # re-serialised through a validity check: echoing a model's malformed
+        # JSON (e.g. a lone backslash in a path) back verbatim gets every later
+        # request rejected by strict providers.
         messages.append({"role": "assistant", "content": msg.content or "", **({"tool_calls": [
-            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": _valid_args_json(tc.function.arguments)}}
             for tc in (msg.tool_calls or [])
         ]} if msg.tool_calls else {})})
 
@@ -4072,10 +4276,7 @@ def _openai_loop(
 
         for tc in tool_calls:
             tool_name = tc.function.name
-            try:
-                tool_input = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                tool_input = {}
+            tool_input = _safe_args(tc.function.arguments)
             if tool_name in _WRITE_TOOLS:
                 write_calls += 1
                 if log_fn:
@@ -4267,8 +4468,10 @@ def _openrouter_chat_turn(
                 )
                 if idx > 0:
                     chain.insert(0, chain.pop(idx))
+                    # Model names never reach the user feed; operators see them here.
+                    logger.info("openrouter: serving with fallback model %s", mdl)
                     if log_fn:
-                        log_fn("info", f"Switched to fallback model: {mdl}")
+                        log_fn("info", "Adjusting the AI route on our side…")
                 return resp
             except Exception as exc:  # noqa: BLE001 — inspect status, then decide
                 last_exc = exc
@@ -4294,6 +4497,23 @@ def _openrouter_loop(
     Mirrors the other backends' loops (DONE detection, write pushback, tool-result
     truncation) but drives the OpenRouter CODE model chain with mid-build failover.
     """
+    from app.build.provider_loop import OpenRouterAdapter, run_agent_loop, unified_loop_enabled
+
+    if unified_loop_enabled():
+        from app.ai.openrouter import OPENROUTER_BASE_URL, code_models
+        from app.config import get_settings
+
+        _s = get_settings()
+        _key = (_s.OPENROUTER_API_KEY or "").strip()
+        if not _key:
+            raise RuntimeError("OPENROUTER_API_KEY is not set — cannot run the Qwen3/OpenRouter build agent.")
+        adapter = OpenRouterAdapter(api_key=_key, base_url=OPENROUTER_BASE_URL, chain=code_models())
+        return run_agent_loop(
+            adapter, system=system, stable=initial_user_msg, workspace=workspace,
+            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
+            tools=tools,
+        )
+
     from openai import OpenAI
 
     from app.ai.openrouter import OPENROUTER_BASE_URL, code_models
@@ -4341,8 +4561,10 @@ def _openrouter_loop(
             total_tokens += usage.total_tokens
 
         msg = response.choices[0].message
+        # Same validity check as the OpenAI loop: a malformed arguments string
+        # echoed back verbatim poisons history and 400s every later turn.
         messages.append({"role": "assistant", "content": msg.content or "", **({"tool_calls": [
-            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": _valid_args_json(tc.function.arguments)}}
             for tc in (msg.tool_calls or [])
         ]} if msg.tool_calls else {})})
 
@@ -4394,10 +4616,7 @@ def _openrouter_loop(
         wrote_this_turn = False
         for tc in tool_calls:
             tool_name = tc.function.name
-            try:
-                tool_input = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                tool_input = {}
+            tool_input = _safe_args(tc.function.arguments)
             if tool_name in _WRITE_TOOLS:
                 write_calls += 1
                 wrote_this_turn = True
@@ -4589,6 +4808,7 @@ def _loop(
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
     tools: list[dict[str, Any]] | None = None,
+    cache_trace: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
     """Agent tool loop. Returns (summary, total_tokens_used).
 
@@ -4598,6 +4818,16 @@ def _loop(
     only pays off because the system prompt and tool array are byte-stable
     across every iteration of a phase.
     """
+    from app.build.provider_loop import AnthropicAdapter, run_agent_loop, unified_loop_enabled
+
+    if unified_loop_enabled():
+        adapter = AnthropicAdapter(api_key="", model=model, client=client)
+        return run_agent_loop(
+            adapter, system=system, stable=initial_user_msg, workspace=workspace,
+            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
+            tools=tools, cache_trace=cache_trace,
+        )
+
     messages: list[dict[str, Any]] = [{"role": "user", "content": initial_user_msg}]
     system_blocks = _cached_system(system)
     tool_blocks = _cached_tools_for(tools)
@@ -4608,21 +4838,29 @@ def _loop(
     seen_reads: set[str] = set()
     explore_streak = 0  # consecutive turns of tool use with no write_file
     last_text = ""
+    trimming_started = False
 
     def _trimmed_messages() -> list[dict[str, Any]]:
-        """First user message + a rolling window that starts on an assistant turn.
+        """Immutable anchor + a rolling window that starts on an assistant turn.
 
-        Slicing purely by count can start the window on the user message holding
-        a tool_result whose tool_use was just dropped. Anthropic rejects that
-        outright, so this is a correctness fix and not only a cost one; advancing
-        to the next assistant turn is the only position a conversation can safely
-        resume from, and it also avoids leaving two user messages adjacent.
+        The anchor is the first user message plus the opening few turns, and it is
+        never dropped, so everything up to its end is byte-stable for the whole
+        phase and can hold a cache breakpoint that actually gets read. Trimming
+        happens only above it.
+
+        The window cannot simply be sliced by count: it would start on the user
+        message holding a tool_result whose tool_use had just been dropped, which
+        Anthropic rejects outright. Advancing to the next assistant turn is the
+        only position a conversation can safely resume from, and it also avoids
+        leaving two user messages adjacent.
         """
-        window = messages[1:][-(_ANTHROPIC_HISTORY_PAIRS * 2):]
+        anchor = messages[:_ANCHOR_END]
+        rest = messages[_ANCHOR_END:]
+        window = rest[-(_ANTHROPIC_HISTORY_PAIRS * 2):]
         start = 0
         while start < len(window) and window[start].get("role") != "assistant":
             start += 1
-        return messages[:1] + window[start:]
+        return anchor + window[start:]
 
     for iteration in range(max_iterations):
         if cancel_fn and cancel_fn():
@@ -4633,12 +4871,38 @@ def _loop(
         if iteration == warn_at and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
-        _mark_message_breakpoints(messages)
+        # Marking depends on whether the window has started sliding, which is a
+        # property of the message list, so it is computed before the request.
+        will_trim = len(messages) > _ANCHOR_END + _ANTHROPIC_HISTORY_PAIRS * 2
+        _mark_message_breakpoints(messages, _ANCHOR_END, will_trim)
+        sent = _trimmed_messages()
+        # A trim changes the message prefix, so every message-level cache entry
+        # below it is invalidated. Recorded per iteration so the cost of the
+        # window can be correlated with the cache numbers rather than guessed at.
+        dropped = len(messages) - len(sent)
+        if dropped and not trimming_started:
+            trimming_started = True
+            logger.info("cache: first trim at iteration %d (%d messages dropped)", iteration, dropped)
+
         response = _stream_turn(
-            client, model, system_blocks, _trimmed_messages(), log_fn, tool_blocks,
+            client, model, system_blocks, sent, log_fn, tool_blocks,
         )
 
         total_tokens += _usage_tokens(response.usage)
+        fresh, created, read = _cache_stats(response.usage)
+        logger.info(
+            "cache iter=%d trimmed=%d fresh=%d creation=%d read=%d",
+            iteration, dropped, fresh, created, read,
+        )
+        if cache_trace is not None:
+            cache_trace.append({
+                "iteration": iteration,
+                "trimmed": dropped,
+                "messages_sent": len(sent),
+                "input_tokens": fresh,
+                "cache_creation_input_tokens": created,
+                "cache_read_input_tokens": read,
+            })
         _log_cache_usage(response.usage)
         messages.append({"role": "assistant", "content": response.content})
 

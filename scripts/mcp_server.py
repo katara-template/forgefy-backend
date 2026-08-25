@@ -35,7 +35,7 @@ try:
 except ImportError:
     sys.exit('The MCP SDK is required: pip install "mcp[cli]"')
 
-API_URL = os.environ.get("FORGEFY_API_URL", "http://localhost:8000").rstrip("/")
+API_URL = os.environ.get("FORGEFY_API_URL", "http://localhost:5000").rstrip("/")
 API_KEY = os.environ.get("FORGEFY_API_KEY", "")
 if not API_KEY:
     sys.exit("FORGEFY_API_KEY is required (create one in the Forgefy dashboard)")

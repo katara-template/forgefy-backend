@@ -75,21 +75,26 @@ def _post(monkeypatch, responses: list[Any]):
 
 
 class TestRateLimitMessaging:
-    def test_per_minute_limit_does_not_blame_demand(self, monkeypatch):
+    def test_per_minute_limit_is_generic_to_users(self, monkeypatch, caplog):
         ok = _Resp(200, {"candidates": []})
         events, _ = _post(monkeypatch, [
             _Resp(429, _rate_limit_body("GenerateRequestsPerMinutePerProjectPerModel-FreeTier")),
             ok,
         ])
 
-        _gemini_post_with_retry(
-            "http://x", "k", {}, 60, lambda kind, msg: events.append((kind, msg))
-        )
+        with caplog.at_level("INFO"):
+            _gemini_post_with_retry(
+                "http://x", "k", {}, 60, lambda kind, msg: events.append((kind, msg))
+            )
 
+        # User feed: never names the provider, never asks the user to fix billing.
         text = " ".join(m for _, m in events)
         assert "High demand" not in text, "a solo user's own rate limit is not demand"
-        assert "rate limit" in text.lower()
-        assert "billing" in text.lower(), "the message must say how to fix it"
+        assert "gemini" not in text.lower(), "users must not see which model serves them"
+        assert "billing" not in text.lower(), "billing is an operator concern"
+
+        # Operator log keeps the actionable detail.
+        assert any("billing" in r.message.lower() for r in caplog.records)
 
     def test_server_overload_still_reports_demand(self, monkeypatch):
         events, _ = _post(monkeypatch, [_Resp(503, {}), _Resp(200, {"candidates": []})])
