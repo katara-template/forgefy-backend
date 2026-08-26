@@ -1,0 +1,23 @@
+{
+  "name": "forgefy-backend-cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Optional Cloudflare Workers + Containers deployment adapter for forgefy-backend. Not required by the app; remove this directory to drop the target.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "push-secrets": "powershell -ExecutionPolicy Bypass -File ./scripts/push-secrets.ps1",
+    "logs": "wrangler tail --format pretty",
+    "containers:list": "wrangler containers list",
+    "containers:images": "wrangler containers images list"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260825.1",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.125.0"
+  }
+}

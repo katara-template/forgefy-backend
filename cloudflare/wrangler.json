@@ -1,0 +1,92 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "forgefy-backend",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-25",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "observability": {
+    "enabled": true
+  },
+
+  "workers_dev": true,
+
+  // Supervisor tick. The WorkerContainer never sleeps on its own (see
+  // onActivityExpired in src/index.ts), but Cloudflare can still stop an
+  // instance for platform reasons such as a host restart. This cron
+  // re-starts it if it is not running.
+  "triggers": {
+    "crons": ["*/2 * * * *"]
+  },
+
+  "containers": [
+    {
+      "class_name": "ApiContainer",
+      "name": "forgefy-api",
+      // Paths are relative to THIS file. image_build_context is the repo
+      // root so `COPY requirements.txt` / `COPY . .` resolve exactly as they
+      // do for `docker compose build`.
+      "image": "../Dockerfile",
+      "image_build_context": "..",
+      // 1 vCPU / 6 GiB / 12 GB disk. The image is ~8.23 GB and Cloudflare
+      // caps image size at the instance's disk size, so standard-1 (8 GB)
+      // is too small. Leaves ~3.8 GB of writable scratch.
+      "instance_type": "standard-2",
+      "max_instances": 5,
+      "rollout_step_percentage": [10, 100]
+    },
+    {
+      "class_name": "WorkerContainer",
+      "name": "forgefy-worker",
+      "image": "../Dockerfile.worker",
+      "image_build_context": "..",
+      // 4 vCPU / 12 GiB / 20 GB disk. Flutter + Gradle builds run here and
+      // need scratch space in /tmp/forgefy_workspaces on top of the image.
+      "instance_type": "standard-4",
+      // Exactly one. Dockerfile.worker runs celery with -B (embedded beat);
+      // a second replica would double-fire every scheduled task.
+      "max_instances": 1,
+      "rollout_step_percentage": 100
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "API_CONTAINER",
+        "class_name": "ApiContainer"
+      },
+      {
+        "name": "WORKER_CONTAINER",
+        "class_name": "WorkerContainer"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      // Container-backed Durable Objects must use new_sqlite_classes.
+      "new_sqlite_classes": ["ApiContainer", "WorkerContainer"]
+    }
+  ],
+
+  // Non-secret config only. Everything else — including REDIS_URL,
+  // CELERY_BROKER_URL and CELERY_RESULT_BACKEND — is uploaded with
+  // `wrangler secret bulk` (see scripts/push-secrets.ps1) and is passed
+  // through to both containers under its existing name.
+  //
+  // Keys declared here must NOT also be uploaded as secrets; push-secrets.ps1
+  // strips them from the upload for you.
+  "vars": {
+    "APP_ENV": "production",
+    // Matches EXPOSE 8000 and the `${PORT:-8000}` default in ./Dockerfile.
+    "PORT": "8000",
+    // Deliberately below the Dockerfile's default of 4: four uvicorn workers
+    // each importing playwright/firebase/etc. is heavy for a 6 GiB instance
+    // and slows cold start past the port-ready window.
+    "WEB_CONCURRENCY": "2",
+    // Unbuffered stdout so container logs reach Workers Logs promptly.
+    "PYTHONUNBUFFERED": "1"
+  }
+}
