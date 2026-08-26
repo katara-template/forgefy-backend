@@ -14,7 +14,7 @@
   // Supervisor tick. The WorkerContainer never sleeps on its own (see
   // onActivityExpired in src/index.ts), but Cloudflare can still stop an
   // instance for platform reasons such as a host restart. This cron
-  // re-starts it if it is not running.
+  // re-starts it if it is not running. /////
   "triggers": {
     "crons": ["*/2 * * * *"]
   },
