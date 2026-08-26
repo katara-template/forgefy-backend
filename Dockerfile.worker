@@ -10,6 +10,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+# The worker runs as --uid=nobody (see CMD) but the image is built as root, so
+# $HOME=/root/.npm is unwritable to nobody → `npm install` fails with EACCES.
+# Point npm/npx at a world-writable cache and create it up front.
+ENV npm_config_cache=/tmp/.npm
+RUN mkdir -p /tmp/.npm && chmod 777 /tmp/.npm
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openjdk-21-jdk-headless \
     && rm -rf /var/lib/apt/lists/*
@@ -53,4 +59,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 RUN playwright install chromium --with-deps
 
 COPY . .
-CMD ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=info", "-Q", "meeting.audio,meeting.transcribe,meeting.extract,build", "-B", "--concurrency=2", "--uid=nobody"]
+# Concurrency is NOT passed here. A --concurrency flag overrides celery_app.conf,
+# which is what let this image and docker-compose.yml drift apart; it now comes
+# from CELERY_CONCURRENCY (default 2, the value this CMD used to hardcode).
+CMD ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=info", "-Q", "meeting.audio,meeting.transcribe,meeting.extract,build", "-B", "-s", "/tmp/celerybeat-schedule", "--uid=nobody"]

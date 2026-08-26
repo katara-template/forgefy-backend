@@ -1,0 +1,53 @@
+{
+  "name": "@forgefy/ui",
+  "version": "0.1.0",
+  "description": "Forgefy layout & animation primitives for React — one package, two entry points (@forgefy/ui/web for Next.js, @forgefy/ui/native for React Native).",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./web": {
+      "types": "./dist/web/index.d.ts",
+      "import": "./dist/web/index.js"
+    },
+    "./native": {
+      "types": "./dist/native/index.d.ts",
+      "import": "./dist/native/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "forgefy",
+    "layout",
+    "flexbox",
+    "animation",
+    "react",
+    "react-native",
+    "nextjs"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-native": ">=0.71"
+  },
+  "peerDependenciesMeta": {
+    "react-native": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "react": "18.2.0",
+    "react-native": "^0.74.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "name": "@forgefy/client",
+  "version": "0.1.0",
+  "description": "Forgefy app-runtime SDK for Next.js & React Native — the auth, data, and networking layer that Forgefy-generated apps depend on.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "forgefy",
+    "supabase",
+    "postgrest",
+    "auth",
+    "nextjs",
+    "react-native"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.0"
+  }
+}

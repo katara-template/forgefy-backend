@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, UploadFile
 from pydantic import BaseModel
 
+from app.core.dispatch import dispatch
 from app.core.exceptions import ValidationError
 from app.db.models.enums import Platform, SessionStatus
 from app.deps import CurrentUser, DBSession
@@ -93,7 +94,8 @@ async def upload_recording(
     session = await sm.transition(session_id, SessionStatus.PROCESSING)
 
     from app.workers.upload_worker import transcribe_upload
-    transcribe_upload.apply_async(
+    await dispatch(
+        transcribe_upload,
         args=[str(session_id), str(dest)],
         queue="meeting.audio",
     )
@@ -111,6 +113,23 @@ async def start_live_transcription(
     """Transition a physical session to LISTENING so the browser can stream mic audio."""
     service = VoxaService(db)
     session = await service.start_live_transcription(session_id, user.id)
+    return SessionOut.model_validate(session)
+
+
+@router.post("/{session_id}/regenerate-blueprint", response_model=SessionOut)
+async def regenerate_blueprint(
+    session_id: uuid.UUID,
+    db: DBSession,
+    user: CurrentUser,
+) -> SessionOut:
+    """Retry blueprint generation after a failed attempt.
+
+    Distinct from /end, which ends a live meeting: this reruns only the
+    aggregation step over the transcript already captured, so end_time and the
+    bot lifecycle are left untouched.
+    """
+    service = VoxaService(db)
+    session = await service.regenerate_blueprint(session_id, user.id)
     return SessionOut.model_validate(session)
 
 

@@ -110,7 +110,7 @@ logger = logging.getLogger(__name__)
 _SYSTEM = _load_prompt("synthesizer")
 _GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-_KNOWN_KEYS = {"app_description", "features", "questions", "conflicts", "action_items"}
+_KNOWN_KEYS = {"app_name", "app_description", "features", "questions", "conflicts", "action_items"}
 
 # HTTP status codes that represent transient server-side failures and are safe
 # to retry.  503 (Service Unavailable) is the one that triggered this addition.
@@ -123,10 +123,17 @@ def call_gemini(
     api_key: str,
     model: str,
     *,
-    max_tokens: int = 2048,
+    max_tokens: int | None = 2048,
     max_retries: int = 3,
 ) -> dict:
     """Call Gemini and return the parsed JSON response.
+
+    Pass ``max_tokens=None`` to omit maxOutputTokens entirely, letting the
+    model use its full output budget. Whole-transcript blueprint synthesis
+    needs that: a long meeting yields a large JSON document, and any cap the
+    response outgrows truncates it mid-object, failing the parse below.
+    Callers producing something inherently small (an app name, a design
+    system) should keep a cap.
 
     Implements exponential backoff with jitter for rate limiting (429) errors
     and transient network failures (timeouts, connection errors).
@@ -134,14 +141,15 @@ def call_gemini(
     if max_retries < 1:
         raise ValueError("max_retries must be >= 1")
 
+    generation_config: dict = {"responseMimeType": "application/json"}
+    if max_tokens is not None:
+        generation_config["maxOutputTokens"] = max_tokens
+
     url = _GEMINI_URL.format(model=model)
     payload = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"parts": [{"text": user_content}]}],
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,
-            "responseMimeType": "application/json",
-        },
+        "generationConfig": generation_config,
     }
 
     for attempt in range(max_retries):
@@ -155,11 +163,25 @@ def call_gemini(
                 block_reason = data.get("promptFeedback", {}).get("blockReason", "unknown")
                 raise ValueError(f"Gemini returned no candidates. Block reason: {block_reason}")
 
+            # A response cut off at the output limit still arrives as a 200
+            # with well-formed-looking text, so without this the failure
+            # surfaces as a misleading "not valid JSON".
+            finish_reason = candidates[0].get("finishReason", "")
+            if finish_reason == "MAX_TOKENS":
+                raise ValueError(
+                    "Gemini hit its output token limit and returned a truncated "
+                    f"response (maxOutputTokens={max_tokens}). Raise or remove the "
+                    "cap for this call."
+                )
+
             raw = candidates[0]["content"]["parts"][0]["text"].strip()
             try:
                 return json.loads(raw)
             except json.JSONDecodeError as exc:
-                logger.warning("Gemini returned non-JSON: %s", raw[:200])
+                logger.warning(
+                    "Gemini returned non-JSON (finishReason=%s): %s",
+                    finish_reason or "unset", raw[:200],
+                )
                 raise ValueError(f"Gemini response was not valid JSON: {exc}") from exc
 
         except (requests.exceptions.HTTPError, requests.exceptions.Timeout,
@@ -192,12 +214,17 @@ def call_gemini(
 
 def run(transcript: str, api_key: str, model: str) -> list[dict]:
     """Return a flat list of extraction events from a single Gemini call."""
-    result = call_gemini(_SYSTEM, transcript, api_key, model, max_tokens=2048)
+    # Uncapped: output scales with how much was discussed, so a meeting rich
+    # enough to be worth building from is exactly the one that overflows a
+    # fixed budget — and truncation there fails the entire blueprint.
+    result = call_gemini(_SYSTEM, transcript, api_key, model, max_tokens=None)
 
     if unknown := set(result) - _KNOWN_KEYS:
         logger.warning("Gemini returned unexpected keys: %s", unknown)
 
     events: list[dict] = []
+    if app_name := result.get("app_name", ""):
+        events.append({"sub_state": "APP_NAME", "payload": {"text": app_name}})
     if app_desc := result.get("app_description", ""):
         events.append({"sub_state": "APP_DESCRIPTION", "payload": {"text": app_desc}})
     for feature in result.get("features", []):

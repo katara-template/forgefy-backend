@@ -1,0 +1,9 @@
+# Deliberately minimal — this container joins untrusted meetings, so it carries
+# no database drivers, no cloud SDKs and no application credentials beyond the
+# Deepgram key and the webhook secret.
+#
+# Note we talk to Deepgram over a plain WebSocket rather than deepgram-sdk: the
+# backend's chunked fallback exists because the SDK's live path returned 400,
+# and going direct sidesteps that entirely.
+websockets==16.0
+httpx==0.28.1

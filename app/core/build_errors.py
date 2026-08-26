@@ -50,7 +50,7 @@ _PATTERNS: list[tuple[re.Pattern, str, str]] = [
 
     # Rate limits / overload (transient — retry is sensible)
     (re.compile(r"rate.?limit|too.?many.?requests|overloaded|capacity|quota.?exceeded", re.I),
-     "The AI service is busy right now. Please try again in a few minutes.",
+     "We're a bit busy — please try again shortly.",
      "retry"),
 
     # Generic HTTP 5xx / transient AI provider errors
@@ -108,6 +108,28 @@ _PATTERNS: list[tuple[re.Pattern, str, str]] = [
 # Shown to end users in place of any "support"-tier message — the real detail
 # goes to the admin alerts feed (app/core/alerts.py) instead.
 GENERIC_OPERATOR_MESSAGE = "Build failed — our team has been notified and is looking into it."
+
+
+# ── AI token / quota exhaustion detection ─────────────────────────────────────
+# Matches provider signals that tokens/credits/quota ran out — Anthropic
+# ("credit balance is too low"), Gemini (429 RESOURCE_EXHAUSTED / "exceeded
+# your current quota"), OpenAI ("insufficient_quota"). Deliberately excludes
+# plain rate limits ("too many requests", "overloaded"), which are transient.
+_AI_QUOTA_EXHAUSTED = re.compile(
+    r"credit balance is too low|insufficient.{0,20}(credits|quota)"
+    r"|credits.{0,20}(are )?depleted|resource.?exhausted|quota.?exceeded"
+    r"|exceeded.{0,20}quota|out of (credits|tokens)|billing.{0,20}(hard )?limit",
+    re.I,
+)
+
+
+def is_ai_quota_error(raw: str) -> bool:
+    """True when an AI provider error means tokens/credits/quota are exhausted.
+
+    Callers use this to alert the operator (admin) — the user can't fix it,
+    and retries won't help until the account is topped up.
+    """
+    return bool(_AI_QUOTA_EXHAUSTED.search(raw))
 
 
 def sanitize_build_error(exc: Exception) -> BuildError:

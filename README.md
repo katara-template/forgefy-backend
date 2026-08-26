@@ -59,8 +59,10 @@ Copy `.env.example` to `.env` and fill in your values. Below are the variables m
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-5` | Claude model for agent pipeline |
 | `GEMINI_API_KEY` | *(empty)* | Google Gemini API key |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model |
-| `OLLAMA_URL` | `http://ollama:11434` | Ollama endpoint — use `http://localhost:11434` outside Docker |
-| `OLLAMA_MODEL` | `qwen3:8b` | Ollama model tag to use for blueprint generation |
+| `OLLAMA_URL` | `http://ollama:11434` | Ollama endpoint — use `http://localhost:11434` outside Docker. Ignored (defaults to `https://ollama.com`) when `OLLAMA_API_KEY` is set |
+| `OLLAMA_API_KEY` | _(empty)_ | Set to use [Ollama Cloud](https://ollama.com/settings/keys) instead of a local daemon — pair with a `-cloud` model tag |
+| `OLLAMA_MODEL` | `qwen3:8b` | Ollama model tag to use for blueprint generation — e.g. `nemotron-3-super` on Ollama Cloud |
+| `OLLAMA_BUILD_MODEL` | _(empty)_ | Separate model for code generation; falls back to `OLLAMA_MODEL`. Worth setting — see below |
 | `OLLAMA_TIMEOUT` | `300` | Request timeout in seconds — increase for slow hardware or long transcripts |
 | `BP_MODEL` | `claude` | Blueprint generation backend: `claude` / `gemini` / `Qwen3` |
 | `OPENAI_API_KEY` | *(empty)* | OpenAI API key (embeddings) |
@@ -94,7 +96,7 @@ Download a service-account key from Firebase Console → Project settings → Se
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-API docs at [http://localhost:8000/docs](http://localhost:8000/docs) in development (disabled in production).
+API docs at [http://localhost:5000/docs](http://localhost:5000/docs) in development (disabled in production).
 
 ### 5. Start Celery workers (separate terminals)
 
@@ -131,9 +133,68 @@ The `BP_MODEL` env var controls which LLM is used to process Deepgram transcript
 |---|---|---|
 | `claude` (default) | Anthropic Claude — 4-agent LangGraph pipeline | `ANTHROPIC_API_KEY` |
 | `gemini` | Google Gemini — single REST call | `GEMINI_API_KEY` |
-| `Qwen3` | Local Qwen3 via Ollama — no external API | Ollama Docker service running |
+| `Qwen3` | OpenRouter (hosted, per-action routing) **or** local Qwen3 via Ollama | `OPENROUTER_API_KEY`, else Ollama running |
 
 Switch backends by changing `BP_MODEL` in `.env`. No rebuild is needed — the value is read at runtime.
+
+---
+
+## OpenRouter (hosted `Qwen3`, no local GPU)
+
+Setting `OPENROUTER_API_KEY` makes `BP_MODEL=Qwen3` (and `BUILD_MODEL=Qwen3`) run against
+OpenRouter's hosted models instead of a local Ollama. Leave the key blank and the Qwen3
+setting behaves exactly as before, calling Ollama — nothing else changes.
+
+```bash
+OPENROUTER_API_KEY=sk-or-v1-...
+BP_MODEL=Qwen3
+BUILD_MODEL=Qwen3
+```
+
+### Per-action model routing
+
+There is no single "best" model, so `Qwen3` does not mean one model. Each action is routed
+to the model that actually suits it — which is frequently *not* a Qwen model. Chains are
+defined in [`app/ai/openrouter.py`](app/ai/openrouter.py):
+
+| Action | Primary model | Why |
+|---|---|---|
+| `synthesis` / `blueprint` | `nvidia/nemotron-3-super-120b` | 1M context + native JSON — swallows a whole transcript |
+| `features` | `nvidia/nemotron-3-super-120b` | Structured JSON, fast |
+| `design` | `google/gemma-4-31b-it` | Strongest aesthetic priors for palette/typography |
+| `naming` / `classify` | `openai/gpt-oss-20b` | Answers one-liners in ~5s instead of reasoning for 30s |
+| `plan` | `nvidia/nemotron-3-ultra-550b` | Deepest reasoning, 1M context |
+| `code` | `qwen/qwen3-coder` | 1M context + tool calling — the best free coding model |
+
+Every task defines an **ordered chain**, not one model. Free OpenRouter endpoints
+rate-limit upstream without warning (HTTP 429 is routine, not exceptional), so a failed,
+truncated, or non-JSON reply drops to the next candidate automatically. A blueprint only
+fails if every model in the chain fails.
+
+### Free tier and paid escalation
+
+All primaries above are `:free`. The free tier allows 20 requests/minute and 50/day
+(1000/day once you have ever purchased $10 of credits). If the free tier is saturated:
+
+```bash
+OPENROUTER_ALLOW_PAID=true   # appends DeepSeek/Gemini/Qwen3-Coder as fallbacks
+```
+
+Paid fallbacks are cheap (DeepSeek is ~$0.20 per million input tokens) and are only
+reached after every free candidate has failed.
+
+`OPENROUTER_MODEL=<id>` pins one model for every action, bypassing routing — a debugging
+aid, not a normal setting.
+
+### A note on token budgets
+
+Most strong free models are *reasoning* models, and their reasoning tokens are billed
+against `max_tokens` before any answer is emitted. A 64-token budget for a 6-character app
+name returns `content: None` — the budget is gone before the model starts answering, and
+disabling reasoning via the API is advisory and widely ignored. The client therefore floors
+every request at 2048 output tokens and treats `finish_reason: "length"` as a failure worth
+retrying on the next model. Do not lower that floor to "save" tokens; free-tier output is
+free, and a starved request fails outright.
 
 ---
 
@@ -188,6 +249,120 @@ Restart the worker for the change to take effect:
 ```bash
 docker compose restart worker
 ```
+
+### Using Ollama Cloud instead of a local daemon
+
+Set an API key and every Ollama call is sent to `https://ollama.com` with an
+`Authorization: Bearer` header — no GPU, no model pull, no `ollama` container:
+
+```env
+BP_MODEL=Qwen3
+BUILD_MODEL=Qwen3
+OLLAMA_API_KEY=...          # from https://ollama.com/settings/keys
+OLLAMA_MODEL=qwen3.5:cloud  # cloud tags end in -cloud
+```
+
+`OLLAMA_URL` is ignored while it stays at a local default (`http://ollama:11434`
+or `http://localhost:11434`); set it explicitly only for a self-hosted endpoint
+or a proxy. Cloud models keep their full context window, so the `num_ctx=8192`
+cap applied to local models is skipped and the build agent retains more history.
+
+Against `https://ollama.com` the tags are bare names (`nemotron-3-super`), not
+the `-cloud` suffixed form used when a *local* daemon pulls a cloud model. List
+what your key can reach with:
+
+```bash
+curl -s https://ollama.com/api/tags -H "Authorization: Bearer $OLLAMA_API_KEY"
+```
+
+Most models there require a paid plan and return HTTP 403; the free tier covers
+`nemotron-3-super`, `nemotron-3-ultra`, `nemotron-3-nano:30b`, `gpt-oss:20b`,
+`gpt-oss:120b`, `gemma4:31b` and `minimax-m3`. Of those, only
+**`nemotron-3-super`**, `gemma4:31b` and `minimax-m3` support both tool-calling
+(needed by the build agent) and `format=json` (needed by the synthesizer) — the
+`gpt-oss` and nano models do tools but not JSON mode.
+
+**Precedence:** `OLLAMA_API_KEY` wins over `OPENROUTER_API_KEY`, since setting it
+is an explicit request for Ollama Cloud while an OpenRouter key is often a
+leftover in `.env`. Clear `OLLAMA_API_KEY` to fall back to OpenRouter routing.
+
+### Build queue capacity and load shedding
+
+A build is minutes of LLM inference plus a workspace container, so the build
+queue cannot absorb a spike the way a read endpoint can. Three settings keep a
+burst from taking the broker down:
+
+| setting | default | why |
+|---|---|---|
+| `BUILD_QUEUE_MAX_DEPTH` | `500` | Past this backlog, build requests get `429` instead of entering a queue that grows until Redis OOMs. `0` disables. |
+| `CELERY_VISIBILITY_TIMEOUT` | `14400` | Redis re-delivers `acks_late` tasks that outlive this. Below the build duration it hands a running build to a second worker — two agents writing one workspace. Celery's default is 1h. |
+| `CELERY_MAX_TASKS_PER_CHILD` | `50` | Recycles prefork children; agent contexts are large. |
+| `CELERY_CONCURRENCY` | `2` | Concurrent tasks per worker container. Applies to both `docker-compose.yml` and `Dockerfile.worker` — neither passes `--concurrency`, because that flag overrides config and is how the two previously drifted. |
+
+`worker_prefetch_multiplier` is pinned to `1`. Celery's default of 4 has each
+worker process reserve four builds up front, so they sit unstarted behind one
+running build while other workers idle — a well-known pathology for long tasks.
+
+Admission control lives in `dispatch()`, so any new build endpoint inherits it.
+It applies only to the `build` queue: meeting tasks are short and shedding them
+would drop live audio.
+
+**Scaling builds is horizontal, not vertical.** `docker compose up --scale
+worker=N` adds capacity; raising `CELERY_CONCURRENCY` mostly adds memory
+pressure. No amount of either makes builds servable at thousands per second —
+each one is minutes of inference, so the queue bound is what keeps the system
+answering honestly instead of collapsing.
+
+### Project memory (`MEMORY.md`)
+
+Every generated project gets a `MEMORY.md` at its root, maintained by the build
+agent and committed with the rest of the code so it survives across runs.
+
+It holds a bounded change log (last 12 runs: what was asked, what the agent
+reported, which files it touched) plus a `path: symbols` map of the codebase. On
+the next run it is injected into the agent's context up front rather than left
+for the agent to discover, because an optional read is one models routinely skip.
+
+**It reduces exploration, it does not replace reading.** The map records where
+code lives, never what it currently says, so an agent about to edit a file still
+opens that file. Measured on the same task and workspace, with and without a
+seeded memory (two trials each):
+
+| | file reads | directory listings | tokens |
+|---|---|---|---|
+| with `MEMORY.md` | 8, 9 | **1, 1** | 29k, 26k |
+| without | 9, 9 | **7, 5** | 80k, 94k |
+
+Reads are flat; the directory wandering is what disappears. That is the intended
+shape — treating memory as a substitute for reading would turn it into a source
+of stale-code bugs.
+
+Writes happen on a background thread and are deliberately absent from the build
+log: they occur after the user already has their result. Reads *are* logged.
+`Workspace.commit_all` flushes any pending write first, since an uncommitted
+`MEMORY.md` would be lost the next time the workspace is cloned. The update is
+pure file I/O and regex scanning — no LLM call, so it costs no tokens and cannot
+fail in a way that affects a build.
+
+### Picking a build model
+
+Blueprint work and code generation reward different things, so `OLLAMA_BUILD_MODEL`
+overrides `OLLAMA_MODEL` for the build/update/fix agents only. This matters more
+than it sounds — benchmarked on one "add a complete home page" update against an
+identical Next.js workspace, all four free models produced a working page but at
+wildly different cost:
+
+| model | tokens | turns | wall clock |
+|---|---|---|---|
+| `nemotron-3-super` | 415,068 | 35 | 16m 46s |
+| `gpt-oss:120b` | 190,347 | 26 | 2m 48s |
+| `minimax-m3` | **106,493** | 30 | 2m 32s |
+| `gemma4:31b` | 140,421 | **17** | **1m 37s** |
+
+Yet `nemotron-3-super` was the only one to extract an open question during
+blueprint synthesis. Hence the split: nemotron for `OLLAMA_MODEL`, `minimax-m3`
+for `OLLAMA_BUILD_MODEL`. These are single runs on one task — treat them as
+order-of-magnitude guidance, not a ranking.
 
 ### Using a different model
 
@@ -337,6 +512,54 @@ All endpoints except `/health` and `/api/v1/auth/*` require a Bearer token.
 | `GET` | `/api/v1/voxa/blueprint/{id}` | Get generated blueprint |
 | `POST` | `/api/v1/voxa/blueprint/{id}/approve` | Approve blueprint, transition → APPROVED |
 
+### Developer API — API keys
+
+Key management is JWT-authed (dashboard users). The raw key is returned once
+at creation and never again — only its SHA-256 hash is stored.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/keys` | Create an API key (max 10 active per user) |
+| `GET` | `/api/v1/keys` | List your keys (prefixes only, newest first) |
+| `DELETE` | `/api/v1/keys/{id}` | Revoke a key (idempotent; propagates within ~30s) |
+
+### Developer API — Extract
+
+Machine-authed with `Authorization: Bearer fgy_live_…`. Runs the same agent
+pipeline the meeting workers use, synchronously.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/extract` | Synchronous — transcript (≤50k chars) → features / questions / conflicts / action items |
+| `POST` | `/api/v1/extract/jobs` | Async — transcript up to 200k chars; returns `202 {job_id}` |
+| `GET` | `/api/v1/extract/jobs/{id}` | Poll job status; `result` present once `status == "done"` |
+| `GET` | `/api/v1/usage` | Key owner's tier, monthly token budget, consumption, reset date |
+
+```json
+{
+  "transcript": "…up to 50k chars…",
+  "extractors": ["features", "questions"],   // optional — default all four
+  "model_tier": "standard"                    // "standard" (Claude) | "economy" (Qwen3)
+}
+```
+
+Response groups extracted items by type and reports `usage`
+(`input_tokens`/`output_tokens`, metered against the key owner's monthly
+budget). Quota policy matches builds: free-tier owners over budget get a 402;
+paid owners are transparently served by the economy tier instead.
+
+Async jobs additionally accept:
+
+- `webhook_url` (https) — the finished job is POSTed there, signed with
+  `X-Forgefy-Signature: sha256=<HMAC-SHA256 hex>` using the `webhook_secret`
+  returned at creation. Delivery is retried 3× with backoff, independently of
+  extraction.
+- An `Idempotency-Key` header — replaying the same key returns the existing
+  job instead of running a second one.
+
+Jobs run on the `meeting.transcribe` Celery queue and are deleted 30 days
+after creation by a daily beat task.
+
 ### WebSocket
 
 ```
@@ -379,7 +602,7 @@ LISTENING sub-states (emitted as `featureDetected` WS events):
 ## Running Tests
 
 ```bash
-# All 105 tests
+# All tests
 pytest tests/ -q
 
 # Specific suite
@@ -389,19 +612,15 @@ pytest tests/test_auth.py tests/test_sessions.py -v
 pytest tests/ --cov=app --cov-report=term-missing
 ```
 
-Test suites:
+Test files are named after what they cover (`test_auth.py`, `test_sessions.py`,
+`test_pipeline.py`, `workers/test_blueprint_worker.py`, …). List them with:
 
-| File | Count | Covers |
-|---|---|---|
-| `test_auth.py` | 10 | Register, login, refresh endpoints |
-| `test_sessions.py` | 10 | Session CRUD endpoints |
-| `test_state_machine.py` | 10 | State transition logic |
-| `test_ws.py` | 14 | WebSocket gateway, ConnectionManager, event schemas |
-| `test_transcription.py` | 11 | DeepgramClient, transcription Celery tasks |
-| `test_pipeline.py` | 12 | LangGraph pipeline, 4 agents, extraction worker |
-| `test_blueprints.py` | 10 | Blueprint endpoints, aggregator, worker |
-| `test_connectors.py` | 14 | Meet/Zoom/Teams connectors, factory, worker |
-| `workers/test_blueprint_worker.py` | 14 | Blueprint worker task logic |
+```bash
+pytest tests/ --collect-only -q
+```
+
+Note the suite takes ~17 minutes — several tests exercise real retry/backoff
+paths rather than mocking the clock, so budget for it in CI.
 
 ## Project Structure
 
@@ -414,7 +633,7 @@ app/
 │   ├── v1/              # REST endpoints (auth, sessions, blueprints)
 │   └── ws/              # WebSocket gateway + ConnectionManager
 ├── build/               # BlueprintAggregator
-├── connectors/          # Playwright Meet bot + Zoom/Teams stubs
+├── connectors/          # Recall.ai cloud bot (Meet/Zoom/Teams) + legacy Playwright Meet bot
 ├── core/                # Exceptions, rate limiting, security, logging
 ├── db/
 │   ├── firebase.py      # Firebase Admin SDK / Firestore client init
@@ -423,5 +642,5 @@ app/
 ├── schemas/             # Pydantic request/response models
 ├── transcription/       # DeepgramClient streaming wrapper
 └── workers/             # Celery tasks (connector, transcription, extraction, blueprint)
-tests/                   # 105 pytest tests
+tests/                   # 419 pytest tests across 44 files
 ```

@@ -1,8 +1,9 @@
-"""Whole-transcript synthesizer using a local Ollama instance.
+"""Whole-transcript synthesizer using Ollama.
 
 Single call that extracts all requirement types at once, identical output
 schema to the Claude/Gemini synthesizers so all can feed the same pipeline.
-Communicates with Ollama via its Docker-internal endpoint (http://ollama:11434).
+Talks to either a local daemon (http://ollama:11434) or Ollama Cloud, depending
+on whether OLLAMA_API_KEY is set — see app/ai/ollama_http.py.
 """
 from __future__ import annotations
 
@@ -12,6 +13,12 @@ import logging
 import requests
 
 from app.ai.agents.base import _load_prompt
+from app.ai.ollama_http import (
+    auth_error_hint,
+    missing_model_hint,
+    ollama_headers,
+    ollama_options,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,21 +48,21 @@ def call_ollama(
         ],
         "stream": True,
         "format": "json",
-        "options": {
-            "num_ctx": 8192,   # cap context window to prevent OOM on small hardware
-            "num_predict": 2048,
-        },
+        # num_ctx is capped locally to prevent OOM on small hardware; on cloud
+        # the full context window is used instead.
+        "options": ollama_options(num_ctx=8192, num_predict=2048),
     }
 
     # stream=True: timeout applies per-chunk, not for the full response,
     # so long generations on slow hardware don't hit the read timeout.
     try:
-        with requests.post(url, json=payload, timeout=(30, None), stream=True) as resp:
+        with requests.post(
+            url, json=payload, headers=ollama_headers(), timeout=(30, None), stream=True
+        ) as resp:
             if resp.status_code == 404:
-                raise OllamaError(
-                    f"Model '{model}' not found in Ollama. "
-                    f"Run 'docker compose exec ollama ollama pull {model}' to load it."
-                )
+                raise OllamaError(missing_model_hint(model))
+            if hint := auth_error_hint(resp.status_code):
+                raise OllamaError(hint)
             try:
                 resp.raise_for_status()
             except requests.exceptions.HTTPError as exc:
@@ -75,10 +82,14 @@ def call_ollama(
     except OllamaError:
         raise
     except requests.exceptions.ConnectionError as exc:
-        raise OllamaError(
-            f"Ollama service unavailable at {base_url}. "
-            "Ensure the ollama Docker service is running."
-        ) from exc
+        from app.ai.ollama_http import using_cloud
+
+        remedy = (
+            "Check network access to Ollama Cloud."
+            if using_cloud()
+            else "Ensure the ollama Docker service is running."
+        )
+        raise OllamaError(f"Ollama service unavailable at {base_url}. {remedy}") from exc
     except requests.exceptions.Timeout as exc:
         raise OllamaError(
             "Ollama connection timed out. "

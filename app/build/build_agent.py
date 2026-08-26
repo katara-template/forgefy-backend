@@ -11,13 +11,252 @@ from typing import Any
 
 import anthropic
 
-from app.build.agent_tools import TOOLS, execute_tool
+from app.build.agent_tools import (
+    _FINDING_SEVERITIES,
+    REPORT_FINDINGS_TOOL,
+    TOOLS,
+    execute_tool,
+    missing_report,
+    reset_report,
+    take_report,
+)
 from app.build.build_logger import tool_message
+from app.build.project_memory import (
+    MEMORY_FILENAME,
+    memory_context_block,
+    read_project_memory,
+    update_project_memory_async,
+)
 
 logger = logging.getLogger(__name__)
 
 _MAX_ITERATIONS = 80
 _WARN_AT_ITERATION = 50
+# Cap on "you haven't written anything yet" pushbacks. Without a cap these
+# consume every iteration when a model won't emit tool calls at all.
+_MAX_NUDGES = 2
+# Tools that only observe the workspace. Repeating one with identical arguments
+# cannot produce a new answer until something mutates the workspace, so repeats
+# are served a short notice instead of being re-executed — otherwise the agent
+# can spend its whole iteration budget re-reading the same files.
+_READ_ONLY_TOOLS = frozenset({
+    "read_file", "list_files", "analyze_code", "grep", "glob",
+})
+# Tools that count as the agent actually producing code. edit_file belongs here
+# alongside write_file: an agent that implements a change entirely through edits
+# has done the work, and treating it as "no files written" would nudge it and
+# then trip the exploration breaker on an agent that is making real progress.
+_WRITE_TOOLS = frozenset({"write_file", "edit_file"})
+# Consecutive tool-only turns without a write before we push the agent to act.
+_MAX_EXPLORE_STREAK = 12
+
+# Tool results are echoed back into context every turn, so they are capped.
+# 1500 chars is ~375 tokens — smaller than a typical component file, so
+# read_file (which advertises "the full text content") returned a fragment and
+# the agent re-read the same file over and over trying to see the rest.
+# Large-context backends can afford far more.
+_TOOL_RESULT_LIMIT_SMALL_CTX = 1500
+_TOOL_RESULT_LIMIT_LARGE_CTX = 24000
+
+# Per-response output cap for the Anthropic loop. The old value (8096) was both a
+# typo for 8192 and far too small: a single large write_file payload plus thinking
+# tokens overran it and the file arrived truncated mid-generation. claude-sonnet-5
+# reports max_tokens=128000 via the Models API; 32000 leaves generous headroom for
+# a big file without letting one runaway turn spend the whole budget.
+_MAX_OUTPUT_TOKENS = 32000
+# Chat-completions backends (OpenAI, OpenRouter) are separate providers with their
+# own, much lower ceilings — 16384 is the documented cap for gpt-4o-mini and a safe
+# value across the OpenRouter chain.
+_MAX_OUTPUT_TOKENS_CHAT = 16384
+
+# Anthropic sliding window, in assistant/tool-result pairs. Claude's context is
+# large, so this is generous — it exists to stop an 80-iteration build from
+# resending every turn forever, not to squeeze into a small window.
+_ANTHROPIC_HISTORY_PAIRS = 20
+# Assistant/tool-result pairs after the first user message that are never
+# trimmed. Everything up to the end of this anchor is byte-stable for the whole
+# phase, which is what lets a cache breakpoint sit there and actually be read;
+# measurement showed that once the window starts sliding, no breakpoint inside it
+# can ever match a stored prefix again. Also keeps the opening of the task in
+# view, which is where the requirements are.
+_ANCHOR_TURNS = 3
+_ANCHOR_END = 1 + _ANCHOR_TURNS * 2
+
+_CACHE_CONTROL: dict[str, Any] = {"type": "ephemeral"}
+
+# Adaptive thinking with a summarised display, so the build feed can narrate the
+# agent's reasoning the way the Ollama path does. On claude-sonnet-5 thinking is
+# already on by default and `display` only controls whether the summary text is
+# returned, so this surfaces reasoning without buying extra thinking.
+_THINKING_CONFIG: dict[str, Any] = {"type": "adaptive", "display": "summarized"}
+# Flipped off permanently if the configured model rejects the parameter.
+_thinking_supported = True
+
+
+def _truncate_tool_result(result: str, limit: int) -> str:
+    """Cap a tool result, saying plainly that re-reading will not help.
+
+    A bare "…[truncated]" invites the model to try again for the rest; it then
+    gets the identical fragment and loops.
+    """
+    if len(result) <= limit:
+        return result
+    return (
+        result[:limit]
+        + f"\n…[TRUNCATED: showing the first {limit:,} of {len(result):,} characters. "
+        "Reading this file again returns exactly this same fragment — do not "
+        "retry. Work from what is shown above.]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Anthropic prompt caching
+#
+# Render order is tools → system → messages, and caching is a prefix match: any
+# byte change invalidates everything after it. Every `system` string reaching
+# _loop is a module-level constant or _build_system(template_key), so the whole
+# prefix is already stable within a run — the volatile parts (project map, git
+# log, change request) live in the user message, after the breakpoint.
+#
+# Four breakpoints are allowed per request and all four are used: one on the last
+# tool, one on the system block, and a rolling pair on the conversation so the
+# growing tool-result history is re-read from cache instead of re-billed in full
+# on every iteration.
+# ---------------------------------------------------------------------------
+
+def _cached_system(system: str) -> list[dict[str, Any]]:
+    """The system prompt as one cacheable content block."""
+    return [{"type": "text", "text": system, "cache_control": dict(_CACHE_CONTROL)}]
+
+
+def _cached_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tool definitions with a cache breakpoint on the last one.
+
+    Tools render before the system prompt, so this breakpoint keeps the tool
+    array cached across phases even though each phase has its own system prompt.
+    """
+    if not tools:
+        return list(tools)
+    cached = [dict(t) for t in tools]
+    cached[-1]["cache_control"] = dict(_CACHE_CONTROL)
+    return cached
+
+
+# Built once so the bytes are identical on every request — rebuilding per call
+# would be equivalent here, but a single object makes accidental drift impossible.
+_CACHED_TOOLS = _cached_tools(TOOLS)
+
+# Cached per tool set, keyed by the tool names it contains. Phases advertise
+# different tool lists (only the reviewing phases get report_findings), and the
+# tools array renders before everything else, so each variant has to be one
+# byte-identical object or its cache entry is rewritten on every request.
+_CACHED_TOOL_SETS: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+
+
+def _cached_tools_for(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Return the cache-annotated form of `tools`, stable across calls."""
+    resolved = tools if tools is not None else TOOLS
+    key = tuple(t["name"] for t in resolved)
+    if key not in _CACHED_TOOL_SETS:
+        _CACHED_TOOL_SETS[key] = _cached_tools(resolved)
+    return _CACHED_TOOL_SETS[key]
+
+
+def _block_type(block: Any) -> str | None:
+    """Content-block type, for blocks that may be dicts or SDK objects."""
+    if isinstance(block, dict):
+        return block.get("type")
+    return getattr(block, "type", None)
+
+
+def _markable_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Last content block of each message we built ourselves.
+
+    Only blocks we construct (tool_result dicts) can carry a marker; assistant
+    turns hold SDK objects and are left untouched.
+    """
+    return [
+        msg["content"][-1]
+        for msg in messages
+        if isinstance(msg.get("content"), list)
+        and msg["content"]
+        and isinstance(msg["content"][-1], dict)
+    ]
+
+
+def _mark_message_breakpoints(
+    messages: list[dict[str, Any]], anchor_end: int, trimming: bool,
+) -> None:
+    """Place the conversation's cache breakpoints, differently once trimming starts.
+
+    While the whole history still fits, marking the two newest turns caches the
+    entire conversation: each request re-reads everything up to the previous turn.
+    Measured hit rate in that regime is ~50% of message breakpoints, covering all
+    the history.
+
+    Once the window starts sliding, that stops working completely. The window
+    drops one pair per turn, so the message prefix differs on every single
+    request and no message breakpoint can ever match a stored one — measured at
+    0/30. Left alone those markers are worse than useless: each one still pays
+    the 1.25x cache-write premium and never earns a read back.
+
+    So above the trim point the only breakpoint that can pay is one at the end of
+    the immutable anchor, which by construction never changes.
+    """
+    for block in _markable_blocks(messages):
+        block.pop("cache_control", None)
+
+    if trimming:
+        # Anchor only — the tail is unstable by definition.
+        anchor_blocks = _markable_blocks(messages[:anchor_end])
+        keep = anchor_blocks[-1:]
+    else:
+        keep = _markable_blocks(messages)[-2:]
+
+    for block in keep:
+        block["cache_control"] = dict(_CACHE_CONTROL)
+
+
+def _cache_stats(usage: Any) -> tuple[int, int, int]:
+    """(fresh, cache_creation, cache_read) input tokens for one turn."""
+    return (
+        getattr(usage, "input_tokens", 0) or 0,
+        getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        getattr(usage, "cache_read_input_tokens", 0) or 0,
+    )
+
+
+def _usage_tokens(usage: Any) -> int:
+    """Total prompt+completion tokens for one turn, including cached input.
+
+    `input_tokens` counts only the uncached remainder once caching is on, so
+    summing it alone would make builds look dramatically cheaper than they are.
+    Adding the cached halves back keeps this number comparable with the
+    pre-caching figures the other backends still report.
+    """
+    return (
+        (getattr(usage, "input_tokens", 0) or 0)
+        + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        + (getattr(usage, "cache_read_input_tokens", 0) or 0)
+        + (getattr(usage, "output_tokens", 0) or 0)
+    )
+
+
+def _log_cache_usage(usage: Any) -> None:
+    """Record the cache split so the saving is measurable rather than assumed.
+
+    This goes to the application log, not log_fn: the build feed is a user-facing
+    narration of the work, and per-iteration cache accounting is operator
+    telemetry.
+    """
+    logger.info(
+        "anthropic usage: input=%d cache_creation=%d cache_read=%d output=%d",
+        getattr(usage, "input_tokens", 0) or 0,
+        getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        getattr(usage, "cache_read_input_tokens", 0) or 0,
+        getattr(usage, "output_tokens", 0) or 0,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Template-specific directory / component scaffolding guidance
@@ -31,6 +270,50 @@ initialized and queried ONLY inside data/datasources/{feature}_remote_datasource
 data/repositories/{feature}_repository_impl.dart calls only the datasource — never
 the SDK directly. Business/validation logic lives in domain/usecases/, not in the
 datasource or repository. presentation/bloc never imports a datasource or the SDK.
+
+FORGEFY CLIENT SDK — use it when the connected database is Supabase or Neon:
+Use the first-party `forgefy_client` package for ALL database reads/writes and
+auth. Do NOT hand-roll api_client.dart for the DB and do NOT add supabase_flutter
+— forgefy_client already ships the retry / error / session layer.
+  • pubspec.yaml → add  forgefy_client: ^0.1.0
+  • lib/core/network/forgefy_client.dart — build ONE ForgefyClient from env
+    (SUPABASE_URL + SUPABASE_ANON_KEY; or ForgefyConfig(provider:
+    ForgefyProvider.neon, url: NEON_DATA_API_URL, anonKey: ...)) with a
+    SessionStore backed by shared_preferences so logins survive restarts.
+    Register it as a lazy singleton in lib/core/injection.dart and inject it
+    into the datasources. This file REPLACES api_client.dart for Supabase/Neon.
+  • {feature}_remote_datasource.dart calls client.from('table')… ; auth
+    datasources call client.auth.signInWithPassword(...) / signUp(...) — never
+    raw http or a provider SDK. Read the result, THEN cast (precedence matters):
+        final result = await client
+            .from('todos').select().eq('done', false)
+            .order('created_at', ascending: false);
+        final rows = result as List;
+  • On startup (main.dart) call client.auth.restoreSession() before runApp.
+  FIREBASE apps keep using the firebase_* SDKs — forgefy_client does not cover
+  Firebase yet. A plain external REST API (not the DB) still uses api_client.dart.
+
+COMPONENT LIBRARY — shadcn_ui (the house control kit for Flutter):
+Use shadcn_ui's Shad* widgets for interactive controls in place of raw Material
+widgets, hand-rolled ones, AND the design system's AppButton/AppTextField — this
+SUPERSEDES the "use AppTextField/AppButton" note for CONTROL widgets. Widgets:
+ShadButton, ShadInput / ShadInputFormField, ShadCard, ShadDialog (showShadDialog)
+/ ShadSheet, ShadSelect, ShadCheckbox, ShadSwitch, ShadTabs, ShadBadge,
+ShadTooltip, ShadForm (+ validation).
+  • pubspec.yaml → add  shadcn_ui: ^0.55.0
+  • ROOT (lib/main.dart): a ShadTheme must be in the tree for Shad* to render.
+    This template uses MaterialApp.router + GoRouter, so use ShadApp.router(
+    routerConfig: appRouter, …) — it provides BOTH the Material theme and the
+    ShadTheme — and keep the existing AppTheme via its materialThemeBuilder. Build
+    the ShadThemeData colorScheme FROM AppColors (light + dark) so the two match; do
+    NOT introduce a second, clashing palette.
+  • Icons: LucideIcons (shadcn_ui bundles lucide).
+COEXISTENCE — additive, not a rewrite:
+  • TOKENS stay the design system's — colors via AppColors, text via AppTextStyles,
+    spacing from the theme. Shad* controls are themed FROM those tokens, never
+    hardcoded.
+  • LAYOUT stays forgefy_ui / sliver-first (VStack/Grid/SliverScreen/…) when the
+    Forgefy UI package is enabled; otherwise standard Flutter layout widgets.
 
 EXACT FOLDER STRUCTURE — call create_directory for every path below before writing any files:
 
@@ -63,6 +346,8 @@ CANONICAL FILE NAMES — use these exact names, no variations:
   lib/core/error/exceptions.dart        — AppException subclasses
   lib/core/error/failures.dart          — Failure sealed class / subclasses
   lib/core/network/api_client.dart      — Dio/http base client with interceptors
+                                          (external REST API only; for a Supabase/Neon
+                                          DB use lib/core/network/forgefy_client.dart)
   lib/core/network/network_info.dart    — connectivity check
   lib/core/usecases/usecase.dart        — abstract UseCase<Type, Params> interface
   lib/core/utils/constants.dart         — API base URL, timeout durations, string keys
@@ -81,13 +366,18 @@ CANONICAL FILE NAMES — use these exact names, no variations:
   lib/features/{feature}/presentation/pages/{feature}_page.dart
   lib/features/{feature}/presentation/widgets/{feature}_form.dart  (or _card, _tile, etc.)
 
-ROOT FILES (mandatory — do NOT rename these):
-  lib/injection_container.dart  — GetIt registering all blocs, repos, usecases, datasources
-  lib/app.dart                  — MaterialApp with theme, BlocProviders, named routes
-  lib/main.dart                 — runApp, WidgetsFlutterBinding, init injection_container
+ROOT FILES (these already EXIST in the template — extend them, do NOT create lib/app.dart):
+  lib/core/injection.dart       — GetIt registering all blocs, repos, usecases, datasources
+  lib/router/app_router.dart    — GoRouter route definitions (add new routes here)
+  lib/main.dart                 — runApp + MaterialApp.router(routerConfig: appRouter,
+                                  theme: AppTheme.light/dark), wrapped in the BlocProviders,
+                                  DI initialised before runApp. There is NO lib/app.dart —
+                                  the root MaterialApp lives in main.dart.
 
 pubspec.yaml — add: flutter_bloc, equatable, get_it, dartz, dio, shared_preferences,
-               connectivity_plus, and any feature-specific packages (firebase_*, etc.)
+               connectivity_plus, shadcn_ui (^0.55.0 — the control kit),
+               forgefy_client (^0.1.0, when the DB is Supabase/Neon),
+               and any feature-specific packages (firebase_*, etc.)
 
 BUILD ORDER (strictly follow):
   1. core/ files first (error, network, utils, theme)
@@ -96,8 +386,8 @@ BUILD ORDER (strictly follow):
   4. presentation/widgets/ for every feature (reusable sub-widgets)
   5. presentation/bloc/ for every feature
   6. presentation/pages/ for every feature
-  7. injection_container.dart (wire everything together)
-  8. app.dart, main.dart
+  7. lib/core/injection.dart (wire everything together)
+  8. lib/router/app_router.dart (routes) + lib/main.dart (root MaterialApp.router)
   9. Generate all image/video assets, declare in pubspec.yaml
   10. pubspec.yaml — finalize all dependencies
 """
@@ -118,6 +408,45 @@ for public-safe values like a Supabase anon key or Firebase client config — th
 database client/SDK is initialized and queried ONLY inside lib/db.ts and
 lib/services/*.ts, and lib/services/*.ts is imported ONLY by app/api/** route
 handlers, NEVER by a "use client" component.
+
+FORGEFY CLIENT SDK — use it when the connected database is Supabase or Neon:
+Use `@forgefy/client` for ALL database reads/writes and auth. Do NOT add
+@supabase/supabase-js and do NOT hand-roll a fetch wrapper for the DB — the
+package ships the retry / error / session layer and runs on the edge runtime.
+  • package.json → add  "@forgefy/client": "^0.1.0"
+  • lib/db.ts — export a factory that builds a ForgefyClient from
+    NEXT_PUBLIC_SUPABASE_URL + NEXT_PUBLIC_SUPABASE_ANON_KEY (or provider: 'neon'
+    with NEXT_PUBLIC_NEON_DATA_API_URL). In a route handler, forward the caller's
+    JWT so queries run as that user (RLS applies):
+        const token = req.headers.get('authorization')?.replace('Bearer ', '');
+        return new ForgefyClient({ url, anonKey, accessToken: token });
+  • lib/services/{entity}.ts calls db.from<T>('table').select()… / .insert(…),
+    and auth services call db.auth.signInWithPassword(...) — imported ONLY by
+    app/api/** route handlers, never a "use client" component.
+  FIREBASE apps keep using the firebase SDK — forgefy_client does not cover
+  Firebase yet.
+
+COMPONENT LIBRARY — components/ui (rich custom kit + shadcn/ui primitives):
+The template ships a rich custom component kit AND real shadcn/Radix primitives
+(new-york style). Reuse them — do NOT hand-roll buttons, inputs, cards, dialogs,
+menus, etc.
+  • Rich custom controls — import from the barrel "@/components/ui": Button
+    (variants + isLoading + leading/trailingIcon), Card (+ CardHeader/CardTitle/…),
+    TextField (label/hint/error + password toggle), Chip, EmptyState, Modal, Avatar,
+    Skeleton, SignatureWidget. PREFER these for buttons, text inputs, and cards —
+    they are richer than the shadcn defaults.
+  • shadcn/Radix primitives — import from "@/components/ui/<name>": Dialog, Select,
+    DropdownMenu, Tabs, Tooltip, Popover, Sheet, Separator, Label. Use these for
+    overlays, menus, selects, tabs, tooltips.
+  • Class-merge helper: import { cn } from "@/lib/utils". Icons: "lucide-react".
+  • Need another shadcn component (accordion, command, checkbox, …)? Write it from
+    the official shadcn (new-york) source at components/ui/<name>.tsx (you cannot run
+    the shadcn CLI) and add its @radix-ui/react-<primitive> dep to package.json.
+  • Colors/spacing use the design-system Tailwind tokens (bg-primary, bg-surface,
+    text-on-surface, text-muted-foreground, border-border) — never hardcode hex.
+    The shadcn primitives already map to these tokens.
+Components live in components/ui; lay them out with Tailwind flex/grid (or the
+@forgefy/ui/web layout primitives when enabled).
 
 EXACT FOLDER STRUCTURE — call create_directory for EVERY path before writing files:
 
@@ -146,7 +475,8 @@ EXACT FOLDER STRUCTURE — call create_directory for EVERY path before writing f
     components/{feature}/       — feature-specific reusable components
 
   ── Server utilities (imported only by app/api/**) ──
-  lib/db.ts                     — database client singleton (Prisma / Supabase / mongoose)
+  lib/db.ts                     — database client (ForgefyClient factory for Supabase/Neon —
+                                   see FORGEFY CLIENT SDK above; else Prisma / mongoose / firebase)
   For each entity/feature that needs persistence:
     lib/services/{entity}.ts    — the ONLY place with queries for this entity: getX/listX,
                                    createX, updateX, deleteX — imported only by app/api/**
@@ -257,66 +587,111 @@ TYPESCRIPT RULES — follow exactly to avoid build errors:
 """
 
 _RN_STRUCTURE = """
-ARCHITECTURE: Feature-Sliced Design with Redux Toolkit.
+ARCHITECTURE: Expo Router (file-based routing) + feature modules + Zustand + React Query.
+Routes live in app/ (expo-router — the filename IS the route). Shared code in src/core/.
+Feature logic in src/features/{feature}/. Client state via Zustand; server data via
+@tanstack/react-query. This template is NOT React Navigation and NOT Redux — do not add
+@react-navigation/* or @reduxjs/toolkit.
+
+FORGEFY CLIENT SDK — use it when the connected database is Supabase or Neon:
+Use `@forgefy/client` for ALL database reads/writes and auth. Do NOT add
+@supabase/supabase-js — the package ships the retry / error / session layer.
+  • package.json → add  "@forgefy/client": "^0.1.0"
+  • src/services/forgefyClient.ts — build ONE ForgefyClient from
+    EXPO_PUBLIC_SUPABASE_URL + EXPO_PUBLIC_SUPABASE_ANON_KEY (or provider: 'neon'
+    with EXPO_PUBLIC_NEON_DATA_API_URL), with a persistent session store backed by
+    expo-secure-store or react-native-mmkv (wrap it to match persistentSessionStore's
+    getItem/setItem/removeItem — this template has NO AsyncStorage). Call
+    forgefy.auth.restoreSession() on app start (in app/_layout.tsx).
+  • src/services/db/{entity}.ts calls forgefy.from('table')… and auth calls
+    forgefy.auth.signInWithPassword(...) — never a provider SDK from a route,
+    component, store, or hook.
+  FIREBASE apps keep using the firebase SDK — forgefy_client does not cover
+  Firebase yet. src/services/httpClient.ts stays for a plain external REST API.
+
+COMPONENT LIBRARY — react-native-reusables (the shadcn kit for React Native):
+react-native-reusables (RNR) is the RN shadcn port — NativeWind (Tailwind
+classNames) + @rn-primitives/* + class-variance-authority + cn(). Components are
+copied in under components/ui/.
+  • USE IT ONLY WHEN the template already has NativeWind configured — a global.css
+    with the theme CSS variables, a tailwind.config.js RNR preset, the NativeWind
+    babel/metro setup, and cn() in lib/utils. Then compose controls from
+    components/ui/* (Button, Input, Card, Dialog, Select, Text, Badge, …) instead of
+    raw react-native controls or hand-rolled ones. Icons: lucide-react-native.
+  • If a needed RNR component isn't in components/ui/, WRITE it from the official RNR
+    source (you cannot run the RNR CLI) and add its deps to package.json: the matching
+    @rn-primitives/<name>, plus class-variance-authority, clsx, tailwind-merge (and
+    nativewind, tailwindcss, tailwindcss-animate if not already present).
+  • DO NOT introduce NativeWind mid-build if the template does not already use it —
+    the babel/metro/global.css changes break the build if imperfect. In that case use
+    the pre-built src/core/components/ instead.
+COEXISTENCE: RNR = controls; design TOKENS stay src/core/theme's; LAYOUT stays
+@forgefy/ui/native (VStack/Grid/List/…) when enabled. NativeWind className and RN
+style props coexist, so forgefy_ui (style-based) works alongside RNR (className).
 
 EXACT FOLDER STRUCTURE — call create_directory for every path before writing files:
 
-  src/app/                      — Redux store root
+  ── Routes (expo-router; the filename IS the route. _layout.tsx files already exist) ──
+  app/_layout.tsx               — root Stack + global providers (EXISTS — extend, don't recreate)
+  app/(tabs)/_layout.tsx        — bottom Tabs navigator (EXISTS)
+  app/(tabs)/{name}.tsx         — a tab screen (index.tsx = Home)
+  For each feature that needs its own route(s):
+    app/{feature}/_layout.tsx   — nested Stack (only if the feature has sub-screens)
+    app/{feature}/index.tsx     — feature home/list route
+    app/{feature}/[id].tsx      — feature detail route (dynamic segment)
+  [AUTH ONLY] app/(auth)/_layout.tsx, app/(auth)/login.tsx, app/(auth)/register.tsx
+
+  ── Feature modules (src/features/{feature}/) ──
   For each feature from the blueprint:
-    src/features/{feature}/api/
-    src/features/{feature}/components/
-    src/features/{feature}/screens/
-    src/features/{feature}/slice/
-    src/features/{feature}/types/
-    src/features/{feature}/hooks/
+    src/features/{feature}/components/   — feature UI (built on src/core + src/components/ui)
+    src/features/{feature}/hooks/        — use{Feature}.ts (React Query + Zustand)
+    src/features/{feature}/store.ts      — Zustand store (only if the feature has client state)
+    src/features/{feature}/api.ts        — React Query queries/mutations
+    src/features/{feature}/types.ts      — TypeScript interfaces for this feature
 
-  NOTE: if a feature is "auth" (login / register / session), create it ONLY if
-  auth decision is YES. If auth decision is NO, do not create the auth feature,
-  no login/register screens, no auth slice or auth API calls — skip entirely.
+  NOTE: if a feature is "auth" (login / register / session), create it ONLY if auth
+  decision is YES. If auth decision is NO, do not create the auth routes, store, or API.
 
-  src/navigation/               — navigator files
-  src/services/                 — shared HTTP client
+  ── Shared (already scaffolded — do NOT recreate) ──
+  src/core/components/          — custom control kit (AppButton, AppCard, AppTextField, …)
+  src/components/ui/            — react-native-reusables components (when NativeWind is set up)
+  src/core/theme/               — ThemeProvider, tokens.ts, useTheme (useAppTheme())
+  src/core/utils/               — formatters, haptics, helpers
+  src/core/types/               — shared types
   For each entity that needs persistence:
-    src/services/db/{entity}Service.ts   — the ONLY place that calls Supabase/Neon/Firebase
-                                            SDKs for this entity — never call them from a
-                                            screen, component, hook, or slice directly
-  src/hooks/                    — shared app-level hooks
-  src/styles/                   — shared style constants
-  src/utils/                    — constants, helpers
+    src/services/db/{entity}.ts — the ONLY place that reads/writes the connected DB —
+                                   never call the DB/SDK from a route, component, hook, or store
   assets/images/                — AI-generated assets
 
-CANONICAL FILE NAMES — use these exact names, no variations:
+CANONICAL NAMES / RULES:
+  • Routes are files under app/ — filename = URL segment. Groups use (parens), layouts
+    are _layout.tsx, dynamic segments are [id].tsx. Add a tab by creating the file AND a
+    <Tabs.Screen name="..."/> in app/(tabs)/_layout.tsx.
+  • Navigation: import { router, useRouter, Link } from 'expo-router' — router.push('/x/1').
+    Do NOT import @react-navigation directly.
+  • Client state: Zustand — create() a store in src/features/{feature}/store.ts (or src/core
+    for global). Do NOT use Redux / @reduxjs/toolkit / configureStore / createSlice.
+  • Server data: @tanstack/react-query (useQuery / useMutation) in feature api.ts / hooks.
+  • Theme: read colors/spacing via useAppTheme() from src/core/theme — never hardcode hex.
+  • Persistent storage: react-native-mmkv (fast KV) or expo-secure-store (secrets).
+    Do NOT use @react-native-async-storage/async-storage.
+  • Path aliases (tsconfig): @core/* → src/core/*, @features/* → src/features/*,
+    ~/* → src/*  (react-native-reusables), @assets/* → assets/*.
 
-  src/app/store.ts                                   — configureStore with all slice reducers
-  src/app/rootReducer.ts                             — combineReducers
-  src/features/{feature}/api/{feature}Api.ts         — RTK Query or axios calls
-  src/features/{feature}/components/{Feature}Form.tsx — reusable UI (no navigation logic)
-  src/features/{feature}/screens/{Feature}Screen.tsx  — full screen, connects store
-  src/features/{feature}/slice/{feature}Slice.ts     — createSlice actions/reducers/selectors
-  src/features/{feature}/types/{feature}.types.ts    — TypeScript interfaces for this feature
-  src/features/{feature}/hooks/use{Feature}.ts       — hook encapsulating dispatch + selectors
-  src/navigation/AppNavigator.tsx                    — root Stack/Tab navigator (DO NOT rename)
-  src/services/httpClient.ts                         — axios instance with interceptors (remote API, not a database)
-  src/services/db/{entity}Service.ts                 — database reads/writes for this entity (if a database is connected)
-  src/hooks/useAppDispatch.ts                        — typed dispatch hook
-  src/styles/tailwind.config.js                      — NativeWind / StyleSheet tokens
-  src/utils/constants.ts                             — API_URL, storage keys, etc.
-  src/App.tsx                                        — Provider + NavigationContainer root
+ROOT (already exists — EXTEND, do NOT recreate):
+  app/_layout.tsx — root Stack wrapped in QueryClientProvider + ThemeProvider +
+    GestureHandlerRootView + BottomSheetModalProvider. Add new global providers here.
 
-BUILD ORDER (strictly follow; skip auth feature steps if auth decision is NO):
-  1. src/utils/constants.ts and src/services/httpClient.ts
-  2. src/services/db/{entity}Service.ts for every entity that needs persistence (if a database is connected)
-  3. types files for every feature  (skip auth feature if auth decision is NO)
-  4. slice files for every feature  (skip auth slice if auth decision is NO)
-  5. src/app/store.ts + rootReducer.ts (import all slices)
-  6. api files for every feature    (skip auth API if auth decision is NO) — call src/services/db/*Service.ts, never the SDK directly
-  7. hooks for every feature + src/hooks/useAppDispatch.ts
-  8. feature components/ (reusable, no screens yet)
-  9. feature screens/               (skip login/register screens if auth decision is NO)
-  10. src/navigation/AppNavigator.tsx — if auth YES: include auth stack; if NO: go straight to main stack
-  11. src/App.tsx
-  12. Generate all image assets, reference in screens
-  13. package.json / app.json — finalize dependencies
+BUILD ORDER (strictly follow; skip [AUTH ONLY] steps if auth decision is NO):
+  1. src/features/{feature}/types.ts for every feature
+  2. src/services/db/{entity}.ts for every entity that needs persistence (if a DB is connected)
+  3. src/features/{feature}/api.ts (React Query) + store.ts (Zustand) per feature
+  4. src/features/{feature}/hooks/use{Feature}.ts
+  5. src/features/{feature}/components/ (feature UI using core + ui components)
+  6. app/ route files per feature (thin — render feature components); add <Tabs.Screen> entries
+  7. [AUTH ONLY] app/(auth)/* routes + session handling
+  8. Generate image assets, reference them in the routes
+  9. app.json + package.json — finalize app name and dependencies
 """
 
 _STRUCTURE_MAP = {
@@ -352,8 +727,8 @@ FLUTTER FOLDER STRUCTURE — every file you create MUST follow this layout:
   lib/features/{feature}/presentation/pages/{feature}_page.dart
   lib/features/{feature}/presentation/widgets/{feature}_*.dart
 
-  Root (mandatory, do NOT rename):
-  lib/injection_container.dart   lib/app.dart   lib/main.dart
+  Root (already exist — extend, do NOT create lib/app.dart):
+  lib/core/injection.dart   lib/router/app_router.dart (GoRouter)   lib/main.dart (root MaterialApp.router)
 
 RULES:
   • Pages go in presentation/pages/ ONLY. Never at lib/ root or lib/screens/.
@@ -363,38 +738,61 @@ RULES:
     queried ONLY inside data/datasources/{feature}_remote_datasource.dart — the
     repository_impl calls only the datasource, business/validation logic lives in
     domain/usecases/, and presentation/bloc never touches the datasource or SDK directly.
+    For Supabase/Neon that SDK is `forgefy_client`. Build ONE ForgefyClient in
+    lib/core/network/forgefy_client.dart from SUPABASE_URL + SUPABASE_ANON_KEY (or
+    ForgefyProvider.neon + NEON_DATA_API_URL) with a shared_preferences SessionStore,
+    register it in lib/core/injection.dart, and add forgefy_client: ^0.1.0 to
+    pubspec.yaml. Datasources call client.from('table').select()… ; auth calls
+    client.auth.signInWithPassword(...). Read the result THEN cast (precedence):
+        final r = await client.from('t').select().eq('done', false); final rows = r as List;
+    Firebase apps keep the firebase_* SDKs.
+  • COMPONENTS: use shadcn_ui's Shad* widgets (ShadButton/ShadInput/ShadCard/
+    ShadDialog/ShadSelect/…) for controls instead of raw Material or AppButton/
+    AppTextField. Add shadcn_ui: ^0.55.0; a ShadTheme must be at the root — this
+    template uses MaterialApp.router, so ShadApp.router in lib/main.dart, colorScheme
+    built from AppColors. Tokens still come from AppColors/AppTextStyles.
   • If you add a new feature, create ALL sub-folders listed above.
-  • If you add a new screen, register it in lib/app.dart (GoRouter or named routes).
+  • If you add a new screen, add its route to lib/router/app_router.dart (GoRouter).
 """,
     "react_native": """\
-REACT NATIVE FOLDER STRUCTURE — every file you create MUST follow this layout:
+REACT NATIVE STRUCTURE (Expo Router + Zustand + React Query) — every file MUST follow this:
 
-  src/app/store.ts               src/app/rootReducer.ts
-  src/navigation/AppNavigator.tsx   ← only navigator file, do NOT rename
-  src/services/httpClient.ts        ← remote API HTTP client, NOT a database
-  src/services/db/{entity}Service.ts  ← ONE per entity that needs persistence — the
-                                        ONLY place that calls Supabase/Neon/Firebase SDKs
-  src/hooks/useAppDispatch.ts
-  src/styles/tailwind.config.js
-  src/utils/constants.ts
-  src/App.tsx                       ← root entry, do NOT rename
+  Routes live in app/ (expo-router — filename = route; _layout.tsx already exist):
+  app/_layout.tsx                   ← root Stack + providers (EXISTS — extend, don't recreate)
+  app/(tabs)/_layout.tsx            ← bottom Tabs (add <Tabs.Screen> to register a tab)
+  app/(tabs)/{name}.tsx             ← a tab screen (index.tsx = Home)
+  app/{feature}/index.tsx  app/{feature}/[id].tsx   ← feature routes (dynamic = [id].tsx)
 
-  For each feature → ALL sub-folders are mandatory:
-  src/features/{feature}/api/{feature}Api.ts
-  src/features/{feature}/components/{Feature}Form.tsx   (or Card, List, etc.)
-  src/features/{feature}/screens/{Feature}Screen.tsx
-  src/features/{feature}/slice/{feature}Slice.ts
-  src/features/{feature}/types/{feature}.types.ts
-  src/features/{feature}/hooks/use{Feature}.ts
+  Feature logic in src/features/{feature}/:
+  src/features/{feature}/components/    src/features/{feature}/hooks/use{Feature}.ts
+  src/features/{feature}/store.ts (Zustand)   src/features/{feature}/api.ts (React Query)
+  src/features/{feature}/types.ts
+
+  Shared (already scaffolded — do NOT recreate):
+  src/core/components/ (AppButton/AppCard/… custom kit)   src/components/ui/ (RNR, if NativeWind)
+  src/core/theme/ (useAppTheme())   src/core/utils/   src/core/types/
+  src/services/db/{entity}.ts   ← ONE per entity — the ONLY place that reads/writes the DB
 
 RULES:
-  • Screens go in features/{feature}/screens/ ONLY. Never in src/screens/ or root.
-  • Components go in features/{feature}/components/ ONLY.
-  • Slice files go in features/{feature}/slice/ ONLY.
-  • If a database is connected, ALL reads/writes go through src/services/db/{entity}Service.ts
-    — screens/components/slices never call Supabase/Neon/Firebase SDKs directly.
-  • If you add a new screen, register it in src/navigation/AppNavigator.tsx.
-  • If you add a new slice, add it to src/app/store.ts and rootReducer.ts.
+  • Routes go in app/ ONLY (expo-router). Add a screen by creating its file; register a tab
+    with <Tabs.Screen name="..."/> in app/(tabs)/_layout.tsx. Navigate via
+    import { router } from 'expo-router'. Do NOT use @react-navigation directly.
+  • This template is Zustand + React Query — NOT Redux. No store.ts/rootReducer/createSlice/
+    useAppDispatch. Client state → Zustand create() in src/features/{feature}/store.ts;
+    server data → React Query in api.ts/hooks. Theme via useAppTheme(); storage via
+    react-native-mmkv / expo-secure-store (NOT AsyncStorage).
+  • If a database is connected, ALL reads/writes go through src/services/db/{entity}.ts
+    — routes/components/hooks/stores never call Supabase/Neon/Firebase SDKs directly.
+    For Supabase/Neon that SDK is `@forgefy/client`. Build ONE ForgefyClient in
+    src/services/forgefyClient.ts from EXPO_PUBLIC_SUPABASE_URL + EXPO_PUBLIC_SUPABASE_ANON_KEY
+    (or provider:'neon' + EXPO_PUBLIC_NEON_DATA_API_URL) with a session store backed by
+    expo-secure-store/mmkv; call forgefy.auth.restoreSession() in app/_layout.tsx. Add
+    "@forgefy/client": "^0.1.0" to package.json. Firebase apps keep the firebase SDK.
+  • COMPONENTS: if the template uses NativeWind, use react-native-reusables from
+    src/components/ui/* (Button/Input/Card/Dialog/Select/…) for controls instead of raw
+    RN or hand-rolled ones; write a missing RNR component from source and add its
+    @rn-primitives/* dep (+ cva/clsx/tailwind-merge). If the template does NOT use
+    NativeWind, do NOT add it mid-build — use src/core/components/. Icons: lucide-react-native.
 """,
     "next": """\
 NEXT.JS FOLDER STRUCTURE — every file you create MUST follow this layout:
@@ -415,10 +813,20 @@ RULES:
   • If a database is connected (Supabase/Neon/Firebase), ALL reads/writes go through
     lib/services/{entity}.ts — route handlers call these functions, never inline
     queries against lib/db.ts or a provider SDK directly, and never from a
-    "use client" component.
+    "use client" component. For Supabase/Neon that SDK is `@forgefy/client`: build the
+    ForgefyClient in lib/db.ts from NEXT_PUBLIC_SUPABASE_URL + NEXT_PUBLIC_SUPABASE_ANON_KEY
+    (or provider:'neon' + NEXT_PUBLIC_NEON_DATA_API_URL); in a route handler forward the
+    caller's JWT — new ForgefyClient({ url, anonKey, accessToken }) — so RLS applies.
+    lib/services/{entity}.ts calls db.from<T>('table')… / db.auth. Add
+    "@forgefy/client": "^0.1.0" to package.json. Firebase apps keep the firebase SDK.
   • New pages go in app/(app)/{feature}/page.tsx.
   • Add a nav link in components/layout/ when adding a new page.
   • All shared types in types/index.ts — do not scatter them across files.
+  • COMPONENTS: use shadcn/ui from @/components/ui/* (new-york style, lucide icons,
+    cn() from @/lib/utils) — never hand-roll buttons/inputs/cards/dialogs. If a
+    needed component isn't in components/ui/, write it from the shadcn source and add
+    its @radix-ui/react-* dep (plus class-variance-authority/clsx/tailwind-merge/
+    lucide-react). Colors via Tailwind tokens (bg-background/text-primary), not hex.
 
 TYPESCRIPT — follow exactly to avoid build failures:
   • Props: define an interface, use plain function — NOT React.FC<>
@@ -454,10 +862,17 @@ HARDCODED VALUES ARE FORBIDDEN:
 ✗  backgroundColor: '#6366F1'      → ✓  backgroundColor: colors.primary (RN)
 ✗  color: '#6366F1'                → ✓  color: var(--color-primary) (Next.js)
 
-REUSE CORE COMPONENTS FIRST:
-Before creating any UI widget/component, check if one already exists in
-lib/core/widgets/ (Flutter), src/core/components/ (RN), or components/ui/ (Next.js).
-Reuse and extend it — do NOT duplicate.
+REUSE COMPONENTS FIRST — do NOT hand-roll standard controls or duplicate:
+Standard controls (buttons, inputs, cards, dialogs, selects, tabs, badges, …) come
+from the platform component kit, NOT from custom code:
+  • Flutter  → shadcn_ui Shad* widgets (ShadButton, ShadInput, ShadCard, …).
+  • Next.js  → shadcn/ui in components/ui/ (imported via @/components/ui/*).
+  • RN       → react-native-reusables (components/ui/) when NativeWind is set up,
+               else the pre-built components in src/core/components/.
+For anything app-SPECIFIC (a composite card, an empty state, the signature element),
+check lib/core/widgets/ (Flutter) / components/{feature}/ (Next) / feature components
+(RN) and reuse/extend rather than duplicate. On Flutter, lib/core/widgets/ holds
+composites built ON TOP OF Shad* — not re-implementations of basic controls.
 
 THE SIGNATURE ELEMENT:
 The blueprint contains a `signature_element` — one distinctive, domain-specific
@@ -483,6 +898,35 @@ LAYOUT RULES:
 
 _BUILD_PREAMBLE = """You are the Forgefy Build Agent.
 Your task: implement a complete, working application from the blueprint by writing files in the workspace.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DEMO SCREEN — REMOVE IT FIRST, WIRE AS YOU GO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The template you cloned ships a demo/placeholder home screen (sample content
+that belongs to the template, not to this app). It must NOT survive the build:
+
+1. FIRST TASK — before any feature work: locate the template's demo/placeholder
+   screen (a home/welcome/showcase page full of sample content) and DELETE it or
+   REPLACE it with this app's real home screen. Update the router/navigator so
+   the app opens on real content, not the demo.
+2. ENTRY SCREEN FIRST — the launch page is built before everything else. The
+   entry screen is whatever opens at launch: app/index.tsx or app/(tabs)/index
+   (Expo), app/page.tsx (Next.js), the home widget under lib/ or the initial
+   route in MainNavigator (Flutter). Build its REAL layout and content from the
+   blueprint first, set it as the initial route, then build every other feature
+   in an order that links outward from it. Never start with a leaf screen.
+3. INTEGRATE INCREMENTALLY — after finishing EACH page, screen, component or
+   feature, IMMEDIATELY register it in the router/navigator (add the route, tab
+   entry, or a link from the home screen) BEFORE starting the next one. Never
+   batch navigation wiring until the end.
+4. WHY: previews are compiled from what is committed. If this run stops early
+   (step/token limit), the user sees the last pushed state — it must open on a
+   real launch page with the features you actually finished, never the demo
+   page. A screen that exists on disk but is not routed is invisible to the
+   user.
+
+A build that finishes with the demo screen still showing has failed its first
+task, no matter how many feature files it wrote.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BUILD PHASES — follow in order
@@ -513,9 +957,12 @@ PHASE 0 · Auth Decision  ← do this BEFORE anything else
     — treat every build-order step marked [AUTH ONLY] as N/A.
     — build the app as a fully public application with no login wall.
 
-PHASE 0 (auth) — if auth IS needed: the login/register screens MUST use the pre-built
-  AppTextField and AppButton core components. No custom text fields. Include a branded
-  header using the display_font. Password field has show/hide toggle.
+PHASE 0 (auth) — if auth IS needed: the login/register screens MUST use the platform
+  control kit — Flutter: shadcn_ui ShadInputFormField + ShadButton (inside a ShadForm);
+  Next.js: shadcn/ui Input + Button; RN: react-native-reusables (if NativeWind) else core
+  controls. No custom/hand-rolled
+  text fields or buttons. Include a branded header using the display_font. Password field
+  has a show/hide toggle.
 
 PHASE 1 · Explore
   • list_files on '.' to see the existing template
@@ -536,10 +983,11 @@ PHASE 2 · Scaffold directories
     This sentence appears in the user's live build log.
 
 PHASE 3 · Reusable components / widgets  ← DO THIS BEFORE SCREENS
-  • Core components are PRE-BUILT in lib/core/widgets/ (Flutter),
-    src/core/components/ (RN), or components/ui/ (Next.js).
-  • Only write FEATURE-SPECIFIC components here. Each must import from core — never
-    redefine base styles.
+  • Standard controls come from the component kit — Flutter: shadcn_ui Shad*;
+    Next.js: shadcn/ui in components/ui/; RN: react-native-reusables (if NativeWind)
+    else pre-built src/core/components/. Do not re-implement them.
+  • Only write FEATURE-SPECIFIC components here (composites built ON TOP OF the kit).
+    Each must use the kit + design tokens — never redefine base styles.
   • Write at minimum: a feature-specific card, a feature-specific list item, and
     the signature_widget integrated where contextually relevant.
 
@@ -593,8 +1041,16 @@ ADDITIONAL REQUIREMENTS
   the services/datasource layer described above for this platform (lib/services/*.ts
   for Next.js, src/services/db/*Service.ts for React Native, data/datasources/* for
   Flutter) — never scatter raw provider SDK/query calls inside pages, screens, or
-  widgets/components directly.
+  widgets/components directly. When that database is Supabase or Neon, that layer uses
+  the Forgefy client SDK (forgefy_client for Flutter, @forgefy/client for Next.js and
+  React Native) for both data and auth — see the "FORGEFY CLIENT SDK" note in the
+  structure section above. Firebase-backed apps keep using the Firebase SDK.
 • Implement EVERY feature listed in the blueprint — nothing optional
+• Build the ENTRY SCREEN first — the page users see at launch gets its real
+  layout and content before any other screen, and stays the initial route
+• Remove the template's demo/placeholder home screen (see DEMO SCREEN above) and
+  wire each finished page/screen into the router AS YOU GO — an unwired screen
+  never reaches a preview, so partial builds must still open on real content
 • Handle loading states, empty states, and basic error states in every screen
 • Add input validation where the app collects user data
 • Style the app consistently using the color/theme constants you define
@@ -683,9 +1139,181 @@ ADDITIONAL REQUIREMENTS
 """
 
 
+# ---------------------------------------------------------------------------
+# Forgefy UI SDK guidance (feature-flagged)
+# ---------------------------------------------------------------------------
+# forgefy_ui (Flutter) and @forgefy/ui (React web + native) give generated apps
+# layout + animation primitives. This guidance is injected ONLY when
+# FORGEFY_UI_ENABLED is truthy: until the packages are published to pub.dev / npm,
+# every build's pub-get / npm-install would fail on the missing dependency — and
+# unlike the DB SDK this applies to EVERY app, so it stays off by default. Flip
+# the env var after publishing.
+
+
+def _ui_enabled() -> bool:
+    from app.config import get_settings
+    return get_settings().FORGEFY_UI_ENABLED
+
+
+_FLUTTER_UI_GUIDANCE = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORGEFY UI — layout, animation, SLIVER-FIRST screens
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use the `forgefy_ui` package for structure and motion instead of hand-writing
+Column/Row/SizedBox or AnimationController.
+  • pubspec.yaml → add  forgefy_ui: ^0.1.0
+  • Import in UI files (Spacer/Wrap overlap Flutter's — hide them):
+      import 'package:flutter/material.dart' hide Spacer, Wrap;
+      import 'package:forgefy_ui/forgefy_ui.dart';
+
+SLIVER-FIRST SCREENS — build EVERY scrolling page this way, NOT
+Scaffold + SingleChildScrollView + Column:
+  SliverScreen(
+    gutter: 16,
+    appBar: SliverHeader(title: Text(...), pinned: true),
+    slivers: [
+      SliverGap(12),
+      SliverStagger(itemCount: items.length, itemBuilder: (c, i) => ItemCard(items[i])),  // lists
+      // grid:           SliverGridView(columns: n, itemCount: .., itemBuilder: ..)
+      // fixed section:  SliverBox(child: VStack(spacing: 12, children: [...]))
+      // empty/error/loading: SliverFill(child: <state widget>)
+    ],
+  )
+
+LAYOUT inside boxes: VStack/HStack(spacing:), Grid(columns:), Wrap, Spacer, and
+Responsive.value(context, mobile: .., tablet: .., desktop: ..) for adaptive
+column counts.
+ANIMATION: FadeIn / SlideIn / ScaleIn (entrances), Stagger / SliverStagger
+(lists), AnimatedVisibility (show/hide) — prefer these over raw AnimationController.
+
+forgefy_ui owns STRUCTURE + MOTION; the design system still owns VALUES — colors
+via AppColors, text via AppTextStyles, spacing from the theme. Never hardcode
+colors/sizes into forgefy_ui widgets.
+"""
+
+_NEXT_UI_GUIDANCE = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORGEFY UI — layout & animation
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use `@forgefy/ui/web` for layout/animation instead of hand-rolled flex divs.
+  • package.json → add  "@forgefy/ui": "^0.1.0"
+  • import { VStack, HStack, Grid, Wrap, Spacer, Scroll, List, Fill, Stagger,
+      FadeIn, SlideIn, useResponsiveValue } from "@forgefy/ui/web";
+  • Stacks with spacing → <VStack gap={16}> / <HStack gap={8}>.
+  • Grid → <Grid columns={useResponsiveValue({ mobile: 1, tablet: 2, desktop: 3 })} gap={12}>.
+  • Empty / error / loading → <Fill><EmptyState/></Fill>.
+  • Animated lists → <Stagger>…</Stagger>; entrances → <FadeIn>/<SlideIn>.
+These use hooks → the files that render them need 'use client'. Tailwind/design
+tokens still own color & typography; forgefy_ui owns layout structure.
+"""
+
+_RN_UI_GUIDANCE = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORGEFY UI — layout & animation
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use `@forgefy/ui/native` instead of hand-written StyleSheet flex layout.
+  • package.json → add  "@forgefy/ui": "^0.1.0"
+  • import { VStack, HStack, Grid, Spacer, List, Fill, Stagger, FadeIn, SlideIn,
+      useResponsiveValue } from "@forgefy/ui/native";
+  • Screens: VStack/HStack(gap), Grid(columns), Spacer.
+  • Long lists → <List data={..} gap={12} renderItem={(item) => <Card .../>} />  (FlatList under the hood).
+  • Empty / error / loading → <Fill><EmptyState/></Fill>. Animated lists → <Stagger>.
+  • Adaptive values → useResponsiveValue({ mobile, tablet, desktop }).
+"""
+
+_UI_GUIDANCE_MAP = {
+    "flutter": _FLUTTER_UI_GUIDANCE,
+    "next": _NEXT_UI_GUIDANCE,
+    "react_native": _RN_UI_GUIDANCE,
+}
+
+_UPDATE_UI_RULES = {
+    "flutter": """
+FORGEFY UI (layout/animation, sliver-first):
+  • Use forgefy_ui; build scrolling screens as SliverScreen (CustomScrollView) —
+    SliverListView/SliverStagger for lists, SliverGridView for grids, SliverFill
+    for empty states, SliverBox(child: VStack(...)) for fixed sections, SliverGap
+    for spacing. Inside boxes use VStack/HStack(spacing:)/Grid/Wrap/Spacer and
+    Responsive.value(...). Entrances via FadeIn/SlideIn/ScaleIn/Stagger.
+  • Add forgefy_ui: ^0.1.0. Import material with `hide Spacer, Wrap;`. Colors/text
+    still come from AppColors/AppTextStyles, never hardcoded into forgefy_ui.
+""",
+    "next": """
+FORGEFY UI (layout/animation):
+  • Use @forgefy/ui/web — VStack/HStack/Grid/Wrap/Spacer/Scroll/List/Fill/Stagger,
+    useResponsiveValue — instead of hand-rolled flex divs. Add "@forgefy/ui": "^0.1.0".
+    Files that render them need 'use client'.
+""",
+    "react_native": """
+FORGEFY UI (layout/animation):
+  • Use @forgefy/ui/native — VStack/HStack/Grid/Spacer/List/Fill/Stagger,
+    useResponsiveValue — instead of StyleSheet flex. Long lists → <List/>; empty
+    states → <Fill/>. Add "@forgefy/ui": "^0.1.0".
+""",
+}
+
+
+def _update_structure_rules(template_key: str) -> str:
+    rules = _UPDATE_STRUCTURE_RULES.get(template_key, "")
+    if _ui_enabled():
+        rules += _UPDATE_UI_RULES.get(template_key, "")
+    return rules
+
+
+# Tool-usage rules every phase needs. Kept in one constant and appended to each
+# phase's system prompt: the design, schema, validator, test and security agents
+# each have their own prompt, and guidance that lives in only one of them is
+# guidance four agents never see. Byte-stable, so it does not disturb caching.
+_TOOL_RULES = """
+
+══════════════════════════════════════════
+HOW TO USE THE FILE TOOLS
+══════════════════════════════════════════
+EDITING — use edit_file, not write_file
+  • New file, or a deliberate full rewrite → write_file
+  • Any change to a file that already exists → edit_file
+  • edit_file replaces one exact string and leaves the rest of the file alone.
+    Rewriting a whole file to change a few lines burns output tokens and is how
+    long files end up truncated or silently missing code.
+  • old_string must match the file exactly, including indentation. read_file
+    returns numbered lines — copy the text to replace straight out of it.
+  • If edit_file reports an ambiguous match, add surrounding lines to old_string.
+    Do not fall back to write_file.
+
+DO NOT RE-READ A FILE YOU JUST EDITED
+  • edit_file returns a diff of exactly what changed. That diff is your
+    confirmation — you do not need to read the file again to verify it.
+  • Read a file ONCE, then make ALL of your changes to it. Repeatedly reading the
+    same file between edits wastes the entire phase and changes nothing.
+  • Only re-read a file if a tool told you your edit failed.
+
+FINDING THINGS — search before you read
+  • grep searches file CONTENTS by regex — use it to find where something is
+    defined or used.
+  • glob finds files by NAME pattern, e.g. 'src/**/*.tsx'.
+  • Opening files one at a time to look for something is the slowest and most
+    expensive way to search. Search first, then read only what matched.
+  • A project map (when one is provided) lists where symbols are DEFINED — it
+    cannot show where they are USED. For any change that spans multiple files,
+    or whenever the map does not clearly name the target, run grep first:
+      - "update every call site of X"  → grep X, edit each match
+      - "where do we call this API?"   → grep the endpoint/method name
+      - verifying an edit is complete  → grep for leftovers of the old code
+    Trusting a stale map over grep is how edits end up half-applied.
+"""
+
+
+def _with_tool_rules(system: str) -> str:
+    """Append the shared tool-usage rules to a phase's system prompt."""
+    return system + _TOOL_RULES
+
+
 def _build_system(template_key: str) -> str:
     structure = _STRUCTURE_MAP.get(template_key, _NEXT_STRUCTURE)
-    return _DESIGN_MANDATE + _BUILD_PREAMBLE + structure + _BUILD_SUFFIX
+    ui = _UI_GUIDANCE_MAP.get(template_key, "") if _ui_enabled() else ""
+    return _with_tool_rules(
+        _DESIGN_MANDATE + _BUILD_PREAMBLE + structure + ui + _BUILD_SUFFIX
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -708,9 +1336,11 @@ HARDCODED VALUES ARE FORBIDDEN in any file you write:
   ✗ padding: 16     →  ✓ AppSpacing.md / spacing.md / var(--space-md)
   ✗ '#6366F1'       →  ✓ colors.primary / var(--color-primary)
 
-REUSE CORE COMPONENTS — check before creating anything new:
-  lib/core/widgets/ (Flutter) | src/core/components/ (RN) | components/ui/ (Next.js)
-  If a matching component exists there, use it — do not create a duplicate.
+USE THE COMPONENT KIT — do not hand-roll standard controls:
+  Flutter → shadcn_ui Shad* widgets | Next.js → shadcn/ui in components/ui/ |
+  RN → react-native-reusables (components/ui/) if NativeWind, else src/core/components/.
+  App-specific composites live in lib/core/widgets/ (Flutter) / components/{feature}/
+  (Next) — reuse an existing one before creating a duplicate.
 
 Every user action (tap, submit, toggle) must produce visible feedback.
 Use built-in component states (loading, pressed) — don't add extra animation libraries.
@@ -745,7 +1375,7 @@ CRITICAL RULES
 - Never output "." or a single word as your response — always write code.
 - Never say DONE without having written at least one file.
 - If a new screen is added, also update the navigator/router to include it.
-- Narrate briefly before each tool call: "Reading AppNavigator…", "Writing OnboardingPage…"
+- Narrate briefly before each tool call: "Reading the router/layout…", "Writing OnboardingScreen…"
 - If you see a file in the git history that was already correctly implemented,
   skip it and move on to what is still missing.
 - If your change adds a new third-party service, update all three env files:
@@ -779,6 +1409,12 @@ React Native / Expo: read package.json, add to "dependencies", write package.jso
 Flutter: read pubspec.yaml, add under "dependencies:", write pubspec.yaml.
 
 Common packages you must add when you use them:
+  shadcn_ui          → shadcn_ui: ^0.55.0            (Flutter control kit — pubspec.yaml)
+  nativewind         → "nativewind": "^4.2.0"        (RN — required by react-native-reusables)
+  @rn-primitives/*   → "@rn-primitives/<name>": "^1.5.0"  (RN — react-native-reusables primitives)
+  lucide-react-native → "lucide-react-native": "^1.25.0"  (RN icons for react-native-reusables)
+  @forgefy/client    → "@forgefy/client": "^0.1.0"   (Supabase/Neon DB + auth; Next.js & React Native)
+  forgefy_client     → forgefy_client: ^0.1.0        (Supabase/Neon DB + auth; Flutter — pubspec.yaml)
   next-themes        → "next-themes": "^0.3.0"
   framer-motion      → "framer-motion": "^11.0.0"
   lucide-react       → "lucide-react": "^0.400.0"
@@ -808,7 +1444,7 @@ Onboarding screen:
   File: lib/features/onboarding/presentation/pages/onboarding_page.dart
   Use PageView with individual step widgets (icon, title, body, skip/next).
   Store completion in SharedPreferences; check in main.dart to decide initial route.
-  Register route in lib/app.dart.
+  Register the route in lib/router/app_router.dart (GoRouter).
 
 Animations:
   Entrance: AnimatedOpacity + SlideTransition triggered in initState via AnimationController.
@@ -821,7 +1457,7 @@ Dark mode:
 
 New screen:
   Create in lib/features/{feature}/presentation/pages/.
-  Add named route to lib/app.dart routes map or GoRouter.
+  Add the route to lib/router/app_router.dart (GoRouter).
 
 ══════════════════════════════════════════
 NEXT.JS PATTERNS
@@ -859,9 +1495,9 @@ New page:
 REACT NATIVE PATTERNS
 ══════════════════════════════════════════
 Onboarding screen:
-  File: src/features/onboarding/screens/OnboardingScreen.tsx
-  Use FlatList or ScrollView with pagingEnabled. Store completion in AsyncStorage.
-  Add to AppNavigator.tsx as the initial screen when not completed.
+  Route file: app/onboarding.tsx (expo-router). Use FlatList or ScrollView with
+  pagingEnabled. Persist completion with react-native-mmkv or expo-secure-store.
+  Redirect from app/index.tsx (or app/_layout.tsx) to /onboarding when not completed.
 
 Animations:
   Entrance: Animated.timing with useRef(new Animated.Value(0)).
@@ -869,8 +1505,9 @@ Animations:
   Layout: LayoutAnimation.configureNext before state changes.
 
 New screen:
-  Create in src/features/{feature}/screens/.
-  Add to Stack.Navigator in src/navigation/AppNavigator.tsx.
+  Create a route file under app/ (expo-router) — e.g. app/{feature}/index.tsx; register a
+  tab with <Tabs.Screen name="..."/> in app/(tabs)/_layout.tsx. Put feature UI/logic in
+  src/features/{feature}/ and render it from the thin route file.
 
 ══════════════════════════════════════════
 IMPORT & SYNTAX RULES — READ BEFORE WRITING ANY FILE
@@ -916,11 +1553,13 @@ RULE 5 — TYPESCRIPT/NEXT.JS COMMON MISTAKES:
   ✗  API route missing runtime declaration → ✓  add export const runtime = 'edge'; at top of every app/api/*.ts file
   ✗  import fs from 'fs' in API route    → NOT available on Cloudflare edge — use fetch() or Web APIs only
 
-RULE 6 — REACT NATIVE COMMON MISTAKES:
+RULE 6 — REACT NATIVE COMMON MISTAKES (this template = Expo Router + Zustand + React Query):
   ✗  import { View } from 'react-native-web'  → ✓  from 'react-native'
-  ✗  StyleSheet.create({ x: { color: '#fff' } }) → ✓  use tokens: colors.xxx
-  ✗  navigation.navigate('Screen', params)  → type must match the Navigator's param list
-  ✗  AsyncStorage from 'react-native'  → ✓  from '@react-native-async-storage/async-storage'"""
+  ✗  StyleSheet.create({ x: { color: '#fff' } }) → ✓  use tokens: useAppTheme().colors.xxx
+  ✗  import { NavigationContainer } / @react-navigation/*  → ✓  expo-router (routes in app/);
+       navigate via import { router } from 'expo-router'
+  ✗  configureStore / createSlice / useDispatch (Redux)  → ✓  Zustand create() stores + React Query
+  ✗  @react-native-async-storage/async-storage  → ✓  react-native-mmkv or expo-secure-store"""
 
 
 # ---------------------------------------------------------------------------
@@ -935,6 +1574,8 @@ Return ONLY valid JSON — absolutely no other text before or after:
 {
   "summary": "<one sentence — what will be built or changed>",
   "skip_design_agent": false,
+  "skip_schema_agent": false,
+  "skip_test_agent": false,
   "skip_security_agent": false,
   "design_impact": {
     "uses_existing_core_components": ["<component name>"],
@@ -966,6 +1607,13 @@ Rules:
 - skip_design_agent: set true ONLY when ALL of these are true:
     new_components_needed is empty, affects_theme is false, signature_element_appears is false.
     Pure logic, data, or backend changes qualify. Any visual or UI change must be false.
+- skip_schema_agent: set true ONLY when the change stores NO new data — no new entity,
+    no new field on an existing entity, no new relationship. Pure UI, styling, copy,
+    navigation, or read-only display changes qualify. If the request adds anything the
+    app must remember between sessions, it must be false.
+- skip_test_agent: set true ONLY when the change adds NO testable logic — pure styling,
+    copy edits, asset swaps, or config changes. Any new business rule, calculation,
+    validation, state transition, or data mapping must be false.
 - skip_security_agent: set true ONLY when the change has NO authentication, NO API keys,
     NO user permissions, NO external API calls, NO data storage (DB, files, cookies).
     Pure UI-only or pure read-only data display changes qualify.
@@ -992,7 +1640,9 @@ def _build_planner_msg(
         "react_native": "React Native / TypeScript / Expo",
     }.get(template_key, template_key)
     try:
-        file_tree = execute_tool("list_files", {"path": "."}, workspace)
+        # The project map (paths + key symbols) lets the planner target real
+        # files by name/symbol instead of guessing from a bare directory listing.
+        file_tree = _build_project_map(workspace)
     except Exception:
         file_tree = "(unavailable)"
     bp_excerpt = json.dumps({
@@ -1012,7 +1662,7 @@ def _build_planner_msg(
         f"App: {app_name}\n"
         f"Framework: {framework}\n\n"
         f"Blueprint excerpt:\n{bp_excerpt}\n\n"
-        f"Current workspace files:\n{file_tree[:1200]}\n\n"
+        f"Project map (path: key symbols):\n{file_tree[:3000]}\n\n"
         f"Change request:\n{planner_prompt}"
     )
 
@@ -1034,6 +1684,9 @@ def _call_planner(
             resp = client.messages.create(
                 model=model, max_tokens=4096,
                 system=_PLANNER_SYSTEM,
+                # Sonnet 5+ thinks by default; thinking blocks lead `content`, so the
+                # content[0].text read below would hit a ThinkingBlock. JSON-only call.
+                thinking={"type": "disabled"},
                 messages=[{"role": "user", "content": planner_input}],
             )
             raw = resp.content[0].text.strip() if resp.content else ""
@@ -1066,22 +1719,31 @@ def _call_planner(
             )
             raw = (resp_oai.choices[0].message.content or "").strip()
 
-        else:  # Qwen3 / Ollama
-            import requests as _req
-            r = _req.post(
-                f"{base_url.rstrip('/')}/api/chat",
-                json={
-                    "model": ollama_model,
-                    "messages": [
-                        {"role": "system", "content": _PLANNER_SYSTEM},
-                        {"role": "user", "content": planner_input},
-                    ],
-                    "stream": False,
-                },
-                timeout=ollama_timeout,
-            )
-            r.raise_for_status()
-            raw = (r.json().get("message") or {}).get("content", "").strip()
+        else:  # Qwen3 — hosted via OpenRouter, or local Ollama
+            from app.ai.qwen import using_openrouter
+
+            if using_openrouter():
+                from app.ai.openrouter import PLAN, chat_openrouter
+                raw = chat_openrouter(_PLANNER_SYSTEM, planner_input, task=PLAN, max_tokens=4096)
+            else:
+                import requests as _req
+
+                from app.ai.ollama_http import ollama_headers
+                r = _req.post(
+                    f"{base_url.rstrip('/')}/api/chat",
+                    json={
+                        "model": ollama_model,
+                        "messages": [
+                            {"role": "system", "content": _PLANNER_SYSTEM},
+                            {"role": "user", "content": planner_input},
+                        ],
+                        "stream": False,
+                    },
+                    headers=ollama_headers(),
+                    timeout=ollama_timeout,
+                )
+                r.raise_for_status()
+                raw = (r.json().get("message") or {}).get("content", "").strip()
 
         # Normalise: strip think tags, markdown fences, extract first {...}
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
@@ -1107,6 +1769,21 @@ NEVER explain your role. NEVER ask questions. NEVER say you cannot make changes.
 Your final output MUST always end with a line starting with "VALIDATED:".
 
 ══════════════════════════════════════════
+DEMO SCREEN CHECK (run FIRST — cheap and critical)
+══════════════════════════════════════════
+The template shipped a demo/placeholder home screen. It must NOT remain the app's
+landing point:
+  1. Open the router/navigator (app/_layout, app/(tabs)/_layout, lib/router/…,
+     or MainNavigator) and check what the app opens on.
+  2. If it still points at a demo/welcome/showcase screen full of sample content,
+     FIX IT: delete or replace that screen with the app's real home screen and
+     update the router accordingly.
+  3. Also check that screens for features listed in the plan are actually routed —
+     an implemented-but-unwired screen is invisible to the user in previews.
+  4. Confirm the launch page shows THIS app's real content (per the blueprint) —
+     not demo/sample content and not an empty shell. Fix it if not.
+
+══════════════════════════════════════════
 DESIGN AUDIT (run BEFORE structural checks)
 ══════════════════════════════════════════
 
@@ -1130,10 +1807,18 @@ For each screen/page file in the plan:
   • Does it handle empty state?   If not — add AppEmptyState/EmptyState.
   • Does AppBar/header exist?     If not — add it.
 
-PASS 3 — Core component reuse check
-Search for any custom button, text field, or card implementation that duplicates a
-core component in lib/core/widgets/ / src/core/components/ / components/ui/.
-If duplicates exist: merge into the canonical path, delete_file the duplicate.
+PASS 3 — Component-kit reuse check
+Standard controls must come from the platform kit, NOT custom code:
+  • Flutter → shadcn_ui Shad* widgets (ShadButton/ShadInput/ShadCard/…). A
+    hand-rolled or raw-Material button/input/card, or a custom AppButton/AppTextField
+    used for a standard control, is a violation — replace it with the Shad* widget.
+  • Next.js → shadcn/ui components in components/ui/ (@/components/ui/*).
+  • RN → react-native-reusables (components/ui/) when NativeWind is set up, else the
+    pre-built components in src/core/components/.
+Shad* widgets and @/components/ui/* are the canonical components — do NOT flag them as
+duplicates or "merge" them into a custom widget. Only genuine app-SPECIFIC composites
+belong in lib/core/widgets/ / components/{feature}/; if two of THOSE duplicate each
+other, merge into the canonical path and delete_file the duplicate.
 
 Output after design audit:
   "DESIGN AUDIT: Fixed N token violations, N quality floor gaps, N duplicate components"
@@ -1153,18 +1838,22 @@ MANDATORY WORKFLOW
       Are all imports valid and present in pubspec.yaml or package.json?
       Are all referenced classes/functions/widgets actually defined?
 4. Check integration points:
-   - Flutter: new screens must be registered in lib/app.dart (GoRouter or named routes)
+   - Flutter: new screens must be registered in lib/router/app_router.dart (GoRouter)
    - Next.js: new pages must have a link in components/layout/; new packages in package.json
-   - React Native: new screens must be in src/navigation/AppNavigator.tsx
+   - React Native: new screens are route files in app/ (expo-router); a new tab is
+     registered with <Tabs.Screen> in app/(tabs)/_layout.tsx
 5. ── STRUCTURE CHECK (see FOLDER STRUCTURE RULES in your task) ──
    a. For Flutter: verify every new feature has ALL required sub-folders:
       data/datasources/, data/models/, data/repositories/,
       domain/entities/, domain/repositories/, domain/usecases/,
       presentation/bloc/, presentation/pages/, presentation/widgets/
-      And that lib/injection_container.dart, lib/app.dart, lib/main.dart exist.
-   b. For React Native: verify every new feature has ALL required sub-folders:
-      api/, components/, screens/, slice/, types/, hooks/
-      And that src/App.tsx, src/navigation/AppNavigator.tsx exist.
+      And that lib/core/injection.dart, lib/router/app_router.dart, lib/main.dart exist
+      (there is NO lib/app.dart — the root MaterialApp.router is in main.dart).
+   b. For React Native (Expo Router): verify each feature's route files exist under app/
+      (e.g. app/{feature}/index.tsx, [id].tsx) and its logic under
+      src/features/{feature}/ (components/, hooks/, store.ts [Zustand], api.ts [React Query],
+      types.ts). Confirm app/_layout.tsx and app/(tabs)/_layout.tsx exist. There is NO
+      src/App.tsx, src/navigation/, Redux store, or slices — flag those if introduced.
    c. For Next.js: verify pages are in app/(app)/, API routes in app/api/, shared
       components in components/ui/ or components/layout/.
    d. If ANY file is in the WRONG location — move it with write_file to the correct
@@ -1240,7 +1929,7 @@ def _validator_user_msg(
             + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         )
 
-    structure_rules = _UPDATE_STRUCTURE_RULES.get(template_key, "")
+    structure_rules = _update_structure_rules(template_key)
     structure_section = (
         "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "FOLDER STRUCTURE RULES — validate all files are in the right place\n"
@@ -1496,6 +2185,244 @@ def _design_agent_user_msg(
     )
 
 
+_SCHEMA_SYSTEM = """You are the Forgefy Schema Agent. You run AFTER the planner and BEFORE the design and execution agents.
+
+Your job: turn the blueprint's data model into concrete Postgres/Supabase migration SQL,
+so the executor writes queries against a schema that actually exists instead of inventing
+table and column names as it goes.
+
+══════════════════════════════════════════
+WHAT YOU PRODUCE
+══════════════════════════════════════════
+1. ONE migration file at supabase/migrations/<UTC timestamp>_<short_snake_name>.sql
+   (timestamp format YYYYMMDDHHMMSS — use a plausible current UTC time).
+2. A SCHEMA READY: brief listing every table and its columns, for the executor to code against.
+
+You do NOT run migrations — there is no execution path from this workspace to a live
+database. You write the SQL file into the repo; applying it is the developer's step.
+Say so in your brief rather than claiming tables were created.
+
+══════════════════════════════════════════
+BEFORE YOU WRITE
+══════════════════════════════════════════
+• list_files on supabase/migrations/ — if migrations already exist, READ them first.
+  You are extending an existing schema, not redefining it. Never rewrite or delete a
+  previous migration; add a new one with ALTER TABLE / CREATE TABLE IF NOT EXISTS.
+• Read the blueprint's "entities" — that is the extracted data model. Entities carry
+  "fields" (name/type/required/notes) and "relationships" (kind/target).
+• If the blueprint has no entities and the plan implies no storage, output
+  "SCHEMA READY: no persistent data required — no migration written" and STOP.
+  Do NOT invent a schema to look productive.
+
+══════════════════════════════════════════
+SQL RULES — non-negotiable
+══════════════════════════════════════════
+• snake_case, plural table names ("Invoice" entity → invoices table).
+• Every table gets: id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now().
+  Add updated_at timestamptz when the entity is edited after creation.
+• Blueprint field types map as: text→text, integer→integer, decimal→numeric(12,2),
+  boolean→boolean, timestamp→timestamptz, date→date, uuid→uuid, json→jsonb,
+  enum→text with a CHECK constraint listing the allowed values.
+• required: true → NOT NULL. Give NOT NULL columns a DEFAULT when a sensible one exists,
+  otherwise leave it and note it in the brief.
+• belongs_to → a <target_singular>_id uuid REFERENCES <target_plural>(id) column.
+  has_many → the foreign key lives on the OTHER table, not this one.
+  many_to_many → a join table named <a>_<b> alphabetically, with both FKs and a
+  composite primary key.
+• ON DELETE: CASCADE when the child is meaningless without the parent, otherwise RESTRICT.
+  Never leave the default (NO ACTION) unstated.
+• Add an index on every foreign key column.
+
+══════════════════════════════════════════
+ROW LEVEL SECURITY — mandatory
+══════════════════════════════════════════
+The anon key ships in the client app. RLS IS the security boundary, so a table without
+policies is a public table.
+
+• ALTER TABLE <t> ENABLE ROW LEVEL SECURITY; on EVERY table you create.
+• Write explicit policies. Default shape for user-owned data:
+    - the table carries user_id uuid not null references auth.users(id) on delete cascade
+    - select/insert/update/delete policies each using (auth.uid() = user_id)
+• For data that is genuinely public-readable, write an explicit
+  "select using (true)" policy and say in your brief why it is public.
+• NEVER write a policy that is "using (true)" for insert/update/delete.
+• If the meeting discussed roles or permissions, model them — do not flatten every
+  user to the same access level.
+
+══════════════════════════════════════════
+OUTPUT
+══════════════════════════════════════════
+End with a brief starting with SCHEMA READY: that lists, per table, the exact column
+names and types, the FK relationships, and the RLS policy shape. The executor reads
+ONLY this brief — if a column is not in it, the executor will not know it exists."""
+
+
+def _schema_agent_user_msg(
+    app_name: str,
+    template_key: str,
+    blueprint: dict[str, Any],
+    plan: dict[str, Any] | None,
+    prompt: str,
+    workspace: Path | None = None,
+) -> str:
+    framework = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(
+        template_key, template_key
+    )
+    entities = blueprint.get("entities") or []
+    entities_section = (
+        f"Extracted data model ({len(entities)} entities):\n{json.dumps(entities, indent=2)}"
+        if entities
+        else "The blueprint carries no extracted entities — derive storage needs from the "
+        "change request and plan, and write no migration if nothing needs persisting."
+    )
+    plan_section = (
+        f"Execution plan:\n{json.dumps(plan, indent=2)}"
+        if plan
+        else "No structured plan — infer storage needs from the change request below."
+    )
+    core_prompt = (
+        prompt.split("\nCURRENT REQUEST\n", 1)[-1].strip()
+        if "\nCURRENT REQUEST\n" in prompt
+        else prompt
+    )
+
+    workspace_section = ""
+    if workspace is not None:
+        workspace_section = (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "CURRENT FILE TREE\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + _scan_workspace(workspace) + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
+    return (
+        f"App: {app_name}\nFramework: {framework}\n\n"
+        f"Incoming change request:\n{core_prompt[:600]}\n\n"
+        f"{entities_section}\n\n"
+        f"{plan_section}\n"
+        f"{workspace_section}\n"
+        "Read any existing migrations, then write the migration and output your brief "
+        "starting with SCHEMA READY:"
+    )
+
+
+_TEST_SYSTEM = """You are the Forgefy Test Agent. You run AFTER the validator, once the code compiles.
+
+Your job: prove the feature actually works by writing tests and running them. Static
+analysis says the code type-checks; it says nothing about whether it behaves correctly.
+
+══════════════════════════════════════════
+WHAT YOU DO
+══════════════════════════════════════════
+1. Read the changed files to understand what behaviour was added.
+2. Write focused tests for that behaviour, in the project's existing test location
+   and style — list_files the test directory and read an existing test FIRST.
+   If there is no test directory, create the framework's conventional one
+   (Flutter → test/, Next.js → __tests__/ or *.test.ts beside the source,
+   React Native → __tests__/).
+3. Call run_tests() and read the result.
+4. If a test fails, decide which side is wrong:
+   • The test encodes the wrong expectation → fix the test.
+   • The implementation is genuinely broken → fix the implementation.
+   Say which one you concluded and why. Do NOT delete or skip a failing test to
+   get a green run — a deleted test is a lie about coverage.
+5. Repeat until run_tests() passes, or you have a specific reason it cannot.
+
+══════════════════════════════════════════
+WHAT TO TEST — and what not to
+══════════════════════════════════════════
+Test the logic this change introduced:
+  • Business rules, calculations, validation, state transitions
+  • Data mapping — an entity's fields surviving a round trip
+  • Error paths that the code explicitly handles
+  • Edge cases the blueprint or plan calls out (empty lists, missing optional
+    fields, boundary values)
+
+Do NOT test:
+  • The framework itself (that setState re-renders, that a Provider provides)
+  • Third-party library internals
+  • Static styling — colors, padding, font sizes. These change constantly and a
+    test that asserts them breaks on every design tweak while catching no bugs.
+  • Trivial getters/setters with no logic
+
+A small number of tests that assert real behaviour beats a large number that
+assert the framework works.
+
+══════════════════════════════════════════
+HARD RULES
+══════════════════════════════════════════
+• NEVER weaken a test to make it pass — no commenting out assertions, no skip
+  markers, no changing an expected value to whatever the code happened to return.
+  If the code is wrong, fix the code.
+• Do NOT add a testing framework or dependency that isn't already in the project.
+  If none is present, write tests in whatever the framework ships with
+  (Flutter: flutter_test; Next.js/React Native: whatever the test script invokes),
+  and if there is genuinely no runner, say so and stop rather than installing one.
+• Do NOT modify application code except to fix a real defect a test exposed.
+  You are not here to refactor.
+• If run_tests() reports no suite and there is no runner configured, write the
+  tests anyway so they are in the repo, and state clearly that they were not run.
+
+══════════════════════════════════════════
+OUTPUT
+══════════════════════════════════════════
+End with a brief starting with TESTS: that states how many tests you wrote, what
+behaviour they cover, the final run_tests() result, and — if anything is still
+failing or unrun — exactly what and why. Report the real outcome; a passing claim
+that isn't backed by a run_tests() result is worse than admitting the gap."""
+
+
+def _test_agent_user_msg(
+    app_name: str,
+    template_key: str,
+    plan: dict[str, Any] | None,
+    prompt: str,
+    workspace: Path | None = None,
+    exec_summary: str = "",
+) -> str:
+    framework = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(
+        template_key, template_key
+    )
+    plan_section = (
+        f"Execution plan (files_to_create / files_to_modify tell you what changed):\n"
+        f"{json.dumps(plan, indent=2)}"
+        if plan
+        else "No structured plan — infer what changed from the request and the summary below."
+    )
+    core_prompt = (
+        prompt.split("\nCURRENT REQUEST\n", 1)[-1].strip()
+        if "\nCURRENT REQUEST\n" in prompt
+        else prompt
+    )
+    exec_section = (
+        f"\nWhat the executor reported doing:\n{exec_summary.strip()[:1500]}\n"
+        if exec_summary
+        else ""
+    )
+
+    workspace_section = ""
+    if workspace is not None:
+        workspace_section = (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "CURRENT FILE TREE\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + _scan_workspace(workspace) + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
+    return (
+        f"App: {app_name}\nFramework: {framework}\n\n"
+        f"Change that was implemented:\n{core_prompt[:600]}\n"
+        f"{exec_section}\n"
+        f"{plan_section}\n"
+        f"{workspace_section}\n"
+        "Read an existing test to match the project's style, write tests for the new "
+        "behaviour, run them, then output your brief starting with TESTS:"
+    )
+
+
 _SECURITY_SYSTEM = """You are the Forgefy Security Agent. You run AFTER the validator to review the implementation for security vulnerabilities.
 
 ══════════════════════════════════════════
@@ -1628,6 +2555,36 @@ def run_build_agent(
     return _loop(client, model, system, workspace, user_msg, log_fn)
 
 
+def _safe_args(raw: Any) -> dict[str, Any]:
+    """Parse model-emitted tool arguments, tolerating invalid JSON.
+
+    A lone backslash in a path or regex ('C:\\apps', '\\d+') makes the raw
+    argument string unparseable. Execution can degrade to {} silently; echoing
+    that same string back into history cannot — strict providers reject the
+    whole request with a 400 from then on.
+    """
+    if isinstance(raw, dict):
+        return raw
+    text = raw if isinstance(raw, str) else "{}"
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        # Common slip: backslashes that are not valid JSON escapes. Double them
+        # so a Windows path or regex survives as a parseable string.
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", text)
+        try:
+            parsed = json.loads(repaired)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+
+def _valid_args_json(raw: Any) -> str:
+    """Return tool arguments as a JSON-object string safe to echo into history."""
+    return json.dumps(_safe_args(raw), default=str)
+
+
 def _tools_to_ollama_format(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
@@ -1652,59 +2609,181 @@ def _ollama_loop(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
-    """Ollama tool-use agent loop. Returns (summary, 0) — Ollama doesn't expose token counts."""
+    """Run the agent, then record what it did in the project's MEMORY.md.
+
+    The memory update is fired after the summary is in hand and is not awaited:
+    the caller's result must not wait on bookkeeping.
+    """
+    written: list[str] = []
+    try:
+        summary, tokens = _ollama_agent_turns(
+            base_url, model, system, workspace, initial_user_msg,
+            timeout, log_fn, cancel_fn, max_iterations, written, tools,
+        )
+    except Exception as exc:
+        # Automatic Qwen3 failover: Ollama Cloud rate-limits without warning and
+        # its retry budget is already spent by the time this fires, so finish the
+        # phase on the OpenRouter CODE chain rather than failing the build.
+        from app.ai.qwen import fallback_to_openrouter_enabled
+
+        if not fallback_to_openrouter_enabled():
+            raise
+        if log_fn:
+            # Provider-agnostic: never name backends or leak exc (it can carry
+            # URLs/keys). Detail goes to the operator log below.
+            log_fn("warning", "The primary AI service is unavailable — switching to a backup automatically…")
+        logger.warning(
+            "qwen: Ollama failed (%s) — falling back to the OpenRouter build loop", exc,
+        )
+        return _openrouter_loop(
+            system, workspace, initial_user_msg,
+            log_fn, cancel_fn, max_iterations, tools,
+        )
+    if written:
+        update_project_memory_async(workspace, initial_user_msg, summary, written)
+    return summary, tokens
+
+
+def _ollama_agent_turns(
+    base_url: str,
+    model: str,
+    system: str,
+    workspace: Path,
+    initial_user_msg: str,
+    timeout: int = 300,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+    max_iterations: int = _MAX_ITERATIONS,
+    written: list[str] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+) -> tuple[str, int]:
+    """Ollama tool-use agent loop. Returns (summary, total_tokens).
+
+    Token counts come from each response's final chunk (prompt_eval_count +
+    eval_count), so Ollama builds/updates are billed like the other backends.
+    Targets a local daemon or Ollama Cloud depending on OLLAMA_API_KEY.
+    """
+    from app.build.provider_loop import OllamaAdapter, run_agent_loop, unified_loop_enabled
+
+    if unified_loop_enabled():
+        adapter: Any = OllamaAdapter(base_url=base_url, model=model, timeout=timeout)
+        # Automatic Qwen3 failover: if this Ollama endpoint keeps failing, finish
+        # the run on the OpenRouter CODE chain instead of dying.
+        try:
+            from app.ai.qwen import fallback_to_openrouter_enabled
+
+            if fallback_to_openrouter_enabled():
+                from app.ai.openrouter import OPENROUTER_BASE_URL, code_models
+                from app.build.provider_loop import OllamaOpenRouterFallback, OpenRouterAdapter
+                from app.config import get_settings
+
+                _s = get_settings()
+                adapter = OllamaOpenRouterFallback(
+                    adapter,
+                    OpenRouterAdapter(
+                        api_key=(_s.OPENROUTER_API_KEY or "").strip(),
+                        base_url=OPENROUTER_BASE_URL,
+                        chain=code_models(),
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001 — fallback is best-effort wiring
+            logger.warning("qwen: OpenRouter fallback unavailable (%s) — Ollama only", exc)
+
+        return run_agent_loop(
+            adapter, system=system, stable=initial_user_msg, workspace=workspace,
+            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
+            tools=tools, written=written,
+        )
+
     import requests as _req
 
+    from app.ai.ollama_http import (
+        ollama_headers,
+        ollama_options,
+        open_chat_stream,
+        using_cloud,
+    )
+
     # Keep tool results short so the context doesn't balloon across iterations.
-    _TOOL_RESULT_LIMIT = 1500
+    # Cloud models run with their full context window, so they get the larger
+    # cap — the small one truncates mid-file and strands the agent.
+    _TOOL_RESULT_LIMIT = (
+        _TOOL_RESULT_LIMIT_LARGE_CTX if using_cloud() else _TOOL_RESULT_LIMIT_SMALL_CTX
+    )
     # Sliding window: system + first user msg are always kept; only the last N
     # assistant/tool pairs are retained so the context stays within num_ctx.
-    _HISTORY_PAIRS = 6  # = 12 messages max in the rolling window
+    # Cloud models have a far larger window, so keep more of the build history.
+    _HISTORY_PAIRS = 20 if using_cloud() else 6
 
     url = f"{base_url.rstrip('/')}/api/chat"
-    ollama_tools = _tools_to_ollama_format(TOOLS)
-    # Slot 0 = system, slot 1 = initial user task — never dropped.
-    anchor: list[dict[str, Any]] = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": initial_user_msg},
-    ]
+    headers = ollama_headers()
+    options = ollama_options(num_ctx=8192, num_predict=4096)
+    ollama_tools = _tools_to_ollama_format(tools if tools is not None else TOOLS)
+
+    # Prior runs' notes, if any. Injected rather than left for the agent to find:
+    # an optional read is a read the model usually skips, and the whole point is
+    # to start with the layout already known. Logged, unlike the write-back.
+    memory = read_project_memory(workspace)
+    if memory and log_fn:
+        log_fn("tool", f"Reading `{MEMORY_FILENAME}`")
+
+    # Anchor slots are never dropped by the sliding window.
+    anchor: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    if memory:
+        anchor.append({"role": "user", "content": memory_context_block(memory)})
+    anchor.append({"role": "user", "content": initial_user_msg})
     history: list[dict[str, Any]] = []  # assistant + tool messages, pruned each turn
     last_text = ""
     write_calls = 0  # track whether the agent actually wrote any files
+    total_tokens = 0
+    nudges = 0  # bounded pushbacks when the agent talks instead of writing
+    # Read-only calls already answered since the last workspace mutation.
+    seen_reads: set[str] = set()
+    explore_streak = 0  # consecutive turns of tool use with no write_file
 
     def _trimmed_messages() -> list[dict[str, Any]]:
-        """Return anchor + the last _HISTORY_PAIRS*2 history messages."""
-        return anchor + history[-(_HISTORY_PAIRS * 2):]
+        """Return anchor + a rolling window that never orphans a tool result.
+
+        Slicing purely by count can start the window on a `tool` message whose
+        `assistant` tool_calls message was just dropped. Models handle that
+        badly — it reads as a result to a question never asked — and it shows
+        up as the agent re-running tools it has already run.
+        """
+        window = history[-(_HISTORY_PAIRS * 2):]
+        start = 0
+        while start < len(window) and window[start].get("role") == "tool":
+            start += 1
+        return anchor + window[start:]
 
     for iteration in range(max_iterations):
         if cancel_fn and cancel_fn():
             if log_fn:
                 log_fn("warning", "Agent stopped by user.")
-            return "Stopped by user.", 0
+            return "Stopped by user.", total_tokens
         warn_at = max(1, max_iterations - 10)
         if iteration == warn_at and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
         try:
             # stream=True: timeout applies per-chunk, not for the full response,
-            # so long generations don't hit the read timeout.
-            with _req.post(
+            # so long generations don't hit the read timeout. Retries rate-limit /
+            # overload responses (Ollama Cloud 429s without warning) in one place.
+            with open_chat_stream(
                 url,
-                json={
+                payload={
                     "model": model,
                     "messages": _trimmed_messages(),
                     "tools": ollama_tools,
                     "stream": True,
-                    "options": {
-                        "num_ctx": 8192,
-                        "num_predict": 4096,
-                    },
+                    "options": options,
                 },
-                timeout=(30, timeout),
-                stream=True,
+                headers=headers,
+                timeout=timeout,
+                model=model,
+                log_fn=log_fn,
             ) as resp:
-                resp.raise_for_status()
                 content_parts: list[str] = []
                 tool_calls: list[dict] = []
                 stream_buf = ""       # accumulate content tokens until a flush boundary
@@ -1751,8 +2830,17 @@ def _ollama_loop(
                                 log_fn("text", stream_buf.strip())
                                 stream_buf = ""
 
+                    # ── Tool calls ─────────────────────────────────────────────
+                    # These stream in on an intermediate chunk (done=False) and
+                    # the final done chunk carries an empty message, so collect
+                    # them as they arrive. Reading them off the done chunk drops
+                    # every call and leaves the agent looping on the same tool.
+                    if chunk_calls := msg.get("tool_calls"):
+                        tool_calls.extend(chunk_calls)
+
                     if chunk.get("done"):
-                        tool_calls = msg.get("tool_calls") or []
+                        # Final chunk carries token counts for this turn.
+                        total_tokens += chunk.get("prompt_eval_count", 0) + chunk.get("eval_count", 0)
                         if log_fn:
                             if think_buf.strip():
                                 log_fn("thinking", think_buf.strip())
@@ -1774,8 +2862,9 @@ def _ollama_loop(
         if content_text:
             last_text = content_text
             if "DONE" in content_text.upper():
-                if write_calls == 0:
-                    # Agent claimed done without writing anything — push back once
+                if write_calls == 0 and nudges < _MAX_NUDGES:
+                    # Agent claimed done without writing anything — push back
+                    nudges += 1
                     if log_fn:
                         log_fn("info", "Agent said DONE without writing files — asking it to implement…")
                     # assistant message already appended above — only add the user pushback
@@ -1789,14 +2878,17 @@ def _ollama_loop(
                     })
                     continue
                 # Don't emit done here — update_worker will use the returned summary
-                return content_text, 0
+                return content_text, total_tokens
 
         if not tool_calls:
-            if write_calls == 0 and last_text:
-                # No tool calls and no writes — push back once to get actual file output
+            if write_calls == 0 and last_text and nudges < _MAX_NUDGES:
+                # No tool calls and no writes — push back to get actual file
+                # output. Bounded: an unbounded nudge burns every iteration
+                # re-asking a model that isn't going to comply.
+                nudges += 1
                 if log_fn:
                     log_fn("info", "No files written yet — asking agent to write the code…")
-                history.append({"role": "assistant", "content": last_text})
+                # assistant message already appended above — only add the pushback
                 history.append({
                     "role": "user",
                     "content": (
@@ -1806,8 +2898,9 @@ def _ollama_loop(
                 })
                 continue
             # Don't emit done here — update_worker will use the returned summary
-            return last_text or "Done.", 0
+            return last_text or "Done.", total_tokens
 
+        wrote_this_turn = False
         for call in tool_calls:
             func = call.get("function", {})
             tool_name = func.get("name", "")
@@ -1817,22 +2910,76 @@ def _ollama_loop(
                     tool_input = json.loads(tool_input)
                 except json.JSONDecodeError:
                     tool_input = {}
-            if tool_name == "write_file":
+            if tool_name in _WRITE_TOOLS:
                 write_calls += 1
+                wrote_this_turn = True
+                if written is not None and (p := tool_input.get("path")):
+                    written.append(str(p))
                 if log_fn:
                     log_fn("file_written", tool_input.get("path", ""))
+
+            call_key = f"{tool_name}:{json.dumps(tool_input, sort_keys=True, default=str)}"
+            is_repeat = tool_name in _READ_ONLY_TOOLS and call_key in seen_reads
             if log_fn:
-                log_fn("tool", tool_message(tool_name, tool_input))
-            result = execute_tool(tool_name, tool_input, workspace, log_fn)
+                # Mark repeats explicitly — an identical-looking log line for a
+                # suppressed call makes a stuck agent impossible to spot.
+                label = tool_message(tool_name, tool_input)
+                log_fn("tool", f"{label} — already read, skipping" if is_repeat else label)
+
+            if is_repeat:
+                # Serving this from a notice rather than re-running it is the
+                # point: re-executing costs a full tool result in context every
+                # time and teaches the model nothing new.
+                result = (
+                    f"[You already ran {tool_name} with these exact arguments and "
+                    "the workspace has not changed since. The result is the same. "
+                    "Stop inspecting and make the change now with write_file.]"
+                )
+            else:
+                result = execute_tool(tool_name, tool_input, workspace, log_fn)
+                if tool_name in _READ_ONLY_TOOLS:
+                    seen_reads.add(call_key)
+                else:
+                    # The workspace changed, so earlier reads may be stale.
+                    seen_reads.clear()
             # Truncate large results (e.g. read_file on a big file) so they
             # don't blow up the context window on the next iteration.
-            if len(result) > _TOOL_RESULT_LIMIT:
-                result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
-            history.append({"role": "tool", "content": result})
+            result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
+            # tool_name is required — without it the model cannot tell which
+            # call a result answers and tends to just issue the call again.
+            history.append({"role": "tool", "tool_name": tool_name, "content": result})
+
+        # Bounded exploration: a run of tool-only turns with nothing written
+        # means the agent is stuck surveying. Push it to act, once per streak.
+        explore_streak = 0 if wrote_this_turn else explore_streak + 1
+        if explore_streak >= _MAX_EXPLORE_STREAK:
+            if nudges < _MAX_NUDGES:
+                nudges += 1
+                explore_streak = 0
+                if log_fn:
+                    log_fn("info", "Agent is still exploring — asking it to start writing…")
+                history.append({
+                    "role": "user",
+                    "content": (
+                        f"You have used {_MAX_EXPLORE_STREAK} turns inspecting the project "
+                        "without writing anything. You have enough context. Implement the "
+                        "change now with write_file, then reply DONE."
+                    ),
+                })
+            else:
+                # Pushed to act and still only surveying. Every further turn
+                # re-sends the whole context for no progress, which is how a
+                # single request burns hundreds of thousands of tokens.
+                if log_fn:
+                    log_fn("warning", "Agent kept exploring without making changes — stopping.")
+                return (
+                    last_text or "Agent stopped: explored the project without making changes.",
+                    total_tokens,
+                )
 
     if log_fn:
         log_fn("warning", "Agent reached iteration limit.")
-    return "Agent reached iteration limit.", 0
+    return "Agent reached iteration limit.", total_tokens
 
 
 def run_build_agent_ollama(
@@ -1845,7 +2992,7 @@ def run_build_agent_ollama(
     timeout: int = 300,
     log_fn: Callable[[str, str], None] | None = None,
 ) -> tuple[str, int]:
-    """Run the build agent using local Ollama with tool calls; return (summary, 0)."""
+    """Run the build agent using local Ollama with tool calls; return (summary, total_tokens)."""
     system = _build_system(template_key)
     user_msg = (
         f"App name: {app_name}\n"
@@ -1931,6 +3078,96 @@ def _scan_workspace(workspace: Path, max_files: int = 300) -> str:
     return "\n".join(lines) if lines else "(empty workspace)"
 
 
+# ── Project map ──────────────────────────────────────────────────────────────
+# A flat path list tells the agent WHICH files exist but not what's in them, so
+# it reads file-by-file to locate code. The project map adds each source file's
+# top-level symbols (classes, widgets, components, functions, hooks) via cheap
+# regex — no LLM calls — so the agent can jump straight to the right file.
+_MAP_SOURCE_EXTS = frozenset({".dart", ".ts", ".tsx", ".js", ".jsx"})
+_MAP_MAX_FILES = 250
+_MAP_MAX_CHARS = 8000
+_MAP_MAX_SYMBOLS = 8
+
+# Dart: classes/mixins/enums (widgets, blocs, states, models) + top-level funcs.
+_DART_TYPE_RE = re.compile(r"^\s*(?:abstract\s+)?(?:class|mixin|enum)\s+(\w+)", re.M)
+_DART_FUNC_RE = re.compile(
+    r"^\s*(?:Future<[^>]*>|Stream<[^>]*>|List<[^>]*>|void|Widget|String|int|bool|double)\s+(\w+)\s*\(",
+    re.M,
+)
+# TS/JS: exported functions/classes/consts/interfaces/types/enums (React
+# components, hooks, services, prop types) — exports are the public surface.
+_TS_EXPORT_RE = re.compile(
+    r"^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|interface|type|enum)\s+(\w+)",
+    re.M,
+)
+
+
+def _extract_symbols(path: Path, text: str) -> list[str]:
+    """Return up to _MAP_MAX_SYMBOLS top-level symbol names declared in a file."""
+    ext = path.suffix.lower()
+    names: list[str] = []
+    if ext == ".dart":
+        names += _DART_TYPE_RE.findall(text)
+        names += _DART_FUNC_RE.findall(text)
+    elif ext in (".ts", ".tsx", ".js", ".jsx"):
+        names += _TS_EXPORT_RE.findall(text)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+        if len(out) >= _MAP_MAX_SYMBOLS:
+            break
+    return out
+
+
+def _build_project_map(workspace: Path) -> str:
+    """Return `path: symbol, symbol, …` lines for source files, `path` otherwise.
+
+    Lets the agent locate code by symbol without reading every file. Capped by
+    file count and total chars so it stays within the context budget; non-source
+    files still appear (path only) so the dedup guidance keeps working.
+    """
+    lines: list[str] = []
+    total = 0
+    count = 0
+    try:
+        for p in sorted(workspace.rglob("*")):
+            if count >= _MAP_MAX_FILES:
+                lines.append(f"… (truncated at {_MAP_MAX_FILES} files)")
+                break
+            rel_parts = p.parts[len(workspace.parts):]
+            if any(part.startswith(".") or part in _SCAN_SKIP_DIRS for part in rel_parts):
+                continue
+            if not p.is_file():
+                continue
+            suffix = p.suffix.lower()
+            if suffix in _SCAN_SKIP_EXTS:
+                continue
+
+            rel = p.relative_to(workspace).as_posix()  # forward slashes, matches write_file paths
+            if suffix in _MAP_SOURCE_EXTS:
+                try:
+                    symbols = _extract_symbols(p, p.read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    symbols = []
+                line = f"{rel}: {', '.join(symbols)}" if symbols else rel
+            else:
+                line = rel
+
+            if total + len(line) + 1 > _MAP_MAX_CHARS:
+                lines.append("… (truncated — map size limit reached)")
+                break
+            lines.append(line)
+            total += len(line) + 1
+            count += 1
+    except Exception:
+        pass
+    return "\n".join(lines) if lines else "(empty workspace)"
+
+
 def _get_installed_packages(workspace: Path) -> str:
     """Read pubspec.yaml or package.json and return the installed dependency names.
 
@@ -1990,7 +3227,7 @@ def _update_user_msg(
     prefix = _plan_prefix(plan) if plan else ""
 
     # Inject the canonical folder structure so the agent puts files in the right place
-    structure_rules = _UPDATE_STRUCTURE_RULES.get(template_key, "")
+    structure_rules = _update_structure_rules(template_key)
     structure_section = (
         "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "MANDATORY FOLDER STRUCTURE — all new files must follow this\n"
@@ -2001,7 +3238,7 @@ def _update_user_msg(
 
     file_listing = ""
     if workspace is not None:
-        scan = _scan_workspace(workspace)
+        scan = _build_project_map(workspace)
         git_log = _get_git_log(workspace)
         recent_files = _get_recent_changed_files(workspace)
         installed_pkgs = _get_installed_packages(workspace)
@@ -2036,16 +3273,22 @@ def _update_user_msg(
             git_section
             + pkg_section
             + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "EXISTING PROJECT FILES — read before creating anything\n"
+            "PROJECT MAP — every file and its key symbols\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Before calling write_file for any new file:\n"
-            "  1. Search this list for any file with the SAME NAME.\n"
-            "  2. Search for any file that serves the SAME PURPOSE\n"
+            "Each line is `path: symbols` — the classes, widgets, components, functions and\n"
+            "hooks defined in that file. USE THIS MAP to find the right file to change. Do\n"
+            "NOT read files one by one to discover where things are — the map already tells\n"
+            "you. Only call read_file when you need a specific file's full contents to edit\n"
+            "it, and prefer reading the 1–3 files the map shows are relevant.\n"
+            "The map shows where symbols are DEFINED, not every place they are USED — for\n"
+            "multi-file changes, or anything the map doesn't clearly name, use grep first\n"
+            "(see HOW TO USE THE FILE TOOLS).\n\n"
+            "Before calling write_file for a NEW file:\n"
+            "  1. Scan the map for a file with the SAME NAME or SAME PURPOSE\n"
             "     (e.g. auth_service.dart ≈ authentication_service.dart,\n"
             "      home_screen.dart ≈ home_page.dart, userApi.ts ≈ user_service.ts).\n"
-            "  3. If found → read it first, then WRITE YOUR CHANGES TO THAT EXISTING PATH.\n"
-            "  4. Only create a brand-new path if you confirm nothing similar already exists.\n"
-            "  NEVER create a second file that does the same job as an existing one.\n\n"
+            "  2. If found → edit THAT existing path. NEVER create a second file that does\n"
+            "     the same job as an existing one.\n\n"
             + scan + "\n"
             + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         )
@@ -2074,26 +3317,37 @@ def _update_user_msg_with_brief(
     plan: dict[str, Any] | None,
     workspace: Path | None,
     design_brief: str,
+    schema_brief: str = "",
 ) -> str:
-    """Like _update_user_msg but prepends the design agent's output so the executor knows
-    exactly which components and tokens were prepared."""
+    """Like _update_user_msg but prepends the design and schema agents' output so the
+    executor knows exactly which components, tokens, tables and columns were prepared."""
     base = _update_user_msg(app_name, template_key, blueprint, prompt, plan, workspace)
-    if not design_brief:
-        return base
-    brief_block = (
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "DESIGN SYSTEM BRIEF — use these components and tokens\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        + design_brief.strip() + "\n"
-        + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-    return brief_block + base
+    blocks = ""
+    if schema_brief:
+        blocks += (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "DATABASE SCHEMA BRIEF — query these tables and columns, invent no others\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + schema_brief.strip() + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+    if design_brief:
+        blocks += (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "DESIGN SYSTEM BRIEF — use these components and tokens\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + design_brief.strip() + "\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+    return blocks + base
 
 
 # Per-agent iteration budgets — focused agents get fewer iterations to save tokens
 _ITERS_DESIGN = 30
+_ITERS_SCHEMA = 20
 _ITERS_EXEC = 50
 _ITERS_VALIDATE = 25
+_ITERS_TEST = 25
 _ITERS_SECURITY = 20
 _ITERS_FIX = 100
 
@@ -2111,32 +3365,287 @@ def _should_skip_design(plan: dict[str, Any] | None) -> bool:
     )
 
 
+def _should_skip_schema(plan: dict[str, Any] | None, blueprint: dict[str, Any]) -> bool:
+    """Skip the schema phase only when the planner says nothing is stored.
+
+    Unlike _should_skip_design there is no heuristic fallback: a missing plan means
+    run the phase. Guessing wrong the other way leaves the executor writing queries
+    against tables that were never defined, which fails at runtime rather than at
+    build time.
+    """
+    if plan and plan.get("skip_schema_agent"):
+        # A planner "skip" is overridden when the blueprint carries an explicit data
+        # model — entities in the blueprint are direct evidence that something is stored.
+        return not (blueprint.get("entities") or [])
+    return False
+
+
+def _should_skip_test(plan: dict[str, Any] | None) -> bool:
+    """Skip the test phase only when the planner says nothing testable changed.
+
+    No plan means run it. There is no blueprint-level evidence to override with
+    (unlike the schema gate) — the plan is the only signal about whether the
+    change introduced behaviour worth asserting on.
+    """
+    if not plan:
+        return False
+    return bool(plan.get("skip_test_agent"))
+
+
 def _should_skip_security(plan: dict[str, Any] | None) -> bool:
     if not plan:
         return False
     return bool(plan.get("skip_security_agent"))
 
 
-def _validation_needs_fix_pass(val_summary: str) -> bool:
-    """Return True when the validator did not emit a clean VALIDATED: report.
+# Phases that review rather than build, and so must file a structured report.
+_REPORTING_PHASES = ("validate", "test", "security")
+# The tool set those phases get: everything, plus the reporting tool.
+_REVIEW_TOOLS = [*TOOLS, REPORT_FINDINGS_TOOL]
 
-    A clean report means the validator finished its workflow and signed off with
-    a VALIDATED: line. Anything else (role explanation, timeout, error dump) means
-    the executor should get a targeted fix pass with the validator's findings.
+# Appended to a reviewing phase's system prompt. The instruction has to be
+# explicit and last, because the whole fix-pass decision now rests on the call
+# being made — a phase that forgets is treated as unresolved.
+_REPORT_INSTRUCTION = """
+
+══════════════════════════════════════════
+YOU MUST REPORT YOUR RESULT
+══════════════════════════════════════════
+Before your final message, call report_findings exactly once.
+  • Nothing needs fixing → status='clean', findings=[]
+  • Something is genuinely broken → status='issues_found' with one entry per
+    problem, each naming the file it is in.
+  • Anything you already fixed during this phase is NOT a finding. Report the
+    state of the code as you are leaving it, not the problems you solved.
+This call, not your prose, decides whether an expensive fix pass runs. Failing to
+call it is treated as an unresolved failure.
+"""
+
+
+def _needs_fix_pass(report: dict[str, Any]) -> bool:
+    """Return True when the validator's structured report says work remains.
+
+    Reads a field the validator set deliberately, rather than sniffing its prose
+    for a "VALIDATED:" prefix. The old test called a clean review dirty whenever
+    the model phrased its sign-off naturally, signed off with DONE, or returned
+    an empty summary — each of which spent a 100-iteration fix pass on code that
+    was already correct.
     """
-    vs = val_summary.lower().strip()
-    if "all checks passed" in vs:
-        return False
-    return not (vs.startswith("validated:") or "\nvalidated:" in vs)
+    return report.get("status") != "clean"
 
 
-def _make_fix_prompt(val_summary: str) -> str:
+def _format_findings(findings: list[dict[str, Any]]) -> str:
+    """Render findings as an ordered, addressable list for the fix pass."""
+    if not findings:
+        return "(no individual findings were listed)"
+    order = {sev: i for i, sev in enumerate(_FINDING_SEVERITIES)}
+    ranked = sorted(findings, key=lambda f: order.get(f.get("severity", ""), 99))
+    lines = []
+    for i, finding in enumerate(ranked, 1):
+        where = finding.get("file") or "(file not specified)"
+        if line := finding.get("line"):
+            where += f":{line}"
+        lines.append(
+            f"{i}. [{finding.get('severity', 'medium')}] {where} — {finding.get('summary', '')}"
+        )
+    return "\n".join(lines)
+
+
+def _make_fix_prompt(report: dict[str, Any]) -> str:
+    findings = report.get("findings") or []
+    summary = report.get("summary") or ""
     return (
         "The validator reviewed the implementation and found unresolved issues.\n\n"
-        f"Validator findings:\n{val_summary}\n\n"
-        "Fix every problem described above. Read each affected file first, then apply "
-        "the minimum change needed. Do not re-explain issues — just fix them."
+        f"Validator summary: {summary}\n\n"
+        f"Findings to fix:\n{_format_findings(findings)}\n\n"
+        "Fix every finding above. Each one names the file it is in — read that file "
+        "first, then apply the minimum change needed. Work through them in order and "
+        "do not re-explain the issues, just fix them."
     )
+
+
+# A phase runner: (system_prompt, user_msg, max_iterations) -> (summary, tokens).
+# Every backend supplies one by closing over its own tool loop; the phase sequence
+# below is then shared, so a new phase is added in exactly one place.
+RunPhase = Callable[[str, str, int], tuple[str, int]]
+
+
+def _run_update_sequence(
+    run_phase: RunPhase,
+    *,
+    workspace: Path,
+    prompt: str,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    plan: dict[str, Any] | None,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+) -> tuple[str, int]:
+    """schema? → design? → execute → validate → fix? → security?
+
+    The single definition of the update pipeline. Backends differ only in how a
+    phase is executed (which tool loop, which client args), which is what
+    ``run_phase`` abstracts — planning happens in the caller because its
+    arguments are backend-specific.
+    """
+    total_tokens = 0
+
+    # Every phase gets the shared tool-usage rules. Wrapping here rather than at
+    # each call site means a new phase cannot be added without them.
+    def _phase(system: str, user_msg: str, iters: int) -> tuple[str, int]:
+        return run_phase(_with_tool_rules(system), user_msg, iters)
+
+    def _review_phase(
+        name: str, system: str, user_msg: str, iters: int,
+    ) -> tuple[str, int, dict[str, Any]]:
+        """Run a reviewing phase and collect its structured report.
+
+        The report travels through a per-workspace store rather than the return
+        value because ``run_phase`` returns (summary, tokens) across five
+        backends; changing that contract would mean changing all five.
+        """
+        reset_report(workspace)
+        summary, tokens = run_phase(
+            _with_tool_rules(system) + _REPORT_INSTRUCTION, user_msg, iters, _REVIEW_TOOLS,
+        )
+        report = take_report(workspace) or missing_report(name)
+        findings = report.get("findings") or []
+        logger.info(
+            "phase=%s status=%s findings=%d reported=%s",
+            name, report.get("status"), len(findings), report.get("reported"),
+        )
+        if log_fn and not report.get("reported"):
+            log_fn("warning", f"{name.title()} phase ended without a result — treating as unresolved.")
+        return summary, tokens, report
+
+    def _cancelled() -> bool:
+        return bool(cancel_fn and cancel_fn())
+
+    if _cancelled():
+        return "Stopped by user.", total_tokens
+
+    # Pre-execution phases produce briefs the executor reads. Their user messages
+    # are built lazily — each one scans the workspace, which is wasted work for a
+    # phase the planner told us to skip.
+    briefs = {"schema": "", "design": ""}
+    pre_exec = (
+        (
+            "schema", "Database schema",
+            _should_skip_schema(plan, blueprint), _SCHEMA_SYSTEM, _ITERS_SCHEMA,
+            lambda: _schema_agent_user_msg(app_name, template_key, blueprint, plan, prompt, workspace),
+            "Preparing database schema…",
+            "Schema phase skipped — no new data is stored.",
+        ),
+        (
+            "design", "Design system",
+            _should_skip_design(plan), _DESIGN_AGENT_SYSTEM, _ITERS_DESIGN,
+            lambda: _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
+            "Preparing design system…",
+            "Design phase skipped — no new components or theme changes.",
+        ),
+    )
+
+    for key, label, skip, system, iters, make_msg, thinking, skip_msg in pre_exec:
+        if skip:
+            if log_fn:
+                log_fn("info", skip_msg)
+            continue
+        if log_fn:
+            log_fn("info", f"━━━ {label} phase ━━━")
+            log_fn("thinking", thinking)
+        briefs[key], tokens = _phase(system, make_msg(), iters)
+        total_tokens += tokens
+        if _cancelled():
+            return briefs[key] or "Stopped by user.", total_tokens
+
+    if log_fn:
+        log_fn("info", "━━━ Execution phase ━━━")
+    exec_summary, tokens = _phase(
+        _UPDATE_SYSTEM,
+        _update_user_msg_with_brief(
+            app_name, template_key, blueprint, prompt, plan, workspace,
+            briefs["design"], briefs["schema"],
+        ),
+        _ITERS_EXEC,
+    )
+    total_tokens += tokens
+    if _cancelled():
+        return exec_summary or "Stopped by user.", total_tokens
+
+    if log_fn:
+        log_fn("info", "━━━ Validation phase ━━━")
+        log_fn("thinking", "Validating implementation…")
+    val_summary, tokens, val_report = _review_phase(
+        "validate",
+        _VALIDATOR_SYSTEM,
+        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
+        _ITERS_VALIDATE,
+    )
+    total_tokens += tokens
+    if _cancelled():
+        return val_summary or exec_summary, total_tokens
+
+    if _needs_fix_pass(val_report):
+        found = len(val_report.get("findings") or [])
+        if log_fn:
+            log_fn("info", "━━━ Post-validation fix pass ━━━")
+            log_fn(
+                "thinking",
+                f"Validator found {found} unresolved issue(s) — running targeted fix pass…"
+                if found else "Validator did not sign off — running targeted fix pass…",
+            )
+        # The fix pass replaces the validator's summary — it is the newer account
+        # of the same work.
+        val_summary, tokens = _phase(_UPDATE_SYSTEM, _make_fix_prompt(val_report), _ITERS_FIX)
+        total_tokens += tokens
+        if _cancelled():
+            return val_summary or exec_summary, total_tokens
+    elif log_fn:
+        log_fn("info", "Validation clean — no fix pass needed.")
+
+    # Tests run after the fix pass, so they assert against code that compiles —
+    # a test suite written against known-broken code just re-reports the same
+    # failure the validator already found.
+    if not _should_skip_test(plan):
+        if log_fn:
+            log_fn("info", "━━━ Test phase ━━━")
+            log_fn("thinking", "Writing and running tests…")
+        # The test brief is surfaced to the user rather than fed forward: it is
+        # evidence about the work, not input to a later phase.
+        test_summary, tokens, _test_report = _review_phase(
+            "test",
+            _TEST_SYSTEM,
+            _test_agent_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
+            _ITERS_TEST,
+        )
+        total_tokens += tokens
+        if test_summary.strip() and log_fn:
+            log_fn("info", test_summary.strip()[:500])
+        if _cancelled():
+            return val_summary or exec_summary, total_tokens
+    elif log_fn:
+        log_fn("info", "Test phase skipped — no testable logic changed.")
+
+    if not _should_skip_security(plan):
+        if log_fn:
+            log_fn("info", "━━━ Security review phase ━━━")
+            log_fn("thinking", "Reviewing for security issues…")
+        # The security agent fixes what it finds in place; its prose isn't
+        # surfaced, so only its token cost and finding count are kept.
+        _, tokens, sec_report = _review_phase(
+            "security",
+            _SECURITY_SYSTEM,
+            _security_user_msg(app_name, template_key, plan, prompt, workspace),
+            _ITERS_SECURITY,
+        )
+        total_tokens += tokens
+        if log_fn and (sec_findings := len(sec_report.get("findings") or [])):
+            log_fn("info", f"Security review: {sec_findings} issue(s) addressed.")
+    elif log_fn:
+        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
+
+    return val_summary or exec_summary, total_tokens
 
 
 def run_update_agent(
@@ -2159,77 +3668,22 @@ def run_update_agent(
     )
     _log_plan(plan, log_fn)
     client = anthropic.Anthropic(api_key=api_key)
-    total_tokens = 0
 
-    if cancel_fn and cancel_fn():
-        return "Stopped by user.", 0
-
-    design_summary = ""
-    if not _should_skip_design(plan):
-        if log_fn:
-            log_fn("info", "━━━ Design system phase ━━━")
-            log_fn("thinking", "Preparing design system…")
-        design_summary, design_tokens = _loop(
-            client, model, _DESIGN_AGENT_SYSTEM, workspace,
-            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+    def run_phase(
+        system: str, user_msg: str, iters: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, int]:
+        return _loop(
+            client, model, system, workspace, user_msg,
+            log_fn, cancel_fn, max_iterations=iters,
+            tools=tools,
         )
-        total_tokens += design_tokens
-        if cancel_fn and cancel_fn():
-            return design_summary or "Stopped by user.", total_tokens
-    elif log_fn:
-        log_fn("info", "Design phase skipped — no new components or theme changes.")
 
-    if log_fn:
-        log_fn("info", "━━━ Execution phase ━━━")
-    exec_summary, exec_tokens = _loop(
-        client, model, _UPDATE_SYSTEM, workspace,
-        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
+    return _run_update_sequence(
+        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
+        app_name=app_name, template_key=template_key, plan=plan,
+        log_fn=log_fn, cancel_fn=cancel_fn,
     )
-    total_tokens += exec_tokens
-    if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", total_tokens
-
-    if log_fn:
-        log_fn("info", "━━━ Validation phase ━━━")
-        log_fn("thinking", "Validating implementation…")
-    val_summary, val_tokens = _loop(
-        client, model, _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
-    )
-    total_tokens += val_tokens
-    if cancel_fn and cancel_fn():
-        return val_summary or exec_summary, total_tokens
-
-    if _validation_needs_fix_pass(val_summary):
-        if log_fn:
-            log_fn("info", "━━━ Post-validation fix pass ━━━")
-            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
-        fix_summary, fix_tokens = _loop(
-            client, model, _UPDATE_SYSTEM, workspace,
-            _make_fix_prompt(val_summary), log_fn, cancel_fn, max_iterations=_ITERS_FIX,
-        )
-        total_tokens += fix_tokens
-        val_summary = fix_summary
-        if cancel_fn and cancel_fn():
-            return val_summary or exec_summary, total_tokens
-
-    if not _should_skip_security(plan):
-        if log_fn:
-            log_fn("info", "━━━ Security review phase ━━━")
-            log_fn("thinking", "Reviewing for security issues…")
-        sec_summary, sec_tokens = _loop(
-            client, model, _SECURITY_SYSTEM, workspace,
-            _security_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
-        )
-        total_tokens += sec_tokens
-    elif log_fn:
-        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
-
-    return val_summary or exec_summary, total_tokens
 
 
 def run_update_agent_ollama(
@@ -2252,77 +3706,22 @@ def run_update_agent_ollama(
         backend="Qwen3", base_url=base_url, ollama_model=model, ollama_timeout=timeout,
     )
     _log_plan(plan, log_fn)
-    total_tokens = 0
 
-    if cancel_fn and cancel_fn():
-        return "Stopped by user.", 0
-
-    design_summary = ""
-    if not _should_skip_design(plan):
-        if log_fn:
-            log_fn("info", "━━━ Design system phase ━━━")
-            log_fn("thinking", "Preparing design system…")
-        design_summary, design_tokens = _ollama_loop(
-            base_url, model, _DESIGN_AGENT_SYSTEM, workspace,
-            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
-            timeout, log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+    def run_phase(
+        system: str, user_msg: str, iters: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, int]:
+        return _ollama_loop(
+            base_url, model, system, workspace, user_msg,
+            timeout, log_fn, cancel_fn, max_iterations=iters,
+            tools=tools,
         )
-        total_tokens += design_tokens
-        if cancel_fn and cancel_fn():
-            return design_summary or "Stopped by user.", total_tokens
-    elif log_fn:
-        log_fn("info", "Design phase skipped — no new components or theme changes.")
 
-    if log_fn:
-        log_fn("info", "━━━ Execution phase ━━━")
-    exec_summary, exec_tokens = _ollama_loop(
-        base_url, model, _UPDATE_SYSTEM, workspace,
-        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
-        timeout, log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
+    return _run_update_sequence(
+        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
+        app_name=app_name, template_key=template_key, plan=plan,
+        log_fn=log_fn, cancel_fn=cancel_fn,
     )
-    total_tokens += exec_tokens
-    if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", total_tokens
-
-    if log_fn:
-        log_fn("info", "━━━ Validation phase ━━━")
-        log_fn("thinking", "Validating implementation…")
-    val_summary, val_tokens = _ollama_loop(
-        base_url, model, _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
-        timeout, log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
-    )
-    total_tokens += val_tokens
-    if cancel_fn and cancel_fn():
-        return val_summary or exec_summary, total_tokens
-
-    if _validation_needs_fix_pass(val_summary):
-        if log_fn:
-            log_fn("info", "━━━ Post-validation fix pass ━━━")
-            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
-        fix_summary, fix_tokens = _ollama_loop(
-            base_url, model, _UPDATE_SYSTEM, workspace,
-            _make_fix_prompt(val_summary), timeout, log_fn, cancel_fn, max_iterations=_ITERS_FIX,
-        )
-        total_tokens += fix_tokens
-        val_summary = fix_summary
-        if cancel_fn and cancel_fn():
-            return val_summary or exec_summary, total_tokens
-
-    if not _should_skip_security(plan):
-        if log_fn:
-            log_fn("info", "━━━ Security review phase ━━━")
-            log_fn("thinking", "Reviewing for security issues…")
-        sec_summary, sec_tokens = _ollama_loop(
-            base_url, model, _SECURITY_SYSTEM, workspace,
-            _security_user_msg(app_name, template_key, plan, prompt, workspace),
-            timeout, log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
-        )
-        total_tokens += sec_tokens
-    elif log_fn:
-        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
-
-    return val_summary or exec_summary, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -2330,12 +3729,86 @@ def run_update_agent_ollama(
 # ---------------------------------------------------------------------------
 
 _GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-_TOOL_RESULT_LIMIT = 1500
+# Gemini 2.5 Flash has a 1M-token context, so the old 1,500-char cap was starving
+# it for no reason: a stylesheet or a component came back as a fragment, and the
+# agent spent its whole phase paging through the same file with read_file offsets
+# trying to see the rest. Use the same large-context cap as the Claude path.
+_TOOL_RESULT_LIMIT = _TOOL_RESULT_LIMIT_LARGE_CTX
+# Rolling window, in model/tool-response pairs, so a long phase stops resending
+# every earlier turn.
+_GEMINI_HISTORY_PAIRS = 20
 
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 _GEMINI_MAX_RETRIES = 4
 _GEMINI_BASE_DELAY_S = 5.0
+
+# Client-side pacing, learned from 429s rather than configured. An agent phase
+# fires requests back to back with no gap, so even a single user can trip a
+# per-minute limit within seconds — it is our own request rate, not anyone
+# else's load. Starts at zero so a key with headroom pays nothing for this; the
+# first rate-limit response sets it, and it decays once requests get through
+# cleanly. Process-local and advisory: worker concurrency is not accounted for.
+_gemini_min_interval_s = 0.0
+_gemini_last_request_at = 0.0
+_GEMINI_MAX_INTERVAL_S = 30.0
+
+
+def _gemini_pace() -> None:
+    """Sleep just long enough to honour the learned minimum request interval."""
+    global _gemini_last_request_at
+    if _gemini_min_interval_s > 0:
+        wait = _gemini_min_interval_s - (time.monotonic() - _gemini_last_request_at)
+        if wait > 0:
+            logger.debug("Gemini pacing: sleeping %.1fs before next request", wait)
+            time.sleep(wait)
+    _gemini_last_request_at = time.monotonic()
+
+
+def _gemini_note_rate_limit(retry_delay: float | None) -> None:
+    """Raise the pacing interval after a rate-limit response."""
+    global _gemini_min_interval_s
+    # Google's own RetryInfo is authoritative when present. The fallback is a
+    # guess at a typical free-tier allowance (~10 requests/minute) used only
+    # until a response tells us better.
+    target = retry_delay if retry_delay and retry_delay > 0 else 6.0
+    _gemini_min_interval_s = min(max(_gemini_min_interval_s, target), _GEMINI_MAX_INTERVAL_S)
+
+
+def _gemini_note_success() -> None:
+    """Relax pacing gradually while requests are getting through."""
+    global _gemini_min_interval_s
+    if _gemini_min_interval_s > 0:
+        _gemini_min_interval_s = max(0.0, _gemini_min_interval_s * 0.9 - 0.1)
+
+
+def _gemini_error_details(resp: Any) -> tuple[float | None, list[str], str]:
+    """Pull (retry_delay_seconds, quota_ids, message) out of a Gemini error body.
+
+    Defensive: an error body that does not match the documented shape yields
+    empty values rather than raising inside the retry loop.
+    """
+    try:
+        error = (resp.json() or {}).get("error") or {}
+    except ValueError:
+        return None, [], resp.text[:300]
+
+    retry_delay: float | None = None
+    quota_ids: list[str] = []
+    for detail in error.get("details") or []:
+        kind = str(detail.get("@type", ""))
+        if kind.endswith("RetryInfo"):
+            raw = str(detail.get("retryDelay", "")).rstrip("s")
+            try:
+                retry_delay = float(raw)
+            except ValueError:
+                retry_delay = None
+        elif kind.endswith("QuotaFailure"):
+            quota_ids += [
+                str(v.get("quotaId") or v.get("quotaMetric") or "")
+                for v in detail.get("violations") or []
+            ]
+    return retry_delay, quota_ids, str(error.get("message") or "")[:300]
 
 
 def _gemini_post_with_retry(
@@ -2356,36 +3829,85 @@ def _gemini_post_with_retry(
 
     delay = _GEMINI_BASE_DELAY_S
     last_exc: Exception | None = None
+    told_user = False
+    hit_rate_limit = False
 
     for attempt in range(_GEMINI_MAX_RETRIES + 1):
+        _gemini_pace()
         try:
             resp = _req.post(url, params={"key": api_key}, json=payload, timeout=timeout)
         except _req.exceptions.RequestException as exc:
             last_exc = exc
+            # A connection error is a local/network problem, never someone
+            # else's load — say so rather than blaming demand.
+            if log_fn and not told_user:
+                told_user = True
+                # Provider-agnostic: users never see which backend is serving.
+                log_fn("warning", "The AI service is briefly unreachable — checking the connection…")
+            logger.warning("Gemini unreachable for %s", url)
         else:
             if resp.status_code not in _RETRYABLE_STATUS_CODES:
                 resp.raise_for_status()
+                # Only a clean first-try success is evidence the limit has
+                # lifted. A success that happened *because* we just backed off
+                # is evidence the backoff worked, so it must not undo it.
+                if not hit_rate_limit:
+                    _gemini_note_success()
                 return resp.json()
-            # 429 covers both "too many requests" (worth retrying) and
-            # depleted prepaid credits (RESOURCE_EXHAUSTED — retrying is
-            # futile, it'll return the exact same response every time).
-            if "RESOURCE_EXHAUSTED" in resp.text and "credit" in resp.text.lower():
-                raise RuntimeError(
-                    "Gemini prepayment credits are depleted. Add credits at "
-                    "https://ai.studio/projects, or switch BUILD_MODEL to "
-                    "'claude' or 'gpt' in .env."
+
+            retry_delay, quota_ids, message = _gemini_error_details(resp)
+            quota_blob = " ".join(quota_ids).lower()
+
+            if resp.status_code == 429:
+                # Depleted prepaid credits: retrying returns the identical
+                # response every time, so fail immediately with the real fix.
+                if "credit" in resp.text.lower():
+                    raise RuntimeError(
+                        "Gemini prepayment credits are depleted. Add credits at "
+                        "https://ai.studio/projects, or switch BUILD_MODEL to "
+                        "'claude' or 'gpt' in .env."
+                    )
+                # A per-DAY quota will not clear within this build either.
+                if "perday" in quota_blob.replace("_", ""):
+                    raise RuntimeError(
+                        "Gemini daily request quota is exhausted for this API key "
+                        f"({', '.join(quota_ids) or 'per-day limit'}). It resets at "
+                        "midnight Pacific. Enable billing on the key, or switch "
+                        "BUILD_MODEL to 'claude' or 'gpt' in .env."
+                    )
+                # Per-minute limit: genuinely transient, and it is our own
+                # request rate. Pace subsequent calls so we stop causing it.
+                hit_rate_limit = True
+                _gemini_note_rate_limit(retry_delay)
+                if log_fn and not told_user:
+                    told_user = True
+                    # Provider-agnostic for users; the billing hint is operator
+                    # information and stays in the log below.
+                    log_fn(
+                        "warning",
+                        "The AI is in high demand right now — pacing requests to stay reliable.",
+                    )
+                logger.info(
+                    "Gemini 429 (%s) — pacing to %.1fs between requests: %s "
+                    "(hint: enabling billing on the API key removes this limit)",
+                    ", ".join(quota_ids) or "rate limit", _gemini_min_interval_s, message,
                 )
+            elif log_fn and not told_user:
+                # 5xx really is Google's problem — the original wording fits here.
+                told_user = True
+                log_fn("thinking", "High demand right now — taking a short pause, hang tight…")
+
             last_exc = _req.exceptions.HTTPError(
-                f"{resp.status_code} {resp.reason} for {url}: {resp.text[:300]}"
+                f"{resp.status_code} {resp.reason} for {url}: {message or resp.text[:300]}"
             )
+            if retry_delay and retry_delay > 0:
+                # Google told us exactly how long to wait; guessing is worse.
+                delay = max(delay, retry_delay)
 
         if attempt < _GEMINI_MAX_RETRIES:
-            if log_fn:
-                log_fn(
-                    "warning",
-                    f"Gemini API busy — retrying in {delay:.0f}s "
-                    f"(attempt {attempt + 1}/{_GEMINI_MAX_RETRIES})…",
-                )
+            logger.info(
+                "Gemini retry %d/%d in %.0fs", attempt + 1, _GEMINI_MAX_RETRIES, delay
+            )
             time.sleep(delay)
             delay *= 2
 
@@ -2412,20 +3934,48 @@ def _gemini_loop(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
-    """Gemini tool-use agent loop via REST API. Returns (summary, 0)."""
+    """Gemini tool-use agent loop via REST API. Returns (summary, total_tokens)."""
+    from app.build.provider_loop import GeminiAdapter, run_agent_loop, unified_loop_enabled
+
+    if unified_loop_enabled():
+        adapter = GeminiAdapter(api_key=api_key, model=model)
+        return run_agent_loop(
+            adapter, system=system, stable=initial_user_msg, workspace=workspace,
+            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
+            tools=tools,
+        )
+
     url = _GEMINI_URL.format(model=model)
-    gemini_tools = _tools_to_gemini_format(TOOLS)
+    gemini_tools = _tools_to_gemini_format(tools if tools is not None else TOOLS)
     contents: list[dict[str, Any]] = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
     last_text = ""
     write_calls = 0
-    pushback_sent = False
+    nudges = 0  # bounded pushbacks when the agent talks instead of writing
+    total_tokens = 0
+    # Read-only calls already answered since the last workspace mutation.
+    seen_reads: set[str] = set()
+    explore_streak = 0  # consecutive turns of tool use with no write
+
+    def _trimmed_contents() -> list[dict[str, Any]]:
+        """First user turn + a window that never orphans a functionResponse.
+
+        Gemini rejects a functionResponse whose functionCall is no longer in the
+        history, so the window advances to the next model turn rather than
+        slicing blindly by count.
+        """
+        window = contents[1:][-(_GEMINI_HISTORY_PAIRS * 2):]
+        start = 0
+        while start < len(window) and window[start].get("role") != "model":
+            start += 1
+        return contents[:1] + window[start:]
 
     for iteration in range(max_iterations):
         if cancel_fn and cancel_fn():
             if log_fn:
                 log_fn("warning", "Agent stopped by user.")
-            return "Stopped by user.", 0
+            return "Stopped by user.", total_tokens
         warn_at = max(1, max_iterations - 10)
         if iteration == warn_at and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
@@ -2435,13 +3985,16 @@ def _gemini_loop(
             api_key,
             {
                 "system_instruction": {"parts": [{"text": system}]},
-                "contents": contents,
+                "contents": _trimmed_contents(),
                 "tools": gemini_tools,
                 "generationConfig": {"maxOutputTokens": 8192},
             },
             timeout=120,
             log_fn=log_fn,
         )
+
+        # Gemini reports usage in usageMetadata.totalTokenCount (input + output).
+        total_tokens += (data.get("usageMetadata") or {}).get("totalTokenCount", 0)
 
         candidates = data.get("candidates", [])
         if not candidates:
@@ -2467,8 +4020,8 @@ def _gemini_loop(
                 tool_calls.append(part["functionCall"])
 
         if done_text is not None and not tool_calls:
-            if write_calls == 0 and not pushback_sent:
-                pushback_sent = True
+            if write_calls == 0 and nudges < _MAX_NUDGES:
+                nudges += 1
                 if log_fn:
                     log_fn("info", "Agent said DONE without writing files — asking it to implement…")
                 contents.append({"role": "user", "parts": [{"text": (
@@ -2476,40 +4029,85 @@ def _gemini_loop(
                     "Implement the changes now using write_file."
                 )}]})
                 continue
-            return done_text, 0
+            return done_text, total_tokens
 
         if finish_reason in ("STOP", "MAX_TOKENS") and not tool_calls:
-            if write_calls == 0 and not pushback_sent:
-                pushback_sent = True
+            if write_calls == 0 and nudges < _MAX_NUDGES:
+                nudges += 1
                 if log_fn:
                     log_fn("info", "No files written yet — asking agent to write the code…")
                 contents.append({"role": "user", "parts": [{"text": (
                     "You haven't written any files yet. Use write_file to implement the changes."
                 )}]})
                 continue
-            return last_text or "Done.", 0
+            return last_text or "Done.", total_tokens
 
         tool_responses: list[dict] = []
+        wrote_this_turn = False
         for call in tool_calls:
             tool_name = call.get("name", "")
             tool_input = call.get("args", {})
-            if tool_name == "write_file":
+            if tool_name in _WRITE_TOOLS:
                 write_calls += 1
+                wrote_this_turn = True
                 if log_fn:
                     log_fn("file_written", tool_input.get("path", ""))
+
+            call_key = f"{tool_name}:{json.dumps(tool_input, sort_keys=True, default=str)}"
+            is_repeat = tool_name in _READ_ONLY_TOOLS and call_key in seen_reads
             if log_fn:
-                log_fn("tool", tool_message(tool_name, tool_input))
-            result = execute_tool(tool_name, tool_input, workspace, log_fn)
-            if len(result) > _TOOL_RESULT_LIMIT:
-                result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
+                # Mark repeats explicitly — an identical-looking log line for a
+                # suppressed call makes a stuck agent impossible to spot.
+                label = tool_message(tool_name, tool_input)
+                log_fn("tool", f"{label} — already read, skipping" if is_repeat else label)
+
+            if is_repeat:
+                result = (
+                    f"[You already ran {tool_name} with these exact arguments and "
+                    "the workspace has not changed since. The result is the same. "
+                    "Stop inspecting and make the change now.]"
+                )
+            else:
+                result = execute_tool(tool_name, tool_input, workspace, log_fn)
+                if tool_name in _READ_ONLY_TOOLS:
+                    seen_reads.add(call_key)
+                else:
+                    # The workspace changed, so earlier reads may be stale.
+                    seen_reads.clear()
+            result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
             tool_responses.append({"functionResponse": {"name": tool_name, "response": {"output": result}}})
 
-        if tool_responses:
-            contents.append({"role": "user", "parts": tool_responses})
+        if not tool_responses:
+            continue
+        contents.append({"role": "user", "parts": tool_responses})
+
+        # Bounded exploration: a run of tool-only turns with nothing written
+        # means the agent is stuck surveying. Push it to act, once per streak.
+        explore_streak = 0 if wrote_this_turn else explore_streak + 1
+        if explore_streak >= _MAX_EXPLORE_STREAK:
+            if nudges < _MAX_NUDGES:
+                nudges += 1
+                explore_streak = 0
+                if log_fn:
+                    log_fn("info", "Agent is still exploring — asking it to start writing…")
+                # Appended to the same turn as the tool responses: a functionResponse
+                # must be answered in the turn directly after its functionCall.
+                tool_responses.append({"text": (
+                    f"You have used {_MAX_EXPLORE_STREAK} turns inspecting the project "
+                    "without writing anything. You have enough context. Implement the "
+                    "change now, then reply DONE."
+                )})
+            else:
+                if log_fn:
+                    log_fn("warning", "Agent kept exploring without making changes — stopping.")
+                return (
+                    last_text or "Agent stopped: explored the project without making changes.",
+                    total_tokens,
+                )
 
     if log_fn:
         log_fn("warning", "Agent reached iteration limit.")
-    return "Agent reached iteration limit.", 0
+    return "Agent reached iteration limit.", total_tokens
 
 
 def run_build_agent_gemini(
@@ -2550,77 +4148,22 @@ def run_update_agent_gemini(
         backend="gemini", api_key=api_key, model=model,
     )
     _log_plan(plan, log_fn)
-    total_tokens = 0
 
-    if cancel_fn and cancel_fn():
-        return "Stopped by user.", 0
-
-    design_summary = ""
-    if not _should_skip_design(plan):
-        if log_fn:
-            log_fn("info", "━━━ Design system phase ━━━")
-            log_fn("thinking", "Preparing design system…")
-        design_summary, design_tokens = _gemini_loop(
-            api_key, model, _DESIGN_AGENT_SYSTEM, workspace,
-            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+    def run_phase(
+        system: str, user_msg: str, iters: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, int]:
+        return _gemini_loop(
+            api_key, model, system, workspace, user_msg,
+            log_fn, cancel_fn, max_iterations=iters,
+            tools=tools,
         )
-        total_tokens += design_tokens
-        if cancel_fn and cancel_fn():
-            return design_summary or "Stopped by user.", total_tokens
-    elif log_fn:
-        log_fn("info", "Design phase skipped — no new components or theme changes.")
 
-    if log_fn:
-        log_fn("info", "━━━ Execution phase ━━━")
-    exec_summary, exec_tokens = _gemini_loop(
-        api_key, model, _UPDATE_SYSTEM, workspace,
-        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
+    return _run_update_sequence(
+        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
+        app_name=app_name, template_key=template_key, plan=plan,
+        log_fn=log_fn, cancel_fn=cancel_fn,
     )
-    total_tokens += exec_tokens
-    if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", total_tokens
-
-    if log_fn:
-        log_fn("info", "━━━ Validation phase ━━━")
-        log_fn("thinking", "Validating implementation…")
-    val_summary, val_tokens = _gemini_loop(
-        api_key, model, _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
-    )
-    total_tokens += val_tokens
-    if cancel_fn and cancel_fn():
-        return val_summary or exec_summary, total_tokens
-
-    if _validation_needs_fix_pass(val_summary):
-        if log_fn:
-            log_fn("info", "━━━ Post-validation fix pass ━━━")
-            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
-        fix_summary, fix_tokens = _gemini_loop(
-            api_key, model, _UPDATE_SYSTEM, workspace,
-            _make_fix_prompt(val_summary), log_fn, cancel_fn, max_iterations=_ITERS_FIX,
-        )
-        total_tokens += fix_tokens
-        val_summary = fix_summary
-        if cancel_fn and cancel_fn():
-            return val_summary or exec_summary, total_tokens
-
-    if not _should_skip_security(plan):
-        if log_fn:
-            log_fn("info", "━━━ Security review phase ━━━")
-            log_fn("thinking", "Reviewing for security issues…")
-        sec_summary, sec_tokens = _gemini_loop(
-            api_key, model, _SECURITY_SYSTEM, workspace,
-            _security_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
-        )
-        total_tokens += sec_tokens
-    elif log_fn:
-        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
-
-    return val_summary or exec_summary, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -2636,12 +4179,24 @@ def _openai_loop(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
     """OpenAI tool-use agent loop. Returns (summary, total_tokens)."""
+    from app.build.provider_loop import OpenAIAdapter, run_agent_loop, unified_loop_enabled
+
+    if unified_loop_enabled():
+        adapter = OpenAIAdapter(api_key=api_key, model=model)
+        return run_agent_loop(
+            adapter, system=system, stable=initial_user_msg, workspace=workspace,
+            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
+            tools=tools,
+        )
+
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key)
-    openai_tools = _tools_to_ollama_format(TOOLS)  # same OpenAI-compatible format
+    # same OpenAI-compatible format
+    openai_tools = _tools_to_ollama_format(tools if tools is not None else TOOLS)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
         {"role": "user", "content": initial_user_msg},
@@ -2666,7 +4221,7 @@ def _openai_loop(
                 messages=messages,
                 tools=openai_tools,
                 tool_choice="auto",
-                max_tokens=8096,
+                max_tokens=_MAX_OUTPUT_TOKENS_CHAT,
             )
         except Exception as exc:
             raise RuntimeError(f"OpenAI agent request failed: {exc}") from exc
@@ -2675,9 +4230,12 @@ def _openai_loop(
             total_tokens += response.usage.total_tokens
 
         msg = response.choices[0].message
-        # Append as dict so it's serialisable for the next round
+        # Append as dict so it's serialisable for the next round. Arguments are
+        # re-serialised through a validity check: echoing a model's malformed
+        # JSON (e.g. a lone backslash in a path) back verbatim gets every later
+        # request rejected by strict providers.
         messages.append({"role": "assistant", "content": msg.content or "", **({"tool_calls": [
-            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": _valid_args_json(tc.function.arguments)}}
             for tc in (msg.tool_calls or [])
         ]} if msg.tool_calls else {})})
 
@@ -2718,19 +4276,15 @@ def _openai_loop(
 
         for tc in tool_calls:
             tool_name = tc.function.name
-            try:
-                tool_input = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                tool_input = {}
-            if tool_name == "write_file":
+            tool_input = _safe_args(tc.function.arguments)
+            if tool_name in _WRITE_TOOLS:
                 write_calls += 1
                 if log_fn:
                     log_fn("file_written", tool_input.get("path", ""))
             if log_fn:
                 log_fn("tool", tool_message(tool_name, tool_input))
             result = execute_tool(tool_name, tool_input, workspace, log_fn)
-            if len(result) > _TOOL_RESULT_LIMIT:
-                result = result[:_TOOL_RESULT_LIMIT] + "\n…[truncated]"
+            result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     if log_fn:
@@ -2776,77 +4330,22 @@ def run_update_agent_openai(
         backend="gpt", api_key=api_key, model=model,
     )
     _log_plan(plan, log_fn)
-    total_tokens = 0
 
-    if cancel_fn and cancel_fn():
-        return "Stopped by user.", 0
-
-    design_summary = ""
-    if not _should_skip_design(plan):
-        if log_fn:
-            log_fn("info", "━━━ Design system phase ━━━")
-            log_fn("thinking", "Preparing design system…")
-        design_summary, design_tokens = _openai_loop(
-            api_key, model, _DESIGN_AGENT_SYSTEM, workspace,
-            _design_agent_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_DESIGN,
+    def run_phase(
+        system: str, user_msg: str, iters: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, int]:
+        return _openai_loop(
+            api_key, model, system, workspace, user_msg,
+            log_fn, cancel_fn, max_iterations=iters,
+            tools=tools,
         )
-        total_tokens += design_tokens
-        if cancel_fn and cancel_fn():
-            return design_summary or "Stopped by user.", total_tokens
-    elif log_fn:
-        log_fn("info", "Design phase skipped — no new components or theme changes.")
 
-    if log_fn:
-        log_fn("info", "━━━ Execution phase ━━━")
-    exec_summary, exec_tokens = _openai_loop(
-        api_key, model, _UPDATE_SYSTEM, workspace,
-        _update_user_msg_with_brief(app_name, template_key, blueprint, prompt, plan, workspace, design_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_EXEC,
+    return _run_update_sequence(
+        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
+        app_name=app_name, template_key=template_key, plan=plan,
+        log_fn=log_fn, cancel_fn=cancel_fn,
     )
-    total_tokens += exec_tokens
-    if cancel_fn and cancel_fn():
-        return exec_summary or "Stopped by user.", total_tokens
-
-    if log_fn:
-        log_fn("info", "━━━ Validation phase ━━━")
-        log_fn("thinking", "Validating implementation…")
-    val_summary, val_tokens = _openai_loop(
-        api_key, model, _VALIDATOR_SYSTEM, workspace,
-        _validator_user_msg(app_name, template_key, plan, prompt, workspace, exec_summary),
-        log_fn, cancel_fn, max_iterations=_ITERS_VALIDATE,
-    )
-    total_tokens += val_tokens
-    if cancel_fn and cancel_fn():
-        return val_summary or exec_summary, total_tokens
-
-    if _validation_needs_fix_pass(val_summary):
-        if log_fn:
-            log_fn("info", "━━━ Post-validation fix pass ━━━")
-            log_fn("thinking", "Validator found unresolved issues — running targeted fix pass…")
-        fix_summary, fix_tokens = _openai_loop(
-            api_key, model, _UPDATE_SYSTEM, workspace,
-            _make_fix_prompt(val_summary), log_fn, cancel_fn, max_iterations=_ITERS_FIX,
-        )
-        total_tokens += fix_tokens
-        val_summary = fix_summary
-        if cancel_fn and cancel_fn():
-            return val_summary or exec_summary, total_tokens
-
-    if not _should_skip_security(plan):
-        if log_fn:
-            log_fn("info", "━━━ Security review phase ━━━")
-            log_fn("thinking", "Reviewing for security issues…")
-        sec_summary, sec_tokens = _openai_loop(
-            api_key, model, _SECURITY_SYSTEM, workspace,
-            _security_user_msg(app_name, template_key, plan, prompt, workspace),
-            log_fn, cancel_fn, max_iterations=_ITERS_SECURITY,
-        )
-        total_tokens += sec_tokens
-    elif log_fn:
-        log_fn("info", "Security phase skipped — no auth/API/storage changes.")
-
-    return val_summary or exec_summary, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -2914,8 +4413,390 @@ def run_fix_agent_openai(
 
 
 # ---------------------------------------------------------------------------
+# OpenRouter agent loop (the hosted "Qwen3" build backend)
+#
+# Self-contained on purpose: it shares no code with the OpenAI/"gpt" loop above,
+# so the two backends can never affect each other. OpenRouter speaks the OpenAI
+# wire protocol, so we use the `openai` SDK purely as an HTTP client, pointed at
+# OpenRouter's base URL — no OpenAI/ChatGPT service or key is involved. Requests
+# run Qwen3-Coder (and the tool-capable fallbacks in app/ai/openrouter.py's CODE
+# chain) with real tool calling.
+# ---------------------------------------------------------------------------
+
+# HTTP conditions worth retrying — free OpenRouter endpoints 429 routinely.
+_OPENROUTER_RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
+
+# Weaker free models sometimes read/list files turn after turn without ever
+# committing an edit. After this many consecutive exploration-only turns, nudge
+# the agent to start writing; give up nudging after _MAX_WRITE_NUDGES so a
+# genuinely read-only task (e.g. a security review) isn't harassed forever.
+_READONLY_STREAK_LIMIT = 8
+_MAX_WRITE_NUDGES = 2
+
+# The OpenRouter loop is non-streaming, so there's a silent gap while each turn's
+# model call is in flight. Emit a rotating status verb (rendered with the
+# "thinking" spinner in the UI) so the build always looks alive. "Forging" nods
+# to the product name.
+_STATUS_VERBS = ("Forging", "Thinking", "Analyzing", "Reasoning", "Working", "Crafting", "Building")
+
+
+def _openrouter_chat_turn(
+    client: Any,
+    chain: list[str],
+    messages: list[dict[str, Any]],
+    tools: list[dict],
+    log_fn: Callable[[str, str], None] | None,
+) -> Any:
+    """One chat turn against the CODE model chain, resilient to rate limits.
+
+    Tries each model in `chain`, retrying a retryable failure once with backoff
+    before moving on. On success, promotes the winning model to the front of
+    `chain` (mutated in place) so the next turn starts with a model that just
+    worked rather than re-hitting a rate-limited free endpoint. Raises
+    RuntimeError only when every model in the chain fails.
+    """
+    last_exc: Exception | None = None
+    for idx, mdl in enumerate(list(chain)):
+        for attempt in range(2):
+            try:
+                resp = client.chat.completions.create(
+                    model=mdl,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    max_tokens=_MAX_OUTPUT_TOKENS_CHAT,  # headroom: reasoning tokens are billed here too
+                )
+                if idx > 0:
+                    chain.insert(0, chain.pop(idx))
+                    # Model names never reach the user feed; operators see them here.
+                    logger.info("openrouter: serving with fallback model %s", mdl)
+                    if log_fn:
+                        log_fn("info", "Adjusting the AI route on our side…")
+                return resp
+            except Exception as exc:  # noqa: BLE001 — inspect status, then decide
+                last_exc = exc
+                status = getattr(exc, "status_code", None)
+                if status in _OPENROUTER_RETRYABLE_STATUS and attempt == 0:
+                    time.sleep(3)
+                    continue
+                break  # non-retryable, or already retried — try the next model
+    raise RuntimeError(f"OpenRouter build agent request failed: {last_exc}")
+
+
+def _openrouter_loop(
+    system: str,
+    workspace: Path,
+    initial_user_msg: str,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+    max_iterations: int = _MAX_ITERATIONS,
+    tools: list[dict[str, Any]] | None = None,
+) -> tuple[str, int]:
+    """Tool-use agent loop for the hosted Qwen3 backend (OpenRouter).
+
+    Mirrors the other backends' loops (DONE detection, write pushback, tool-result
+    truncation) but drives the OpenRouter CODE model chain with mid-build failover.
+    """
+    from app.build.provider_loop import OpenRouterAdapter, run_agent_loop, unified_loop_enabled
+
+    if unified_loop_enabled():
+        from app.ai.openrouter import OPENROUTER_BASE_URL, code_models
+        from app.config import get_settings
+
+        _s = get_settings()
+        _key = (_s.OPENROUTER_API_KEY or "").strip()
+        if not _key:
+            raise RuntimeError("OPENROUTER_API_KEY is not set — cannot run the Qwen3/OpenRouter build agent.")
+        adapter = OpenRouterAdapter(api_key=_key, base_url=OPENROUTER_BASE_URL, chain=code_models())
+        return run_agent_loop(
+            adapter, system=system, stable=initial_user_msg, workspace=workspace,
+            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
+            tools=tools,
+        )
+
+    from openai import OpenAI
+
+    from app.ai.openrouter import OPENROUTER_BASE_URL, code_models
+    from app.config import get_settings
+
+    settings = get_settings()
+    api_key = (settings.OPENROUTER_API_KEY or "").strip()
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set — cannot run the Qwen3/OpenRouter build agent.")
+
+    client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+    chain = code_models()  # ordered, tool-capable; mutated in place by failover
+    # OpenAI-compatible schema
+    openrouter_tools = _tools_to_ollama_format(tools if tools is not None else TOOLS)
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": initial_user_msg},
+    ]
+    last_text = ""
+    write_calls = 0
+    pushback_sent = False
+    readonly_streak = 0  # consecutive turns that used tools but wrote nothing
+    write_nudges = 0
+    total_tokens = 0
+
+    for iteration in range(max_iterations):
+        if cancel_fn and cancel_fn():
+            if log_fn:
+                log_fn("warning", "Agent stopped by user.")
+            return "Stopped by user.", total_tokens
+        warn_at = max(1, max_iterations - 10)
+        if iteration == warn_at and log_fn:
+            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
+
+        # Heartbeat while the (non-streaming) model call is in flight.
+        if log_fn:
+            log_fn("thinking", f"{_STATUS_VERBS[iteration % len(_STATUS_VERBS)]}…")
+
+        response = _openrouter_chat_turn(client, chain, messages, openrouter_tools, log_fn)
+
+        # OpenRouter returns OpenAI-style usage — accumulate so builds/updates are
+        # billed and count toward the user's monthly quota (see core/usage.py).
+        usage = getattr(response, "usage", None)
+        if usage and getattr(usage, "total_tokens", None):
+            total_tokens += usage.total_tokens
+
+        msg = response.choices[0].message
+        # Same validity check as the OpenAI loop: a malformed arguments string
+        # echoed back verbatim poisons history and 400s every later turn.
+        messages.append({"role": "assistant", "content": msg.content or "", **({"tool_calls": [
+            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": _valid_args_json(tc.function.arguments)}}
+            for tc in (msg.tool_calls or [])
+        ]} if msg.tool_calls else {})})
+
+        # Reasoning models return their chain-of-thought in a `reasoning` field —
+        # surface a trimmed slice as real "thinking" when it's there.
+        if log_fn:
+            try:
+                reasoning = (getattr(msg, "reasoning", None) or "").strip()
+            except Exception:
+                reasoning = ""
+            if reasoning:
+                log_fn("thinking", reasoning[:200])
+
+        tool_calls = msg.tool_calls or []
+        text = msg.content or ""
+        done_text: str | None = None
+
+        if text:
+            last_text = text
+            if log_fn and text.strip():
+                log_fn("text", text.strip()[:160])
+            if "DONE" in text.upper():
+                done_text = text
+
+        if done_text is not None and not tool_calls:
+            if write_calls == 0 and not pushback_sent:
+                pushback_sent = True
+                if log_fn:
+                    log_fn("info", "Agent said DONE without writing files — asking it to implement…")
+                messages.append({"role": "user", "content": (
+                    "You said you were done but haven't called write_file yet. "
+                    "Implement the changes now using write_file."
+                )})
+                continue
+            return done_text, total_tokens
+
+        finish_reason = response.choices[0].finish_reason
+        if finish_reason == "stop" and not tool_calls:
+            if write_calls == 0 and not pushback_sent:
+                pushback_sent = True
+                if log_fn:
+                    log_fn("info", "No files written yet — asking agent to write the code…")
+                messages.append({"role": "user", "content": (
+                    "You haven't written any files yet. Use write_file to implement the changes."
+                )})
+                continue
+            return last_text or "Done.", total_tokens
+
+        wrote_this_turn = False
+        for tc in tool_calls:
+            tool_name = tc.function.name
+            tool_input = _safe_args(tc.function.arguments)
+            if tool_name in _WRITE_TOOLS:
+                write_calls += 1
+                wrote_this_turn = True
+                if log_fn:
+                    log_fn("file_written", tool_input.get("path", ""))
+            if log_fn:
+                log_fn("tool", tool_message(tool_name, tool_input))
+            result = execute_tool(tool_name, tool_input, workspace, log_fn)
+            result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+        # Break read-only stalls: if the agent has explored for many turns without
+        # writing, tell it explicitly to start editing (see _READONLY_STREAK_LIMIT).
+        readonly_streak = 0 if wrote_this_turn else readonly_streak + 1
+        if readonly_streak >= _READONLY_STREAK_LIMIT and write_nudges < _MAX_WRITE_NUDGES:
+            write_nudges += 1
+            readonly_streak = 0
+            if log_fn:
+                log_fn("info", "Agent has only been reading files — nudging it to start writing…")
+            messages.append({"role": "user", "content": (
+                "You have spent several steps only reading files without editing any. "
+                "You have enough context now — stop exploring and call write_file to "
+                "implement the changes. Produce real code edits, not more reads."
+            )})
+
+    if log_fn:
+        log_fn("warning", "Agent reached iteration limit.")
+    return "Agent reached iteration limit.", total_tokens
+
+
+def run_build_agent_openrouter(
+    workspace: Path,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    log_fn: Callable[[str, str], None] | None = None,
+) -> tuple[str, int]:
+    """Full build via the hosted Qwen3 backend (OpenRouter)."""
+    system = _build_system(template_key)
+    user_msg = (
+        f"App name: {app_name}\nTemplate: {template_key}\n\n"
+        f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
+        "Build this application now following the phases in your instructions. "
+        "Narrate each step. When finished, write DONE: <summary of what was built>."
+    )
+    return _openrouter_loop(system, workspace, user_msg, log_fn)
+
+
+def run_fix_agent_openrouter(
+    workspace: Path,
+    prompt: str,
+    app_name: str,
+    template_key: str,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+) -> tuple[str, int]:
+    """Executor-only compile-fix pass via the hosted Qwen3 backend (OpenRouter)."""
+    return _openrouter_loop(_UPDATE_SYSTEM, workspace, prompt, log_fn, cancel_fn, max_iterations=_ITERS_FIX)
+
+
+def run_update_agent_openrouter(
+    workspace: Path,
+    prompt: str,
+    blueprint: dict[str, Any],
+    app_name: str,
+    template_key: str,
+    log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
+) -> tuple[str, int]:
+    """Plan → design? → execute → validate → security? via the hosted Qwen3 backend.
+
+    The planner routes through app/ai/openrouter.py's PLAN chain (backend="Qwen3"
+    resolves to OpenRouter when a key is set); every tool-using phase runs on the
+    CODE chain via _openrouter_loop.
+    """
+    if log_fn:
+        log_fn("thinking", "Planning changes…")
+    plan = _call_planner(
+        _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
+        backend="Qwen3",
+    )
+    _log_plan(plan, log_fn)
+    # The planner call above routes through chat_openrouter, which doesn't
+    # surface usage — its (small) tokens aren't counted; the tool-loop phases
+    # below are the bulk of the cost.
+
+    def run_phase(
+        system: str, user_msg: str, iters: int,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, int]:
+        return _openrouter_loop(
+            system, workspace, user_msg,
+            log_fn, cancel_fn, max_iterations=iters,
+            tools=tools,
+        )
+
+    return _run_update_sequence(
+        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
+        app_name=app_name, template_key=template_key, plan=plan,
+        log_fn=log_fn, cancel_fn=cancel_fn,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Core loop
 # ---------------------------------------------------------------------------
+
+def _stream_turn(
+    client: anthropic.Anthropic,
+    model: str,
+    system_blocks: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+    log_fn: Callable[[str, str], None] | None,
+    tool_blocks: list[dict[str, Any]],
+) -> Any:
+    """Run one streamed Anthropic turn and return the accumulated final message.
+
+    Streaming is what keeps the build feed alive: on a non-streamed call the UI
+    sits silent for the whole generation and then receives the turn in one lump.
+    Text is flushed at sentence / newline / 120-char boundaries and thinking at
+    120 chars, matching the Ollama path so the feed reads identically across
+    providers.
+    """
+    global _thinking_supported
+
+    def _run(thinking: dict[str, Any] | None) -> Any:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": _MAX_OUTPUT_TOKENS,
+            "system": system_blocks,
+            "tools": tool_blocks,
+            "messages": messages,
+        }
+        if thinking:
+            kwargs["thinking"] = thinking
+
+        stream_buf = ""  # content tokens awaiting a flush boundary
+        think_buf = ""   # thinking tokens, flushed separately
+        with client.messages.stream(**kwargs) as stream:
+            for event in stream:
+                if event.type != "content_block_delta":
+                    continue
+                delta = event.delta
+                if delta.type == "text_delta":
+                    stream_buf += delta.text
+                    if log_fn and (
+                        "\n" in stream_buf
+                        or stream_buf.endswith((".", "!", "?", "…"))
+                        or len(stream_buf) >= 120
+                    ):
+                        if stream_buf.strip():
+                            log_fn("text", stream_buf.strip())
+                        stream_buf = ""
+                elif delta.type == "thinking_delta":
+                    think_buf += delta.thinking
+                    if log_fn and len(think_buf) >= 120:
+                        log_fn("thinking", think_buf.strip())
+                        think_buf = ""
+            if log_fn:
+                if think_buf.strip():
+                    log_fn("thinking", think_buf.strip())
+                if stream_buf.strip():
+                    log_fn("text", stream_buf.strip())
+            return stream.get_final_message()
+
+    if _thinking_supported:
+        try:
+            return _run(_THINKING_CONFIG)
+        except anthropic.BadRequestError as exc:
+            if "thinking" not in str(exc).lower():
+                raise
+            # Adaptive thinking is rejected by pre-4.6 models. ANTHROPIC_MODEL is
+            # operator-configurable, so degrade for the rest of the process
+            # instead of failing every Claude build on a pinned older model.
+            _thinking_supported = False
+            logger.warning(
+                "Model %s rejected adaptive thinking — continuing without it: %s", model, exc,
+            )
+    return _run(None)
+
 
 def _loop(
     client: anthropic.Anthropic,
@@ -2926,67 +4807,166 @@ def _loop(
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
     max_iterations: int = _MAX_ITERATIONS,
+    tools: list[dict[str, Any]] | None = None,
+    cache_trace: list[dict[str, Any]] | None = None,
 ) -> tuple[str, int]:
-    """Agent tool loop. Returns (summary, total_tokens_used)."""
+    """Agent tool loop. Returns (summary, total_tokens_used).
+
+    Carries the same context-control guards as the Ollama path — truncated tool
+    results, a rolling window that never orphans a tool_result, repeat-read
+    suppression and a bounded-exploration breaker — plus prompt caching, which
+    only pays off because the system prompt and tool array are byte-stable
+    across every iteration of a phase.
+    """
+    from app.build.provider_loop import AnthropicAdapter, run_agent_loop, unified_loop_enabled
+
+    if unified_loop_enabled():
+        adapter = AnthropicAdapter(api_key="", model=model, client=client)
+        return run_agent_loop(
+            adapter, system=system, stable=initial_user_msg, workspace=workspace,
+            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
+            tools=tools, cache_trace=cache_trace,
+        )
+
     messages: list[dict[str, Any]] = [{"role": "user", "content": initial_user_msg}]
+    system_blocks = _cached_system(system)
+    tool_blocks = _cached_tools_for(tools)
     total_tokens = 0
     write_calls = 0
-    pushback_sent = False
+    nudges = 0  # bounded pushbacks when the agent talks instead of writing
+    # Read-only calls already answered since the last workspace mutation.
+    seen_reads: set[str] = set()
+    explore_streak = 0  # consecutive turns of tool use with no write_file
+    last_text = ""
+    trimming_started = False
+
+    def _trimmed_messages() -> list[dict[str, Any]]:
+        """Immutable anchor + a rolling window that starts on an assistant turn.
+
+        The anchor is the first user message plus the opening few turns, and it is
+        never dropped, so everything up to its end is byte-stable for the whole
+        phase and can hold a cache breakpoint that actually gets read. Trimming
+        happens only above it.
+
+        The window cannot simply be sliced by count: it would start on the user
+        message holding a tool_result whose tool_use had just been dropped, which
+        Anthropic rejects outright. Advancing to the next assistant turn is the
+        only position a conversation can safely resume from, and it also avoids
+        leaving two user messages adjacent.
+        """
+        anchor = messages[:_ANCHOR_END]
+        rest = messages[_ANCHOR_END:]
+        window = rest[-(_ANTHROPIC_HISTORY_PAIRS * 2):]
+        start = 0
+        while start < len(window) and window[start].get("role") != "assistant":
+            start += 1
+        return anchor + window[start:]
 
     for iteration in range(max_iterations):
         if cancel_fn and cancel_fn():
             if log_fn:
                 log_fn("warning", "Agent stopped by user.")
-            return "Stopped by user.", 0
+            return "Stopped by user.", total_tokens
         warn_at = max(1, max_iterations - 10)
         if iteration == warn_at and log_fn:
             log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
 
-        response = client.messages.create(
-            model=model,
-            max_tokens=8096,
-            system=system,
-            tools=TOOLS,
-            messages=messages,
+        # Marking depends on whether the window has started sliding, which is a
+        # property of the message list, so it is computed before the request.
+        will_trim = len(messages) > _ANCHOR_END + _ANTHROPIC_HISTORY_PAIRS * 2
+        _mark_message_breakpoints(messages, _ANCHOR_END, will_trim)
+        sent = _trimmed_messages()
+        # A trim changes the message prefix, so every message-level cache entry
+        # below it is invalidated. Recorded per iteration so the cost of the
+        # window can be correlated with the cache numbers rather than guessed at.
+        dropped = len(messages) - len(sent)
+        if dropped and not trimming_started:
+            trimming_started = True
+            logger.info("cache: first trim at iteration %d (%d messages dropped)", iteration, dropped)
+
+        response = _stream_turn(
+            client, model, system_blocks, sent, log_fn, tool_blocks,
         )
 
-        total_tokens += response.usage.input_tokens + response.usage.output_tokens
+        total_tokens += _usage_tokens(response.usage)
+        fresh, created, read = _cache_stats(response.usage)
+        logger.info(
+            "cache iter=%d trimmed=%d fresh=%d creation=%d read=%d",
+            iteration, dropped, fresh, created, read,
+        )
+        if cache_trace is not None:
+            cache_trace.append({
+                "iteration": iteration,
+                "trimmed": dropped,
+                "messages_sent": len(sent),
+                "input_tokens": fresh,
+                "cache_creation_input_tokens": created,
+                "cache_read_input_tokens": read,
+            })
+        _log_cache_usage(response.usage)
         messages.append({"role": "assistant", "content": response.content})
 
+        if response.stop_reason == "max_tokens" and log_fn:
+            log_fn("warning", "Response hit the output limit — the last file may be incomplete.")
+
         tool_results: list[dict[str, Any]] = []
-        last_text = ""
         done_text: str | None = None
+        wrote_this_turn = False
 
         for block in response.content:
             if block.type == "text":
-                last_text = block.text
+                # Already streamed to the feed above; only the bookkeeping here.
+                if block.text.strip():
+                    last_text = block.text
                 logger.debug("Agent text: %s", block.text[:120])
-                if log_fn and block.text.strip():
-                    preview = block.text.strip()[:160]
-                    if len(block.text.strip()) > 160:
-                        preview += "…"
-                    log_fn("text", preview)
                 if "DONE" in block.text.upper():
                     done_text = block.text
 
             elif block.type == "tool_use":
-                if block.name == "write_file":
+                tool_input = block.input or {}
+                if block.name in _WRITE_TOOLS:
                     write_calls += 1
+                    wrote_this_turn = True
                     if log_fn:
-                        log_fn("file_written", (block.input or {}).get("path", ""))
-                msg = tool_message(block.name, block.input)
-                logger.debug("Tool %s → %s", block.name, msg)
+                        log_fn("file_written", tool_input.get("path", ""))
+
+                call_key = f"{block.name}:{json.dumps(tool_input, sort_keys=True, default=str)}"
+                is_repeat = block.name in _READ_ONLY_TOOLS and call_key in seen_reads
                 if log_fn:
-                    log_fn("tool", msg)
-                result = execute_tool(block.name, block.input, workspace, log_fn)
+                    # Mark repeats explicitly — an identical-looking log line for
+                    # a suppressed call makes a stuck agent impossible to spot.
+                    label = tool_message(block.name, tool_input)
+                    log_fn("tool", f"{label} — already read, skipping" if is_repeat else label)
+
+                if is_repeat:
+                    # Serving this from a notice rather than re-running it is the
+                    # point: re-executing costs a full tool result in context
+                    # every time and teaches the model nothing new.
+                    result = (
+                        f"[You already ran {block.name} with these exact arguments and "
+                        "the workspace has not changed since. The result is the same. "
+                        "Stop inspecting and make the change now.]"
+                    )
+                else:
+                    result = execute_tool(block.name, tool_input, workspace, log_fn)
+                    if block.name in _READ_ONLY_TOOLS:
+                        seen_reads.add(call_key)
+                    else:
+                        # The workspace changed, so earlier reads may be stale.
+                        seen_reads.clear()
+                # Cap large results so they don't blow up the context window on
+                # the next iteration. Claude's context is large — use the big cap.
+                result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT_LARGE_CTX)
                 tool_results.append(
                     {"type": "tool_result", "tool_use_id": block.id, "content": result}
                 )
 
-        # If agent said DONE but hasn't written any files, push back once
+        # If agent said DONE but hasn't written any files, push back — bounded,
+        # because an unbounded nudge burns every iteration re-asking a model that
+        # isn't going to comply.
         if done_text is not None and not tool_results:
-            if write_calls == 0 and not pushback_sent:
-                pushback_sent = True
+            if write_calls == 0 and nudges < _MAX_NUDGES:
+                nudges += 1
                 if log_fn:
                     log_fn("info", "Agent said DONE without writing files — asking it to implement…")
                 messages.append({
@@ -3001,9 +4981,8 @@ def _loop(
             return done_text, total_tokens
 
         if response.stop_reason == "end_turn":
-            if write_calls == 0 and not pushback_sent:
-                # Agent stopped without writing any files — push back once
-                pushback_sent = True
+            if write_calls == 0 and nudges < _MAX_NUDGES:
+                nudges += 1
                 if log_fn:
                     log_fn("info", "No files written yet — asking agent to write the code…")
                 messages.append({
@@ -3018,8 +4997,40 @@ def _loop(
                 continue
             return last_text or "Done.", total_tokens
 
-        if tool_results:
-            messages.append({"role": "user", "content": tool_results})
+        if not tool_results:
+            continue
+        messages.append({"role": "user", "content": tool_results})
+
+        # Bounded exploration: a run of tool-only turns with nothing written
+        # means the agent is stuck surveying. Push it to act, once per streak.
+        explore_streak = 0 if wrote_this_turn else explore_streak + 1
+        if explore_streak >= _MAX_EXPLORE_STREAK:
+            if nudges < _MAX_NUDGES:
+                nudges += 1
+                explore_streak = 0
+                if log_fn:
+                    log_fn("info", "Agent is still exploring — asking it to start writing…")
+                # Appended to the tool_result message rather than sent as its own
+                # user turn: tool results must be answered in the message that
+                # directly follows the tool_use, and a text block may trail them.
+                tool_results.append({
+                    "type": "text",
+                    "text": (
+                        f"You have used {_MAX_EXPLORE_STREAK} turns inspecting the project "
+                        "without writing anything. You have enough context. Implement the "
+                        "change now with write_file, then reply DONE."
+                    ),
+                })
+            else:
+                # Pushed to act and still only surveying. Every further turn
+                # re-sends the whole context for no progress, which is how a
+                # single request burns hundreds of thousands of tokens.
+                if log_fn:
+                    log_fn("warning", "Agent kept exploring without making changes — stopping.")
+                return (
+                    last_text or "Agent stopped: explored the project without making changes.",
+                    total_tokens,
+                )
 
     if log_fn:
         log_fn("warning", "Agent reached iteration limit.")

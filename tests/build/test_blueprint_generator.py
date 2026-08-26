@@ -174,6 +174,38 @@ class TestBlueprintGeneratorGenerate:
         mock_synth.assert_called_once()
         assert blueprint.json_output["app_description"] == "A team collaboration tool"
 
+    async def test_prefers_full_transcript_synthesis_over_noisy_fragment_events(self):
+        """Regression test: when BOTH raw transcript segments AND incremental
+        per-fragment extraction events exist (the normal case for a real
+        Recall/physical meeting), the final blueprint must come from one
+        synthesis pass over the full transcript — not from concatenating the
+        per-fragment events, which are each extracted from an isolated,
+        often too-short chunk and can be noisy or hallucinated junk.
+        """
+        transcript = _event_doc("transcript.segment", {"text": "We need a login page"})
+        junk_feature = _event_doc(
+            "FEATURE_FOUND",
+            {"title": "Junk", "description": "hallucinated from a 2-word fragment", "priority": "low"},
+        )
+        db = _make_db(_session_doc(), [transcript, junk_feature])
+
+        synth_events = [
+            {"sub_state": "APP_DESCRIPTION", "payload": {"text": "A real product description"}},
+            {"sub_state": "FEATURE_FOUND", "payload": {"title": "Login", "description": "Auth", "priority": "high"}},
+        ]
+
+        with (
+            patch("app.build.blueprint_generator.MeetingStateMachine") as mock_sm_cls,
+            patch("app.config.get_settings", return_value=_FAKE_SETTINGS),
+            patch("app.ai.agents.synthesizer.run", return_value=synth_events) as mock_synth,
+        ):
+            mock_sm_cls.return_value.transition = AsyncMock(return_value=_session_obj())
+            blueprint = await BlueprintAggregator(db).generate(SESSION_ID)
+
+        mock_synth.assert_called_once()
+        assert blueprint.json_output["app_description"] == "A real product description"
+        assert blueprint.json_output["features"][0]["title"] == "Login"
+
     async def test_raises_when_no_transcript_data_at_all(self):
         """Empty events collection → ValueError mentioning 'No transcript data'."""
         db = _make_db(_session_doc(), [])  # no events whatsoever
@@ -405,3 +437,98 @@ class TestClassifyNeedsDatabase:
 
         assert needs_db is False
         assert reason == ""
+
+
+# ── _merge_entities ───────────────────────────────────────────────────────────
+
+
+class TestMergeEntities:
+    """Segment-level extraction reports the same entity repeatedly; the merge
+    must produce one entity carrying the union of everything seen."""
+
+    def test_empty_input_returns_empty_list(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        assert _merge_entities([]) == []
+
+    def test_unions_fields_across_segments(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        result = _merge_entities([
+            {"name": "Invoice", "description": "A bill", "fields": [
+                {"name": "amount", "type": "decimal", "required": True, "notes": ""},
+            ]},
+            {"name": "Invoice", "description": "", "fields": [
+                {"name": "due_date", "type": "date", "required": False, "notes": ""},
+            ]},
+        ])
+
+        assert len(result) == 1
+        assert result[0]["description"] == "A bill"
+        assert [f["name"] for f in result[0]["fields"]] == ["amount", "due_date"]
+
+    def test_dedupes_entity_name_case_insensitively(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        result = _merge_entities([
+            {"name": "Invoice", "fields": []},
+            {"name": "invoice", "fields": []},
+        ])
+
+        assert len(result) == 1
+        assert result[0]["name"] == "Invoice"  # first spelling wins
+
+    def test_required_is_sticky_and_first_type_wins(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        result = _merge_entities([
+            {"name": "Invoice", "fields": [
+                {"name": "amount", "type": "decimal", "required": False, "notes": ""},
+            ]},
+            {"name": "Invoice", "fields": [
+                {"name": "amount", "type": "text", "required": True, "notes": "in cents"},
+            ]},
+        ])
+
+        field = result[0]["fields"][0]
+        assert field["required"] is True
+        assert field["type"] == "decimal"
+        assert field["notes"] == "in cents"
+
+    def test_dedupes_relationships(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        result = _merge_entities([
+            {"name": "Invoice", "relationships": [
+                {"kind": "belongs_to", "target": "Customer", "notes": ""},
+            ]},
+            {"name": "Invoice", "relationships": [
+                {"kind": "belongs_to", "target": "customer", "notes": "one per invoice"},
+                {"kind": "has_many", "target": "LineItem", "notes": ""},
+            ]},
+        ])
+
+        rels = result[0]["relationships"]
+        assert [(r["kind"], r["target"]) for r in rels] == [
+            ("belongs_to", "Customer"), ("has_many", "LineItem"),
+        ]
+
+    def test_skips_nameless_entities_and_fields(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        result = _merge_entities([
+            {"name": "", "fields": [{"name": "x", "type": "text"}]},
+            {"name": "Invoice", "fields": [{"name": "  ", "type": "text"}]},
+        ])
+
+        assert len(result) == 1
+        assert result[0]["fields"] == []
+
+    def test_tolerates_missing_keys(self):
+        from app.build.blueprint_generator import _merge_entities
+
+        result = _merge_entities([{"name": "Invoice"}])
+
+        assert result == [
+            {"name": "Invoice", "description": "", "fields": [], "relationships": []}
+        ]

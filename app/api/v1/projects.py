@@ -8,8 +8,10 @@ import uuid
 from contextlib import suppress
 from datetime import UTC, datetime
 
+import anyio
 from fastapi import APIRouter
 
+from app.core.dispatch import dispatch
 from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
 from app.deps import CurrentUser, DBSession, SettingsDep
 from app.schemas.project import (
@@ -88,7 +90,7 @@ async def _finalize_db_connect(project_id: uuid.UUID, project: ProjectOut, db) -
             "updated_at": datetime.now(UTC),
         })
         from app.workers.build_worker import run_build
-        run_build.apply_async(args=[str(project.session_id), str(project_id)], queue="build")
+        await dispatch(run_build, args=[str(project.session_id), str(project_id)], queue="build")
         return {"build_queued": True}
 
     return {"prompt_wire_in": True}
@@ -132,7 +134,8 @@ async def stop_project(
     from app.build.cancel import request_cancel
     from app.config import get_settings
     settings = get_settings()
-    request_cancel(settings.REDIS_URL, str(project_id))
+    # request_cancel opens a sync Redis connection — keep it off the event loop.
+    await anyio.to_thread.run_sync(request_cancel, settings.REDIS_URL, str(project_id))
 
     # Immediately mark as not-updating so the UI unblocks
     from datetime import datetime
@@ -330,7 +333,8 @@ async def update_project(
         raise ValidationError("A build or update is already in progress.")
 
     from app.workers.update_worker import apply_update
-    apply_update.apply_async(
+    await dispatch(
+        apply_update,
         args=[str(project_id), body.prompt, str(user.id)],
         queue="build",
     )
@@ -364,8 +368,11 @@ async def chat_with_project(
     )
 
     from app.config import get_settings
+    from app.core.build_model import get_effective_build_model
 
     settings = get_settings()
+    effective_model = await get_effective_build_model(db, settings, user_id=str(user.id))
+    settings = settings.model_copy(update={"BUILD_MODEL": effective_model})
     fw = {"flutter": "Flutter", "next": "Next.js", "react_native": "React Native"}.get(
         project.template_key, project.template_key
     )
@@ -391,7 +398,8 @@ async def chat_with_project(
             )
         log_fn("started", f"Preparing update for {project.app_name}…")
         from app.workers.update_worker import apply_update
-        apply_update.apply_async(
+        await dispatch(
+            apply_update,
             args=[str(project_id), message, str(user.id)],
             queue="build",
         )
@@ -550,9 +558,19 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
 
             import requests as _req
 
-            def _ollama_classify():
+            from app.ai.qwen import using_openrouter
+
+            def _qwen_classify():
+                # Hosted backend: routed to a reasoning model, since this call also
+                # has to author the technical update_prompt, not just pick a type.
+                if using_openrouter():
+                    from app.ai.openrouter import PLAN, chat_openrouter
+                    return chat_openrouter(system, message, task=PLAN, max_tokens=4096)
+
+                from app.ai.ollama_http import ollama_base_url, ollama_headers
+
                 r = _req.post(
-                    f"{settings.OLLAMA_URL.rstrip('/')}/api/chat",
+                    f"{ollama_base_url(settings)}/api/chat",
                     json={
                         "model": settings.OLLAMA_MODEL,
                         "messages": [
@@ -561,32 +579,35 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
                         ],
                         "stream": False,
                     },
+                    headers=ollama_headers(settings),
                     timeout=120,
                 )
                 r.raise_for_status()
                 return (r.json().get("message") or {}).get("content", "").strip()
 
-            raw = await asyncio.to_thread(_ollama_classify)
+            raw = await asyncio.to_thread(_qwen_classify)
 
         elif settings.BUILD_MODEL == "gemini":
             import asyncio
 
-            import requests as _req
-
             def _gemini_classify():
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.GEMINI_MODEL}:generateContent"
-                r = _req.post(
+                # Same transport the Gemini build loop uses: client-side pacing
+                # learned from 429s plus RetryInfo-aware backoff, so a free-tier
+                # per-minute limit costs a short wait instead of failing the chat.
+                from app.build.build_agent import _GEMINI_URL, _gemini_post_with_retry
+
+                url = _GEMINI_URL.format(model=settings.GEMINI_MODEL)
+                data = _gemini_post_with_retry(
                     url,
-                    params={"key": settings.GEMINI_API_KEY},
-                    json={
+                    settings.GEMINI_API_KEY,
+                    {
                         "system_instruction": {"parts": [{"text": system}]},
                         "contents": [{"role": "user", "parts": [{"text": message}]}],
                         "generationConfig": {"maxOutputTokens": 1024},
                     },
                     timeout=60,
                 )
-                r.raise_for_status()
-                parts = (r.json().get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+                parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
                 return "".join(p.get("text", "") for p in parts).strip()
 
             raw = await asyncio.to_thread(_gemini_classify)
@@ -621,6 +642,22 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
             raw = ai_resp.content[0].text.strip() if ai_resp.content else ""
     except Exception as exc:
         logger.error("Chat classifier failed project=%s: %s", project_id, exc, exc_info=True)
+        # Surface the real reason to operators (not the user): push a scrubbed
+        # alert to the admin portal so a missing key, rate limit, or provider
+        # outage is diagnosable. sanitize_build_error maps it to a safe title;
+        # record_operator_alert scrubs keys/URLs from raw_detail.
+        try:
+            from app.core.alerts import record_operator_alert
+            from app.core.build_errors import sanitize_build_error
+            await record_operator_alert(
+                db,
+                title=f"Chat classifier failed: {sanitize_build_error(exc).message}",
+                raw_detail=str(exc),
+                source="chat_classifier",
+                project_id=str(project_id),
+            )
+        except Exception:  # never let alerting failure mask the original error
+            logger.exception("Failed to record operator alert for chat classifier")
         return ChatResponse(type="chat", response="I'm having trouble processing that right now. Please try again in a moment.")
 
     # Strip <think>...</think> blocks that Qwen3 prepends
@@ -650,7 +687,8 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
             )
         log_fn("started", f"Preparing update for {project.app_name}…")
         from app.workers.update_worker import apply_update
-        apply_update.apply_async(
+        await dispatch(
+            apply_update,
             args=[str(project_id), message, str(user.id)],
             queue="build",
         )
@@ -692,7 +730,8 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
 
         log_fn("started", f"Preparing update for {project.app_name}…")
         from app.workers.update_worker import apply_update
-        apply_update.apply_async(
+        await dispatch(
+            apply_update,
             args=[str(project_id), update_prompt, str(user.id)],
             queue="build",
         )
@@ -749,7 +788,8 @@ async def trigger_preview_build(
         raise ValidationError("Project has no GitHub repository yet — wait for the initial build to finish.")
 
     from app.workers.build_worker import build_preview
-    build_preview.apply_async(
+    await dispatch(
+        build_preview,
         args=[str(project_id), str(user.id)],
         queue="build",
     )
@@ -827,18 +867,21 @@ async def connect_neon(
 
     project = await _get_owned(project_id, user.id, db)
 
-    created = await neon_management.create_project(settings.NEON_API_KEY, name=project.app_name)
+    created = await neon_management.create_project(
+        settings.NEON_API_KEY, name=project.app_name, org_id=settings.NEON_ORG_ID or None
+    )
     neon_project_id = created["project"]["id"]
     branch_id = created["branch"]["id"]
+    database_name = created["databases"][0]["name"]
     connection_uri = created["connection_uris"][0]["connection_uri"]
 
     data_api = await neon_management.enable_data_api(
-        settings.NEON_API_KEY, project_id=neon_project_id, branch_id=branch_id
+        settings.NEON_API_KEY,
+        project_id=neon_project_id,
+        branch_id=branch_id,
+        database_name=database_name,
     )
-    # NOTE: Neon's Data API response field name is not verified against a real
-    # API key yet — trying the plausible candidates. Once tested for real,
-    # check the actual response and simplify this to the one true key name.
-    data_api_url = data_api.get("uri") or data_api.get("data_api_url") or data_api.get("url")
+    data_api_url = data_api["url"]
 
     await db.collection("projects").document(str(project_id)).update({
         "neon_project_id": neon_project_id,
@@ -936,7 +979,7 @@ async def skip_database(
     })
 
     from app.workers.build_worker import run_build
-    run_build.apply_async(args=[str(project.session_id), str(project_id)], queue="build")
+    await dispatch(run_build, args=[str(project.session_id), str(project_id)], queue="build")
     return {"status": "queued"}
 
 
@@ -973,5 +1016,5 @@ async def wire_database(
     )
 
     from app.workers.update_worker import apply_update
-    apply_update.apply_async(args=[str(project_id), prompt, str(user.id)], queue="build")
+    await dispatch(apply_update, args=[str(project_id), prompt, str(user.id)], queue="build")
     return {"status": "queued"}

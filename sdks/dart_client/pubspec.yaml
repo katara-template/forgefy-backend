@@ -1,0 +1,18 @@
+name: forgefy_client
+description: Forgefy app-runtime SDK for Dart & Flutter — the auth, data, and networking layer that Forgefy-generated apps depend on.
+version: 0.1.0
+repository: https://github.com/forgefy/forgefy
+issue_tracker: https://github.com/forgefy/forgefy/issues
+
+environment:
+  sdk: ^3.0.0
+
+# Pure `package:http` — no dart:io — so the same package runs on the Dart VM,
+# Flutter (mobile/desktop), and Flutter web. Session persistence is pluggable;
+# the default is in-memory, so there is no forced dependency on shared_preferences.
+dependencies:
+  http: ^1.2.0
+
+dev_dependencies:
+  lints: ^4.0.0
+  test: ^1.25.0

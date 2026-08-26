@@ -12,11 +12,13 @@ os.environ["SENTRY_DSN"] = ""
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.config import get_settings
+from app.db.models.api_key import ApiKey
 from app.db.models.user import User
-from app.deps import get_current_user, get_db, get_redis
+from app.deps import get_api_key, get_current_user, get_db, get_redis
 from app.main import app
 
-_ASYNC_TERMINALS = ("get", "set", "update", "delete", "add", "stream")
+_ASYNC_TERMINALS = ("get", "set", "update", "delete", "add", "stream", "create")
 _CHAIN_METHODS = ("collection", "document", "where", "limit", "order_by", "count")
 
 
@@ -129,6 +131,9 @@ async def client(
 
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_redis] = override_get_redis
+    # /health caches dependency checks briefly; reset so one test's healthy
+    # result doesn't mask another test's simulated outage.
+    app.state.health_cache = {"at": 0.0, "checks": None}
 
     with (
         patch("app.main.init_firebase", return_value=mock_db),
@@ -155,3 +160,32 @@ async def auth_client(
     yield client
     # get_db/get_redis overrides and the firebase/redis patches are cleaned
     # up by the client fixture.
+
+
+@pytest.fixture
+def test_api_key(test_user: User) -> ApiKey:
+    """A resolved ApiKey owned by test_user, for developer-API endpoint tests."""
+    return ApiKey(
+        id=uuid.uuid4(),
+        owner_user_id=test_user.id,
+        name="test key",
+        prefix="fgy_live_abc",
+        key_hash="a" * 64,
+        created_at=datetime.now(UTC),
+    )
+
+
+@pytest.fixture
+async def api_client(
+    client: AsyncClient, test_api_key: ApiKey
+) -> AsyncGenerator[AsyncClient, None]:
+    """AsyncClient with API-key auth short-circuited and settings controlled.
+
+    Settings are replaced so developer-API tests don't depend on whether the
+    local .env has an ANTHROPIC_API_KEY.
+    """
+    settings = MagicMock(ANTHROPIC_API_KEY="test-anthropic-key", ANTHROPIC_MODEL="claude-test")
+    app.dependency_overrides[get_api_key] = lambda: test_api_key
+    app.dependency_overrides[get_settings] = lambda: settings
+    yield client
+    # client fixture teardown clears all dependency_overrides.

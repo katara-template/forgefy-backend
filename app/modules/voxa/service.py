@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 from google.cloud.firestore import AsyncClient
 
+from app.core.dispatch import dispatch
 from app.core.exceptions import NotFoundError, ValidationError
 from app.db.models.enums import Platform, SessionStatus
 from app.db.models.meeting_event import MeetingEvent
@@ -12,6 +13,14 @@ from app.db.models.meeting_session import MeetingSession
 from app.modules.voxa.state_machine import MeetingStateMachine
 
 logger = logging.getLogger(__name__)
+
+_ENDABLE = frozenset({SessionStatus.JOINING, SessionStatus.LISTENING})
+_ALREADY_ENDED = frozenset({
+    SessionStatus.PROCESSING,
+    SessionStatus.BLUEPRINT_READY,
+    SessionStatus.APPROVED,
+    SessionStatus.BUILDING,
+})
 
 
 def _doc_to_session(doc) -> MeetingSession:
@@ -55,6 +64,11 @@ class VoxaService:
         meeting_url: str | None = None,
     ) -> MeetingSession:
         """Create a session in WAITING state and log the creation event."""
+        if platform != Platform.PHYSICAL and not (meeting_url and meeting_url.strip()):
+            raise ValidationError(
+                "A meeting URL is required for Google Meet, Zoom, and Teams sessions."
+            )
+
         session_id = str(uuid.uuid4())
         now = datetime.now(UTC)
 
@@ -131,7 +145,14 @@ class VoxaService:
         if session.platform != Platform.PHYSICAL:
             from app.workers.connector_worker import dispatch_connector
             dispatch_connector.apply_async(
-                args=[str(session_id), session.platform.value, session.meeting_url],
+                # user_id lets a self-hosted Zoom bot mint the OBF token it
+                # needs from this user's Zoom grant; Recall ignores it.
+                args=[
+                    str(session_id),
+                    session.platform.value,
+                    session.meeting_url,
+                    str(session.user_id),
+                ],
                 queue="meeting.audio",
             )
         return session
@@ -166,31 +187,83 @@ class VoxaService:
         session_id: uuid.UUID,
         user_id: uuid.UUID,
     ) -> MeetingSession:
-        """End the meeting: transition to PROCESSING and record end_time."""
+        """End the meeting: transition to PROCESSING and record end_time.
+
+        Idempotent with the bot-detected meeting end: if the session was
+        already ended (by the Recall webhook or a double click), return it
+        as-is instead of erroring.
+        """
+        from app.core.exceptions import InvalidStateTransition
+
         session = await self._require_owned(session_id, user_id)
 
-        endable = {SessionStatus.JOINING, SessionStatus.LISTENING}
-        if session.status not in endable:
+        if session.status in _ALREADY_ENDED:
+            return session
+
+        if session.status not in _ENDABLE:
             raise ValidationError(
                 f"Cannot end a session in '{session.status.value}' state"
             )
 
-        session = await self._sm.transition(session_id, SessionStatus.PROCESSING)
-        end_time = datetime.now(UTC)
-        await self._db.collection("sessions").document(str(session_id)).update(
-            {"end_time": end_time}
-        )
-        session.end_time = end_time
+        try:
+            return await self._finalize_end(session, remove_bot=True)
+        except InvalidStateTransition:
+            # Raced with the bot-detected end — the session is already
+            # PROCESSING and the blueprint is on its way.
+            return await self._require_owned(session_id, user_id)
 
-        if session.platform != Platform.PHYSICAL:
-            from app.workers.connector_worker import recall_remove_bot
-            recall_remove_bot.apply_async(args=[str(session_id)], queue="meeting.audio")
+    async def end_session_from_bot(self, session_id: uuid.UUID) -> MeetingSession | None:
+        """End a session when the bot reports the meeting itself ended.
+
+        Runs the same pipeline as the frontend end button (end_session),
+        minus the ownership check (Recall's webhook is the caller) and the
+        bot removal (the bot already left). Returns None when there is
+        nothing to do — session missing or already ended.
+        """
+        from app.core.exceptions import InvalidStateTransition
+
+        doc = await self._db.collection("sessions").document(str(session_id)).get()
+        if not doc.exists:
+            return None
+
+        session = _doc_to_session(doc)
+        if session.status not in _ENDABLE:
+            return None
+
+        try:
+            return await self._finalize_end(session, remove_bot=False)
+        except InvalidStateTransition:
+            return None
+
+    async def regenerate_blueprint(
+        self,
+        session_id: uuid.UUID,
+        user_id: uuid.UUID,
+    ) -> MeetingSession:
+        """Re-run blueprint generation for a session whose last attempt failed.
+
+        The transcript and extracted requirements are already stored, so only
+        the aggregation step repeats — the meeting is not rejoined and
+        end_time is left as originally recorded.
+        """
+        session = await self._require_owned(session_id, user_id)
+
+        if session.status != SessionStatus.FAILED:
+            raise ValidationError(
+                f"Can only retry blueprint generation for a failed session, "
+                f"not one in '{session.status.value}' state"
+            )
+
+        session = await self._sm.transition(session_id, SessionStatus.PROCESSING)
 
         from app.workers.blueprint_worker import generate_blueprint
-        generate_blueprint.apply_async(
+        await dispatch(
+            generate_blueprint,
             args=[str(session_id)],
             queue="meeting.extract",
         )
+
+        logger.info("Blueprint regeneration requested session=%s", session_id)
         return session
 
     async def get_session(
@@ -227,6 +300,44 @@ class VoxaService:
         return session, events
 
     # ── Private helpers ───────────────────────────────────────────────────────
+
+    async def _finalize_end(
+        self,
+        session: MeetingSession,
+        *,
+        remove_bot: bool,
+    ) -> MeetingSession:
+        """Shared end-of-meeting pipeline: PROCESSING + end_time + blueprint.
+
+        Raises InvalidStateTransition if another caller ended the session
+        between the caller's status check and the transition.
+        """
+        session_id = session.id
+        platform = session.platform
+
+        session = await self._sm.transition(session_id, SessionStatus.PROCESSING)
+        end_time = datetime.now(UTC)
+        await self._db.collection("sessions").document(str(session_id)).update(
+            {"end_time": end_time}
+        )
+        session.end_time = end_time
+
+        if remove_bot and platform != Platform.PHYSICAL:
+            # Dispatches on which bot actually served this session (Recall or a
+            # self-hosted Zoom container) rather than on current config, so a
+            # session started before ZOOM_BOT_PROVIDER changed is still torn
+            # down by the connector that created it.
+            from app.workers.zoom_bot_worker import remove_bot_for_session
+            remove_bot_for_session.apply_async(
+                args=[str(session_id)], queue="meeting.audio"
+            )
+
+        from app.workers.blueprint_worker import generate_blueprint
+        generate_blueprint.apply_async(
+            args=[str(session_id)],
+            queue="meeting.extract",
+        )
+        return session
 
     async def _require_owned(
         self,

@@ -35,7 +35,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
     from app.build.build_agent import run_update_agent
     from app.build.cancel import clear_cancel, is_cancelled
     from app.build.workspace import EditWorkspace
-    from app.core.usage import get_user_tier, is_over_limit, record_usage
+    from app.core.usage import record_usage
     from app.db.firebase import refresh_async_firestore_client
 
     settings = get_settings()
@@ -55,32 +55,50 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
     template_key: str = project.get("template_key", "")
     blueprint_context: dict = project.get("blueprint_context") or {}
 
+    # A previous run may have stopped with work outstanding. If so, a bare
+    # "continue" resolves to that original request rather than being treated as
+    # a new (and meaningless) instruction.
+    from app.build import resume_state
+    unfinished = resume_state.pending(project)
+    prompt = resume_state.resolve_request(prompt, unfinished)
+
     # Get the right GitHub token (validates personal token; falls back to system if invalid)
     from app.build.github_token import get_valid_github_token
     github_token = await get_valid_github_token(user_id, settings.GITHUB_TOKEN)
     push_url = f"https://{github_token}@github.com/{repo_full_name}.git"
 
-    # Check token quota before doing any expensive work
-    user_tier = await get_user_tier(db, user_id)
-    if await is_over_limit(db, user_id, user_tier):
-        from app.build.build_logger import publish_user_event
-        from app.core.tiers import get_tier
-        tier = get_tier(user_tier)
-        error_msg = (
-            f"You've used all {tier.monthly_tokens:,} tokens in your {tier.name} plan this month. "
-            "Upgrade to continue."
-        )
+    # Check token quota before doing any expensive work. Free users over budget
+    # are blocked; paid users are downgraded to the free model and keep going
+    # (see app/core/usage.py evaluate_quota). quota_forced_model, when set,
+    # overrides the resolved build_model below.
+    from app.build.build_logger import publish_user_event
+    from app.core.tiers import get_tier
+    from app.core.usage import evaluate_quota
+    quota = await evaluate_quota(db, settings, user_id)
+    tier = get_tier(quota.tier_key)
+    quota_forced_model: str | None = None
+    if quota.action == "block":
         await _patch_project(project_id, {
-            "build_error": error_msg,
+            "build_error": quota.message,
             "build_error_action": "support",
             "updated_at": datetime.now(UTC),
         })
         publish_user_event(
-            settings.REDIS_URL, user_id, "quota_exceeded", error_msg,
-            tier=user_tier, limit=tier.monthly_tokens,
+            settings.REDIS_URL, user_id, "quota_exceeded", quota.message,
+            tier=quota.tier_key, limit=tier.monthly_tokens,
         )
-        logger.warning("Update blocked — token limit reached user=%s tier=%s", user_id, user_tier)
+        logger.warning("Update blocked — token limit reached user=%s tier=%s", user_id, quota.tier_key)
         return {"blocked": "token_limit"}
+    if quota.action == "downgrade":
+        quota_forced_model = quota.forced_model
+        publish_user_event(
+            settings.REDIS_URL, user_id, "quota_downgrade", quota.message,
+            tier=quota.tier_key, limit=tier.monthly_tokens, forced_model=quota.forced_model,
+        )
+        logger.info(
+            "Update over quota — downgraded to free model=%s user=%s tier=%s",
+            quota.forced_model, user_id, quota.tier_key,
+        )
 
     await _patch_project(project_id, {"is_updating": True})
 
@@ -88,14 +106,38 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
 
     from app.build.build_logger import make_log_publisher
     log_fn = make_log_publisher(project_id, settings.REDIS_URL)
+    if quota_forced_model:
+        log_fn("warning", quota.message)
     log_fn("started", f"Applying update to {app_name}…")
+
+    # Checkpoints the workspace to GitHub while the agent works, so an ending we
+    # never get to handle — exhausted budget, OOM kill, timeout — still leaves
+    # the user's code on GitHub instead of in a workspace we are about to delete.
+    from app.build.auto_sync import WorkspaceAutoSync
+    syncer = WorkspaceAutoSync(workspace, push_url, label="update")
 
     try:
         workspace.ensure()
-        log_fn("info", "Workspace ready, running update agent…")
+
+        # Install before the agent runs — analyze_code() reports every import as
+        # unresolved in a tree with no node_modules / resolved Dart packages, and
+        # the validator reads those as real errors.
+        log_fn("info", "Workspace ready, installing dependencies…")
+        from app.build.workspace import install_dependencies_at
+        install_dependencies_at(workspace.path, template_key, log_fn=log_fn)
+
+        log_fn("info", "Running update agent…")
+
+        # Start only now: before this point the workspace may not exist, and
+        # dependency install churns node_modules/.dart_tool for minutes with
+        # nothing worth saving.
+        syncer.start()
 
         from app.core.build_model import get_effective_build_model
-        build_model = await get_effective_build_model(db, settings)
+        build_model = await get_effective_build_model(db, settings, user_id=user_id)
+        # A paid user over quota is downgraded to the free model for this update.
+        if quota_forced_model:
+            build_model = quota_forced_model
 
         # Build a condensed history of previous requests + what was done so the
         # agent understands what already exists and doesn't repeat or contradict it.
@@ -128,20 +170,39 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         except Exception:
             pass  # non-fatal — fall back to the bare prompt
 
+        # Prepended last so it sits at the top: the agent must know it is
+        # resuming before it reads either the history or the request.
+        contextual_prompt = resume_state.resume_context(unfinished) + contextual_prompt
+
         if build_model == "Qwen3":
-            from app.build.build_agent import run_update_agent_ollama
-            summary, tokens_used = run_update_agent_ollama(
-                workspace=workspace.path,
-                prompt=contextual_prompt,
-                blueprint=blueprint_context,
-                app_name=app_name,
-                template_key=template_key,
-                base_url=settings.OLLAMA_URL,
-                model=settings.OLLAMA_MODEL,
-                timeout=settings.OLLAMA_TIMEOUT,
-                log_fn=log_fn,
-                cancel_fn=cancel_fn,
-            )
+            from app.ai.qwen import using_openrouter
+
+            if using_openrouter():
+                from app.build.build_agent import run_update_agent_openrouter
+                summary, tokens_used = run_update_agent_openrouter(
+                    workspace=workspace.path,
+                    prompt=contextual_prompt,
+                    blueprint=blueprint_context,
+                    app_name=app_name,
+                    template_key=template_key,
+                    log_fn=log_fn,
+                    cancel_fn=cancel_fn,
+                )
+            else:
+                from app.ai.ollama_http import ollama_base_url, ollama_build_model
+                from app.build.build_agent import run_update_agent_ollama
+                summary, tokens_used = run_update_agent_ollama(
+                    workspace=workspace.path,
+                    prompt=contextual_prompt,
+                    blueprint=blueprint_context,
+                    app_name=app_name,
+                    template_key=template_key,
+                    base_url=ollama_base_url(settings),
+                    model=ollama_build_model(settings),
+                    timeout=settings.OLLAMA_TIMEOUT,
+                    log_fn=log_fn,
+                    cancel_fn=cancel_fn,
+                )
         elif build_model == "gemini":
             from app.build.build_agent import run_update_agent_gemini
             summary, tokens_used = run_update_agent_gemini(
@@ -183,6 +244,16 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         logger.info("Update agent used %d tokens project=%s", tokens_used, project_id)
         await record_usage(db, user_id, tokens_used, is_update=True)
 
+        # Forgefy UI SDK (layout/animation) — gated by FORGEFY_UI_ENABLED; applies
+        # to every app of this template.
+        from app.build.workspace import ensure_forgefy_ui_dependency, stamp_forgefy_signature
+        ensure_forgefy_ui_dependency(workspace.path, template_key)
+
+        # Provenance: stamp the Forgefy signature banner into the app's entry file.
+        # Idempotent, so re-running on an already-stamped app is a no-op; this also
+        # backfills the banner into apps built before this feature on their next edit.
+        stamp_forgefy_signature(workspace.path, template_key)
+
         # If a database is connected for this project, keep .env in sync with
         # the real values (see app/build/workspace.py) in case the agent
         # rewrote them.
@@ -205,12 +276,15 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         was_stopped = cancel_fn()
         clear_cancel(settings.REDIS_URL, project_id)
 
-        pushed = workspace.sync_to_github(
-            commit_message=f"feat: {prompt[:60]}",  # original short prompt, not the full context
-            push_url=push_url,
-        )
-        if pushed:
-            log_fn("info", "Changes pushed to GitHub.")
+        # Stop checkpointing before the final commit so the two cannot interleave.
+        syncer.stop(f"feat: {prompt[:60]}")  # original short prompt, not the full context
+        # NOT just the final sync's result: a checkpoint may already have pushed
+        # every change, leaving the final commit with nothing to stage. Reading
+        # that as "no changes" would skip the preview build and tell the user
+        # their agent did nothing.
+        pushed = syncer.pushed_anything
+        # Silent to the user: the push is background bookkeeping — the "done"
+        # message below is what the user actually needs.
 
         raw = (summary or "").strip()
         # Extract the human-readable part of the summary.
@@ -241,6 +315,19 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         }
         if env_local_content is not None:
             patch["env_local_template"] = env_local_content
+
+        # Record whether anything is still outstanding, so a later "continue"
+        # knows what was in flight. Cleared on a clean finish so a completed
+        # update cannot be resumed into by a stale record.
+        if hit_limit or was_stopped:
+            patch.update(resume_state.record(
+                request=prompt,
+                reason="stopped" if was_stopped else "step_limit",
+                progress=clean_summary,
+            ))
+        else:
+            patch.update(resume_state.clear())
+
         await _patch_project(project_id, patch)
 
         if was_stopped:
@@ -267,7 +354,8 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
             log_fn(
                 "warning",
                 "The agent pushed partial changes but hit its step limit before finishing. "
-                "Send the same request again to continue — it will pick up where it left off."
+                "Send \"continue\" whenever you're ready — it will resume this request "
+                "from where it stopped rather than starting over."
             )
             logger.warning("Preview build skipped — agent hit iteration limit project=%s", project_id)
         else:
@@ -294,15 +382,29 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         return {"summary": summary, "pushed": pushed}
 
     except Exception as exc:
+        # Save whatever the agent produced before it failed. `finally` deletes
+        # the workspace, so this is the last chance — and a partial update the
+        # user can inspect beats spending their tokens for nothing.
+        saved = syncer.stop("chore: partial update (run did not complete)")
+        if saved or syncer.pushed_anything:
+            log_fn("info", "Partial changes were saved to GitHub before the failure.")
+
         from app.core.build_errors import sanitize_build_error
         build_err = sanitize_build_error(exc)
         logger.error("Update FAILED project=%s: %s", project_id, exc, exc_info=True)
-        await _patch_project(project_id, {
+        failure_patch: dict = {
             "is_updating": False,
             "build_error": build_err.message,
             "build_error_action": build_err.action,
             "updated_at": datetime.now(UTC),
-        })
+        }
+        # The request is unfinished by definition — let the user resume it.
+        failure_patch.update(resume_state.record(
+            request=prompt,
+            reason="quota" if build_err.action == "upgrade" else "error",
+            progress=(project.get("last_summary") or "") if saved else "",
+        ))
+        await _patch_project(project_id, failure_patch)
         log_fn("error", f"Update failed: {build_err.message}")
         raise
 

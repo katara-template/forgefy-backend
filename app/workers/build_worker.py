@@ -7,13 +7,26 @@ import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
+from app.build.auto_sync import WorkspaceAutoSync
 from app.config import get_settings
 from app.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
 _TEMPLATE_KEYS = frozenset({"flutter", "react_native", "next"})
+
+
+def _label(item: Any, key: str) -> str:
+    """Render a blueprint feature/entity as a short log label.
+
+    Blueprint items are dicts, but older sessions stored bare strings — handle
+    both so a build log never dumps a raw dict at the user.
+    """
+    if isinstance(item, dict):
+        return str(item.get(key) or item.get("name") or item.get("title") or "").strip() or "?"
+    return str(item)
 
 
 class _BuildFixExhausted(RuntimeError):
@@ -104,6 +117,20 @@ def _make_fix_prompt_with_hint(error_msg: str, template_key: str, retry_hint: bo
     return warning + base
 
 
+def _kill_agent_jobs(workspace_path: Path) -> None:
+    """Stop background jobs the agent started, on the build's way out.
+
+    Best-effort: this runs on cancel and failure paths, where an exception here
+    would replace the real reason the build ended.
+    """
+    try:
+        from app.build.jobs import kill_all_jobs
+
+        kill_all_jobs(workspace_path)
+    except Exception as exc:  # noqa: BLE001 — cleanup must never mask the outcome
+        logger.warning("Could not stop background jobs: %s", exc)
+
+
 def _run_agent_fix(
     workspace_path: Path,
     error_msg: str,
@@ -123,17 +150,29 @@ def _run_agent_fix(
     fix_prompt = _make_fix_prompt_with_hint(error_msg, template_key, retry_hint)
 
     if settings.BUILD_MODEL == "Qwen3":
-        from app.build.build_agent import run_fix_agent_ollama
-        summary, _ = run_fix_agent_ollama(
-            workspace=workspace_path,
-            prompt=fix_prompt,
-            app_name=app_name,
-            template_key=template_key,
-            base_url=settings.OLLAMA_URL,
-            model=settings.OLLAMA_MODEL,
-            timeout=settings.OLLAMA_TIMEOUT,
-            log_fn=log_fn,
-        )
+        from app.ai.qwen import using_openrouter
+        from app.build.build_agent import run_fix_agent_ollama, run_fix_agent_openrouter
+
+        if using_openrouter():
+            summary, _ = run_fix_agent_openrouter(
+                workspace=workspace_path,
+                prompt=fix_prompt,
+                app_name=app_name,
+                template_key=template_key,
+                log_fn=log_fn,
+            )
+        else:
+            from app.ai.ollama_http import ollama_base_url, ollama_build_model
+            summary, _ = run_fix_agent_ollama(
+                workspace=workspace_path,
+                prompt=fix_prompt,
+                app_name=app_name,
+                template_key=template_key,
+                base_url=ollama_base_url(settings),
+                model=ollama_build_model(settings),
+                timeout=settings.OLLAMA_TIMEOUT,
+                log_fn=log_fn,
+            )
     elif settings.BUILD_MODEL == "gemini":
         from app.build.build_agent import run_fix_agent_gemini
         summary, _ = run_fix_agent_gemini(
@@ -180,14 +219,7 @@ def _cf_project_name(name: str) -> str:
     slug = re.sub(r"[^a-z0-9-]", "-", name.lower())
     slug = re.sub(r"-+", "-", slug).strip("-")
     return (slug or "forgefy-app")[:28].rstrip("-")
-
 def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
-    """Deploy to Cloudflare Pages. Returns the preview URL on success.
-
-    Returns None (silently) only when credentials are not configured — that is a
-    soft skip, not a failure. Raises RuntimeError for all actual deploy failures
-    so the caller can surface the real error to the user.
-    """
     import os
     import subprocess
 
@@ -203,55 +235,131 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
     env["CI"] = "true"
     env["WRANGLER_SEND_METRICS"] = "false"
 
-    # Step 1: Ensure the project exists (create if missing — ignore failure,
-    # project likely already exists)
-    create_result = subprocess.run(
-        [
-            "npx", "--yes", "wrangler@3", "pages", "project", "create", cf_name,
-            "--production-branch", "main",
-        ],
-        capture_output=True, text=True, env=env, timeout=30,
-    )
-    if create_result.returncode == 0:
-        logger.info("Cloudflare Pages project '%s' created", cf_name)
-    else:
-        logger.info(
-            "Cloudflare Pages project '%s' may already exist: %s",
-            cf_name, (create_result.stdout + create_result.stderr)[-300:],
-        )
+    # Stamp Forgefy SEO provenance meta into the built HTML before it ships.
+    from app.build.workspace import inject_forgefy_seo_meta
+    inject_forgefy_seo_meta(build_dir)
 
-    # Step 2: Deploy
     try:
+        # Step 1: Ensure the project exists (create if missing)
+        create_result = subprocess.run(
+            [
+                "npx", "--yes", "wrangler@3", "pages", "project", "create", cf_name,
+                "--production-branch", "main",
+            ],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        create_output = create_result.stdout + create_result.stderr
+        if create_result.returncode == 0:
+            logger.info("Cloudflare Pages project '%s' created", cf_name)
+        else:
+            logger.info("Cloudflare Pages project '%s' may already exist: %s", cf_name, create_output[-300:])
+
+        # Step 2: Deploy as preview (non-production branch)
         result = subprocess.run(
             [
                 "npx", "--yes", "wrangler@3", "pages", "deploy", str(build_dir),
                 "--project-name", cf_name,
-                "--branch", "main",
+                "--branch", "preview",
                 "--commit-dirty", "true",
             ],
             capture_output=True, text=True, env=env, timeout=180,
         )
+        output = result.stdout + result.stderr
+        logger.info("Wrangler output (rc=%d):\n%s", result.returncode, output[-1500:])
+
+        match = re.search(r"https://[^\s]+\.pages\.dev[^\s]*", output)
+        if match:
+            url = match.group(0).rstrip(".")
+            logger.info("Cloudflare Pages preview deployed → %s", url)
+            return url
+
+        if result.returncode != 0:
+            print(f"Wrangler deploy failed with code {result.returncode}:\n{output}")
+            logger.warning("Wrangler exited with code %d — deploy failed", result.returncode)
+        else:
+            print(f"Wrangler deploy succeeded but no pages.dev URL found:\n{output}")
+            logger.warning("Wrangler succeeded but no pages.dev URL found in output")
+        return None
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Cloudflare Pages deploy timed out after 180 s — try again or check your Cloudflare dashboard.") from exc
+        print(f"Wrangler deploy timed out: {exc}")
+        logger.warning("Cloudflare Pages deploy timed out")
+        return None
+    except Exception as exc:
+        print(f"Wrangler deploy failed: {exc}")
+        logger.warning("Cloudflare Pages deploy failed (non-fatal): %s", exc)
+        return None
 
-    output = (result.stdout + result.stderr).strip()
-    logger.info("Wrangler output (rc=%d):\n%s", result.returncode, output[-1500:])
+# def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
+#     """Deploy to Cloudflare Pages. Returns the preview URL on success.
 
-    match = re.search(r"https://[^\s]+\.pages\.dev[^\s]*", output)
-    if match:
-        url = match.group(0).rstrip(".")
-        logger.info("Cloudflare Pages deployed → %s", url)
-        return url
+#     Returns None (silently) only when credentials are not configured — that is a
+#     soft skip, not a failure. Raises RuntimeError for all actual deploy failures
+#     so the caller can surface the real error to the user.
+#     """
+#     import os
+#     import subprocess
 
-    # No URL found — surface the real wrangler output as the error
-    snippet = output[-800:] if len(output) > 800 else output
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Cloudflare Pages deploy failed (exit {result.returncode}):\n{snippet}"
-        )
-    raise RuntimeError(
-        f"Cloudflare Pages deploy succeeded but no pages.dev URL was returned:\n{snippet}"
-    )
+#     settings = get_settings()
+#     if not settings.CLOUDFLARE_ACCOUNT_ID or not settings.CLOUDFLARE_API_TOKEN:
+#         logger.warning("Cloudflare Pages skipped — CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_API_TOKEN not set")
+#         return None
+
+#     cf_name = _cf_project_name(project_name)
+#     env = os.environ.copy()
+#     env["CLOUDFLARE_ACCOUNT_ID"] = settings.CLOUDFLARE_ACCOUNT_ID
+#     env["CLOUDFLARE_API_TOKEN"] = settings.CLOUDFLARE_API_TOKEN
+#     env["CI"] = "true"
+#     env["WRANGLER_SEND_METRICS"] = "false"
+
+#     # Step 1: Ensure the project exists (create if missing — ignore failure,
+#     # project likely already exists)
+#     create_result = subprocess.run(
+#         [
+#             "npx", "--yes", "wrangler@3", "pages", "project", "create", cf_name,
+#             "--production-branch", "main",
+#         ],
+#         capture_output=True, text=True, env=env, timeout=30,
+#     )
+#     if create_result.returncode == 0:
+#         logger.info("Cloudflare Pages project '%s' created", cf_name)
+#     else:
+#         logger.info(
+#             "Cloudflare Pages project '%s' may already exist: %s",
+#             cf_name, (create_result.stdout + create_result.stderr)[-300:],
+#         )
+
+#     # Step 2: Deploy
+#     try:
+#         result = subprocess.run(
+#             [
+#                 "npx", "--yes", "wrangler@3", "pages", "deploy", str(build_dir),
+#                 "--project-name", cf_name,
+#                 "--branch", "preview",
+#                 "--commit-dirty", "true",
+#             ],
+#             capture_output=True, text=True, env=env, timeout=180,
+#         )
+#     except subprocess.TimeoutExpired as exc:
+#         raise RuntimeError("Cloudflare Pages deploy timed out after 180 s — try again or check your Cloudflare dashboard.") from exc
+
+#     output = (result.stdout + result.stderr).strip()
+#     logger.info("Wrangler output (rc=%d):\n%s", result.returncode, output[-1500:])
+
+#     match = re.search(r"https://[^\s]+\.pages\.dev[^\s]*", output)
+#     if match:
+#         url = match.group(0).rstrip(".")
+#         logger.info("Cloudflare Pages deployed → %s", url)
+#         return url
+
+#     # No URL found — surface the real wrangler output as the error
+#     snippet = output[-800:] if len(output) > 800 else output
+#     if result.returncode != 0:
+#         raise RuntimeError(
+#             f"Cloudflare Pages deploy failed (exit {result.returncode}):\n{snippet}"
+#         )
+#     raise RuntimeError(
+#         f"Cloudflare Pages deploy succeeded but no pages.dev URL was returned:\n{snippet}"
+#     )
 
 
 # def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
@@ -491,21 +599,25 @@ async def _run(session_id: str, project_id: str) -> dict:
     from app.build.github_token import get_valid_github_token
     sess_doc = await db.collection("sessions").document(session_id).get()
     owner_id: str = sess_doc.to_dict()["user_id"] if sess_doc.exists else ""
+
+    from app.core.build_model import get_effective_build_model
+    effective_model = await get_effective_build_model(db, settings, user_id=owner_id)
+    settings = settings.model_copy(update={"BUILD_MODEL": effective_model})
+
     github_token = await get_valid_github_token(owner_id, settings.GITHUB_TOKEN)
     # True when user hasn't connected their GitHub — repo lands on the platform account
     using_platform_github: bool = github_token == settings.GITHUB_TOKEN
 
-    # 5. Check the user's token quota before doing any expensive work
-    from app.core.usage import get_user_tier, is_over_limit
-    user_tier = await get_user_tier(db, owner_id)
-    if await is_over_limit(db, owner_id, user_tier):
-        from app.build.build_logger import publish_user_event
-        from app.core.tiers import get_tier
-        tier = get_tier(user_tier)
-        error_msg = (
-            f"You've used all {tier.monthly_tokens:,} tokens in your {tier.name} plan this month. "
-            "Upgrade to continue building."
-        )
+    # 5. Check the user's token quota before doing any expensive work.
+    # Free users over budget are blocked; paid users are downgraded to the free
+    # model and keep building (see app/core/usage.py evaluate_quota).
+    from app.build.build_logger import publish_user_event
+    from app.core.tiers import get_tier
+    from app.core.usage import evaluate_quota
+    quota = await evaluate_quota(db, settings, owner_id)
+    tier = get_tier(quota.tier_key)
+    quota_downgrade_notice: str | None = None
+    if quota.action == "block":
         now = datetime.now(UTC)
         await db.collection("projects").document(project_id).set({
             "owner_id": owner_id,
@@ -519,18 +631,29 @@ async def _run(session_id: str, project_id: str) -> dict:
             "preview_url": None,
             "artifact_url": None,
             "is_updating": False,
-            "build_error": error_msg,
+            "build_error": quota.message,
             "build_error_action": "support",
             "blueprint_context": json_output,
             "created_at": now,
             "updated_at": now,
         })
         publish_user_event(
-            settings.REDIS_URL, owner_id, "quota_exceeded", error_msg,
-            tier=user_tier, limit=tier.monthly_tokens,
+            settings.REDIS_URL, owner_id, "quota_exceeded", quota.message,
+            tier=quota.tier_key, limit=tier.monthly_tokens,
         )
-        logger.warning("Build blocked — token limit reached user=%s tier=%s", owner_id, user_tier)
+        logger.warning("Build blocked — token limit reached user=%s tier=%s", owner_id, quota.tier_key)
         return {"project_id": project_id, "blocked": "token_limit"}
+    if quota.action == "downgrade":
+        settings = settings.model_copy(update={"BUILD_MODEL": quota.forced_model})
+        quota_downgrade_notice = quota.message  # shown in the build log once it opens
+        publish_user_event(
+            settings.REDIS_URL, owner_id, "quota_downgrade", quota.message,
+            tier=quota.tier_key, limit=tier.monthly_tokens, forced_model=quota.forced_model,
+        )
+        logger.info(
+            "Build over quota — downgraded to free model=%s user=%s tier=%s",
+            quota.forced_model, owner_id, quota.tier_key,
+        )
 
     # 6. Transition to BUILDING
     sm = MeetingStateMachine(db)
@@ -559,15 +682,17 @@ async def _run(session_id: str, project_id: str) -> dict:
     logger.info("Project stub created project=%s", project_id)
 
     log_fn = make_log_publisher(project_id, settings.REDIS_URL)
+    if quota_downgrade_notice:
+        log_fn("warning", quota_downgrade_notice)
     log_fn("started", f"Starting build for {app_name} ({template_key})")
 
     # Log the feature plan so users immediately see what will be built
-    features: list[str] = json_output.get("features") or []
-    entities: list[str] = json_output.get("entities") or []
+    features: list[Any] = json_output.get("features") or []
+    entities: list[Any] = json_output.get("entities") or []
     if features:
-        log_fn("info", f"Features to build: {', '.join(str(f) for f in features[:12])}")
+        log_fn("info", f"Features to build: {', '.join(_label(f, 'title') for f in features[:12])}")
     if entities:
-        log_fn("info", f"Data models: {', '.join(str(e) for e in entities[:8])}")
+        log_fn("info", f"Data models: {', '.join(_label(e, 'name') for e in entities[:8])}")
     stack_label = {"flutter": "Flutter", "react_native": "React Native", "next": "Next.js"}.get(template_key, template_key)
     log_fn("info", f"Stack: {stack_label} · scaffolding project structure…")
 
@@ -575,7 +700,17 @@ async def _run(session_id: str, project_id: str) -> dict:
     repo_url: str = ""
     repo_full_name: str = ""
 
-    workspace = Workspace(uuid.UUID(session_id), template_key, template_url, git_token=github_token)
+    # The template lives in Forgefy's own private org, so it must be cloned with
+    # the PLATFORM token. github_token above is the user's personal token when
+    # they have connected GitHub — that token cannot see katara-template/*, and
+    # GitHub answers 404 "Repository not found" rather than 403 for private repos
+    # you lack access to. It stays reserved for creating and pushing THEIR repo.
+    workspace = Workspace(
+        uuid.UUID(session_id), template_key, template_url, git_token=settings.GITHUB_TOKEN
+    )
+    # Assigned once the repo exists and push_url is known. Declared here so the
+    # error handlers below can reach it after a failure that happens earlier.
+    syncer: WorkspaceAutoSync | None = None
     try:
         # 7. Clone template
         workspace.clone()
@@ -584,13 +719,21 @@ async def _run(session_id: str, project_id: str) -> dict:
 
         # 8. Create GitHub repo and push template code immediately so it's live on GitHub
         gh = GitHubClient(github_token)
-        repo_data = gh.create_repo(
+        # Suffixes the name (app → app-2 → app-3 → app-<random>) when it is
+        # already taken. Rebuilding an app you have built before is normal, and
+        # previously failed the whole build with "rename your app and try again".
+        repo_data = gh.create_repo_unique(
             name=app_name,
             description=(json_output.get("app_description") or "")[:100],
             private=True,
         )
         repo_url = repo_data["html_url"]
         repo_full_name = repo_data["full_name"]
+        # app_name stays the user's chosen name; only the repo carries the
+        # suffix. Tell them when the two diverge so the GitHub link is not a
+        # surprise.
+        if repo_data["name"] != app_name:
+            log_fn("info", f"'{app_name}' was taken on GitHub — using '{repo_data['name']}'.")
         push_url = gh.get_push_url(repo_full_name)
 
         workspace.commit_all("chore: initial template")
@@ -604,6 +747,20 @@ async def _run(session_id: str, project_id: str) -> dict:
             "repo_owner": "platform" if using_platform_github else "user",
             "updated_at": now,
         })
+
+        # Resumability (Part: continue-after-interrupt). From this point the
+        # project has a GitHub repo that auto-sync keeps current, so an
+        # interrupted run is continuable from any device: this in-progress
+        # record says WHAT was being built, a later record (or clear) says how
+        # it ended. A bare "continue" in chat picks it up.
+        from app.build import resume_state as _resume_state
+        await db.collection("projects").document(project_id).update(
+            _resume_state.record(
+                _resume_state.build_request(json_output, app_name),
+                "error",  # placeholder until the run's real outcome overwrites it
+                kind="build",
+            )
+        )
         log_fn("info", f"Repository live on GitHub ({repo_url}). Generating design system…")
 
         # 8.5 Phase 0.5 — materialise design system files before the build agent reads them
@@ -619,21 +776,48 @@ async def _run(session_id: str, project_id: str) -> dict:
             logger.warning("Design system generation failed (non-fatal): %s", _ds_exc)
             log_fn("info", "Design system generation skipped — build agent will create styles.")
 
+        # 8.6 Install dependencies before the agent runs. Without this the
+        # validator's analyze_code() sees every import as unresolved and the fix
+        # pass burns iterations chasing errors that don't exist.
+        log_fn("info", "Installing dependencies…")
+        from app.build.workspace import install_dependencies_at
+        install_dependencies_at(workspace.path, template_key, log_fn=log_fn)
+
         log_fn("info", "Running build agent…")
+
+        # Checkpoint the workspace to GitHub while the agent works. A build that
+        # dies partway — exhausted budget, OOM kill, timeout — otherwise loses
+        # everything to the workspace.cleanup() in `finally`, even though the
+        # repo already exists and could have held the partial code.
+        # Started here: the repo and push_url exist, and the template is pushed.
+        syncer = WorkspaceAutoSync(workspace, push_url, label="build")
+        syncer.start()
 
         # 9. Run build agent — model selected by BUILD_MODEL (independent of BP_MODEL)
         if settings.BUILD_MODEL == "Qwen3":
-            from app.build.build_agent import run_build_agent_ollama
-            summary, tokens_used = run_build_agent_ollama(
-                workspace=workspace.path,
-                blueprint=json_output,
-                app_name=app_name,
-                template_key=template_key,
-                base_url=settings.OLLAMA_URL,
-                model=settings.OLLAMA_MODEL,
-                timeout=settings.OLLAMA_TIMEOUT,
-                log_fn=log_fn,
-            )
+            from app.ai.qwen import using_openrouter
+            from app.build.build_agent import run_build_agent_ollama, run_build_agent_openrouter
+
+            if using_openrouter():
+                summary, tokens_used = run_build_agent_openrouter(
+                    workspace=workspace.path,
+                    blueprint=json_output,
+                    app_name=app_name,
+                    template_key=template_key,
+                    log_fn=log_fn,
+                )
+            else:
+                from app.ai.ollama_http import ollama_base_url, ollama_build_model
+                summary, tokens_used = run_build_agent_ollama(
+                    workspace=workspace.path,
+                    blueprint=json_output,
+                    app_name=app_name,
+                    template_key=template_key,
+                    base_url=ollama_base_url(settings),
+                    model=ollama_build_model(settings),
+                    timeout=settings.OLLAMA_TIMEOUT,
+                    log_fn=log_fn,
+                )
         elif settings.BUILD_MODEL == "gemini":
             from app.build.build_agent import run_build_agent_gemini
             summary, tokens_used = run_build_agent_gemini(
@@ -668,6 +852,14 @@ async def _run(session_id: str, project_id: str) -> dict:
             )
         logger.info("Build agent used %d tokens session=%s", tokens_used, session_id)
 
+        # Forgefy UI SDK (layout/animation) — gated by FORGEFY_UI_ENABLED; applies
+        # to every app of this template, so it runs before the DB-specific injects.
+        from app.build.workspace import ensure_forgefy_ui_dependency, stamp_forgefy_signature
+        ensure_forgefy_ui_dependency(workspace.path, template_key)
+
+        # Provenance: stamp the Forgefy signature banner into the app's entry file.
+        stamp_forgefy_signature(workspace.path, template_key)
+
         # If a database is already connected for this project, replace the
         # agent's placeholders with the real values (see app/build/workspace.py).
         proj_doc = await db.collection("projects").document(project_id).get()
@@ -686,14 +878,47 @@ async def _run(session_id: str, project_id: str) -> dict:
                 "appId": proj_data.get("firebase_app_id"),
             })
 
+        # 9.5 Deterministic demo-screen guard. The prompt asks the agent to
+        # replace the template's demo launch page and the validator re-checks;
+        # both are LLM-driven and can be ignored. This scan is not: if the entry
+        # file still carries template-demo markers, force a targeted fix pass
+        # BEFORE anything is pushed, so a preview never opens on demo content.
+        try:
+            from app.build.demo_guard import demo_screen_present
+
+            _demo_hit, _demo_evidence = demo_screen_present(workspace.path, template_key)
+        except Exception as _dg_exc:  # a guard must never fail the build
+            logger.warning("demo guard error (non-fatal): %s", _dg_exc)
+            _demo_hit, _demo_evidence = False, ""
+        if _demo_hit:
+            log_fn("warning", "The launch page still shows template demo content — fixing…")
+            await _run_agent_fix(
+                workspace_path=workspace.path,
+                error_msg=(
+                    "The app's launch/entry screen still contains TEMPLATE DEMO content "
+                    f"({_demo_evidence}). Replace it with this application's real home "
+                    "screen built from the blueprint, delete or stop routing the demo "
+                    "screen, and make sure the router/navigator opens on real content."
+                ),
+                template_key=template_key,
+                app_name=app_name,
+                blueprint=json_output,
+                settings=settings,
+                log_fn=log_fn,
+            )
+            _still_hit, _ = demo_screen_present(workspace.path, template_key)
+            if _still_hit:
+                logger.warning("demo guard: fix pass did not clear the launch page session=%s", session_id)
+
         # Record usage against the user's monthly quota
         from app.core.usage import record_usage
         await record_usage(db, owner_id, tokens_used, is_build=True)
 
-        # 10. Push agent changes on top of the template commit
-        log_fn("info", "Pushing agent changes to GitHub…")
-        workspace.commit_all(f"feat: initial build by Forgefy\n\n{summary[:400]}")
-        workspace.push(push_url)
+        # 10. Push agent changes on top of the template commit.
+        # Through the syncer so it cannot interleave with a checkpoint; stopping
+        # it first also guarantees no further checkpoints during the deploy steps.
+        # Silent to the user: pushing is background bookkeeping, not build work.
+        syncer.stop(f"feat: initial build by Forgefy\n\n{summary[:400]}")
 
         # 11. Preview + artifact (all non-fatal)
         artifact_url: str | None = None
@@ -717,6 +942,9 @@ async def _run(session_id: str, project_id: str) -> dict:
             while True:
                 if is_cancelled(settings.REDIS_URL, session_id):
                     clear_cancel(settings.REDIS_URL, session_id)
+                    # Cancelling the loop does not stop what the agent spawned;
+                    # an orphaned npm install would outlive the build.
+                    _kill_agent_jobs(workspace.path)
                     log_fn("warning", "Build stopped by user.")
                     return {}
                 try:
@@ -815,6 +1043,9 @@ async def _run(session_id: str, project_id: str) -> dict:
             "build_error": None,
             "updated_at": now,
         }
+        # Build completed — nothing is outstanding, so drop the resume record.
+        from app.build import resume_state as _resume_state
+        proj_update.update(_resume_state.clear())
         if env_local_content is not None:
             proj_update["env_local_template"] = env_local_content
         await db.collection("projects").document(project_id).update(proj_update)
@@ -836,6 +1067,8 @@ async def _run(session_id: str, project_id: str) -> dict:
     except _BuildFixExhausted as exc:
         # Auto-fix ran out of attempts — code is on GitHub but wouldn't compile.
         # Do NOT say "the agent will attempt to fix" — it already tried and stopped.
+        if syncer is not None:
+            syncer.stop("chore: build stopped after auto-fix attempts")
         user_msg = (
             "The preview couldn't be compiled automatically. "
             "Your code is saved on GitHub — send a chat message like "
@@ -854,11 +1087,26 @@ async def _run(session_id: str, project_id: str) -> dict:
             proj_err["github_url"] = repo_url
             proj_err["repo_full_name"] = repo_full_name
             proj_err["repo_owner"] = "platform" if using_platform_github else "user"
+        # Auto-fix exhausted — the build itself is unfinished and continuable.
+        from app.build import resume_state as _resume_state
+        proj_err.update(_resume_state.record(
+            _resume_state.build_request(json_output, app_name),
+            "error",
+            progress=str(locals().get("summary", "") or ""),
+            kind="build",
+        ))
         await db.collection("projects").document(project_id).update(proj_err)
         log_fn("warning", user_msg)
         return {}
 
     except Exception as exc:
+        # Last chance to save the agent's work: `finally` deletes the workspace.
+        # No-op when the failure happened before the repo existed.
+        if syncer is not None:
+            saved = syncer.stop("chore: partial build (run did not complete)")
+            if saved or syncer.pushed_anything:
+                log_fn("info", "Partial code was saved to GitHub before the failure.")
+
         from app.core.build_errors import GENERIC_OPERATOR_MESSAGE, sanitize_build_error
         build_err = sanitize_build_error(exc)
         logger.error("Build FAILED session=%s: %s", session_id, exc, exc_info=True)
@@ -923,6 +1171,10 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
     settings = get_settings()
     db = refresh_async_firestore_client()
 
+    from app.core.build_model import get_effective_build_model
+    effective_model = await get_effective_build_model(db, settings, user_id=user_id)
+    settings = settings.model_copy(update={"BUILD_MODEL": effective_model})
+
     # Wipe any stale cancel flag before starting fresh work.
     from app.build.cancel import clear_cancel as _clear_cancel
     _clear_cancel(settings.REDIS_URL, project_id)
@@ -952,8 +1204,12 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
 
     workspace = EditWorkspace(uuid.UUID(project_id), repo_full_name, github_token)
     push_url = f"https://{github_token}@github.com/{repo_full_name}.git"
+    # The auto-fix loop below runs a code-writing agent, so this path can lose
+    # work the same way a build or update can.
+    syncer = WorkspaceAutoSync(workspace, push_url, label="preview")
     try:
         workspace.ensure()
+        syncer.start()
 
         # If a database is connected for this project, keep .env in sync with
         # the real values (see app/build/workspace.py) — a prior commit may
@@ -989,6 +1245,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         while True:
             if is_cancelled(settings.REDIS_URL, project_id):
                 clear_cancel(settings.REDIS_URL, project_id)
+                _kill_agent_jobs(workspace.path)
                 log_fn("warning", "Build stopped by user.")
                 return {}
             try:
@@ -1013,10 +1270,9 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
                 logger.warning("Auto-fix triggered project=%s attempt=%d streak=%d: %s", project_id, _fix_attempt, _same_err_streak, _err[:200])
                 fix_summary = _run_agent_fix(workspace.path, _err, template_key, app_name, blueprint, settings, log_fn, retry_hint=_same_err_streak > 0)
                 hit_limit = "iteration limit" in fix_summary.lower()
-                workspace.sync_to_github(
-                    commit_message="fix: auto-fix compilation errors",
-                    push_url=push_url,
-                )
+                # Through the syncer so it shares the lock with the background
+                # checkpoints and cannot run git concurrently with one.
+                syncer.sync_now("fix: auto-fix compilation errors")
                 if hit_limit:
                     _hit_limit_streak += 1
                     if _hit_limit_streak >= _MAX_HIT_LIMIT_STREAK:
@@ -1064,10 +1320,12 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         if artifact_url:
             updates["artifact_url"] = artifact_url
 
+        syncer.stop()
         await db.collection("projects").document(project_id).update(updates)
         return {"preview_url": preview_url, "artifact_url": artifact_url}
 
     except _BuildFixExhausted as exc:
+        syncer.stop("chore: preview stopped after auto-fix attempts")
         user_msg = (
             "The preview couldn't be compiled automatically. "
             "Send a chat message like 'Fix the build errors' and the agent will try again."
@@ -1083,6 +1341,10 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         return {}
 
     except Exception as exc:
+        # `finally` deletes the workspace — save any fix-agent output first.
+        if syncer.stop("chore: partial preview fixes (run did not complete)") or syncer.pushed_anything:
+            log_fn("info", "Partial fixes were saved to GitHub before the failure.")
+
         from app.core.build_errors import GENERIC_OPERATOR_MESSAGE, sanitize_build_error
         build_err = sanitize_build_error(exc)
         logger.error("Preview build FAILED project=%s: %s", project_id, exc, exc_info=True)

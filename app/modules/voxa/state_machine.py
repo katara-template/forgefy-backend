@@ -6,8 +6,13 @@ Valid transition graph:
 JOINING → PROCESSING is also allowed as a cancellation path when the bot
 joins but the meeting never reaches the LISTENING phase.
 
+FAILED → PROCESSING lets a user retry blueprint generation without starting a
+new session; the transcript is already captured, so only the aggregation step
+needs repeating.
+
 LISTENING sub-states (FEATURE_FOUND, QUESTION_FOUND, CONFLICT_FOUND,
-ACTION_ITEM_FOUND) are logged as events but do not change session.status.
+ACTION_ITEM_FOUND, ENTITY_FOUND) are logged as events but do not change
+session.status.
 """
 import uuid
 from datetime import UTC, datetime
@@ -26,11 +31,14 @@ _TRANSITIONS: dict[SessionStatus, frozenset[SessionStatus]] = {
     SessionStatus.BLUEPRINT_READY: frozenset({SessionStatus.APPROVED}),
     SessionStatus.APPROVED: frozenset({SessionStatus.BUILDING}),
     SessionStatus.BUILDING: frozenset(),
-    SessionStatus.FAILED: frozenset(),
+    # FAILED is recoverable, not terminal: blueprint generation fails for
+    # transient reasons (model timeouts, extraction still catching up) as often
+    # as real ones, so the user can retry it from the session page.
+    SessionStatus.FAILED: frozenset({SessionStatus.PROCESSING}),
 }
 
 LISTENING_SUB_STATES: frozenset[str] = frozenset(
-    {"FEATURE_FOUND", "QUESTION_FOUND", "CONFLICT_FOUND", "ACTION_ITEM_FOUND"}
+    {"FEATURE_FOUND", "QUESTION_FOUND", "CONFLICT_FOUND", "ACTION_ITEM_FOUND", "ENTITY_FOUND"}
 )
 
 

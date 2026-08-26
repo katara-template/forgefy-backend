@@ -26,18 +26,20 @@ async def ws_projects(
 ) -> None:
     """Stream the caller's project list; polls every 5 s for changes."""
     settings = get_settings()
+    # Accept before auth so a bad token surfaces as close code 4001 (client can
+    # refresh and retry) instead of a generic handshake 403.
+    await ws.accept()
     try:
         user_id_str = decode_access_token(token, settings)
     except Exception:
         await ws.close(code=4001, reason="Unauthorized")
         return
 
-    await ws.accept()
     logger.info("ws/projects connected user=%s", user_id_str)
     db = ws.app.state.firestore
     last_data: list | None = None
 
-    async def push() -> None:
+    async def push() -> bool:
         nonlocal last_data
         docs = await db.collection("projects").where("owner_id", "==", user_id_str).get()
         projects = sorted(
@@ -49,13 +51,21 @@ async def ws_projects(
         if data != last_data:
             last_data = data
             await ws.send_json({"type": "projects", "data": data})
+            return True
+        return False
 
+    # Poll fast while the list is changing, back off to 60 s when idle —
+    # a flat 5 s poll is ~17k Firestore queries/day per open tab, which
+    # alone can exhaust the free-tier daily read quota.
+    poll_min, poll_max = 5.0, 60.0
+    delay = poll_min
     try:
         await push()
         while True:
             with suppress(TimeoutError):
-                await asyncio.wait_for(ws.receive_text(), timeout=5.0)
-            await push()
+                await asyncio.wait_for(ws.receive_text(), timeout=delay)
+            changed = await push()
+            delay = poll_min if changed else min(delay * 2, poll_max)
     except WebSocketDisconnect:
         logger.info("ws/projects disconnected user=%s", user_id_str)
     except Exception:

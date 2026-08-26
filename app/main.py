@@ -1,11 +1,12 @@
 """FastAPI application factory."""
 import logging
+import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
@@ -13,6 +14,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.v1.router import router as api_v1_router
+from app.api.ws.assistant import router as ws_assistant_router
 from app.api.ws.build_logs import router as ws_build_logs_router
 from app.api.ws.projects import router as ws_projects_router
 from app.api.ws.sessions import router as ws_sessions_router
@@ -57,6 +59,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     firestore_client = init_firebase()
     app.state.firestore = firestore_client
 
+    # Absorb the first-call gRPC channel setup (~3s measured) at startup so it
+    # doesn't land on the first user request after a deploy or scale-up.
+    with suppress(Exception):
+        await firestore_client.collection("system").document("healthcheck").get()
+
     # Strip any ssl_cert_reqs query param from rediss:// URLs — redis-py
     # handles TLS via the scheme; the query param causes issues on newer versions.
     redis_url = settings.REDIS_URL
@@ -83,6 +90,15 @@ def create_app() -> FastAPI:
     """Construct and configure the FastAPI application."""
     settings = get_settings()
 
+    # Refuse to serve production traffic with the dev-default secrets — JWTs
+    # could be forged and encrypted-at-rest tokens decrypted by anyone who has
+    # read this repo.
+    if settings.APP_ENV == "production":
+        if settings.SECRET_KEY == "changeme":
+            raise RuntimeError("SECRET_KEY must be set to a real secret in production")
+        if settings.SECRETS_ENCRYPTION_KEY.startswith("changeme"):
+            raise RuntimeError("SECRETS_ENCRYPTION_KEY must be set to a real secret in production")
+
     app = FastAPI(
         title="Forgefy Backend",
         description="Meeting Mode — AI orchestration backend",
@@ -92,16 +108,64 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # ── Request timing ─────────────────────────────────────────────────────────
+    # Every response carries a Server-Timing header (visible per-request in the
+    # browser devtools Network tab) so slow endpoints can be spotted without
+    # extra tooling; anything over 1s is also logged server-side.
+    @app.middleware("http")
+    async def server_timing(request: Request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start) * 1000
+        response.headers["Server-Timing"] = f"app;dur={duration_ms:.1f}"
+        if duration_ms > 1000:
+            logger.warning(
+                "slow request: %s %s took %.0f ms",
+                request.method, request.url.path, duration_ms,
+            )
+        return response
+
+    # ── Security headers ───────────────────────────────────────────────────────
+    # The API serves JSON only, so these are cheap blanket protections:
+    # nosniff stops MIME-confusion attacks, DENY stops the API (incl. /docs)
+    # being framed, no-referrer keeps tokens/paths out of third-party logs,
+    # and HSTS (production only, where TLS is guaranteed) pins browsers to HTTPS.
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        if settings.APP_ENV == "production":
+            response.headers.setdefault(
+                "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
+            )
+        return response
+
     # ── Rate limiting (shared singleton from core.rate_limit) ─────────────────
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
     app.add_middleware(SlowAPIMiddleware)
 
     # ── CORS ──────────────────────────────────────────────────────────────────
+    # Origins come from the CORS_ORIGINS setting (JSON array, Python-style list,
+    # or comma-separated — see config.parse_cors_origins).
+    #
+    # A literal "*" is honoured but forces allow_credentials off: Starlette
+    # echoes the caller's Origin back when wildcard and credentials are combined,
+    # which lets *any* site make credentialed cross-origin calls. Auth here is
+    # Bearer-header rather than cookie-based, so dropping credentials costs
+    # nothing and removes that footgun.
+    cors_origins = list(settings.CORS_ORIGINS)
+    allow_all_origins = "*" in cors_origins
+    if allow_all_origins and settings.APP_ENV == "production":
+        logger.warning(
+            "CORS_ORIGINS contains '*' in production — set an explicit origin allowlist"
+        )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.CORS_ORIGINS,
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials=not allow_all_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -116,6 +180,7 @@ def create_app() -> FastAPI:
     app.include_router(ws_projects_router)
     app.include_router(ws_build_logs_router)
     app.include_router(ws_user_events_router)
+    app.include_router(ws_assistant_router)
     # default route for sanity check    
     @app.get("/", tags=["ops"], summary="Sanity check")
     async def root() -> dict[str, str]:
@@ -123,6 +188,12 @@ def create_app() -> FastAPI:
         return {"message": "Forgefy backend is up and running!"}
     
     # ── Ops endpoints ─────────────────────────────────────────────────────────
+    # Orchestrators probe /health every few seconds; cache the dependency
+    # checks briefly so probes don't consume Firestore read quota all day.
+    # Kept on app.state so tests can reset it between cases.
+    app.state.health_cache = {"at": 0.0, "checks": None}
+    health_cache_ttl = 25.0
+
     @app.get("/health", tags=["ops"], summary="Liveness + dependency readiness probe")
     async def health(db: DBSession, redis: RedisDep) -> Response:
         """Return service status, including Redis and Firestore reachability.
@@ -131,19 +202,27 @@ def create_app() -> FastAPI:
         (Docker/Render health checks) can detect and recycle a container that's
         running but can't actually serve requests.
         """
-        checks: dict[str, str] = {}
+        cache = app.state.health_cache
+        checks: dict[str, str] | None = None
+        if time.monotonic() - cache["at"] < health_cache_ttl:
+            checks = cache["checks"]
 
-        try:
-            await redis.ping()
-            checks["redis"] = "ok"
-        except Exception as exc:
-            checks["redis"] = f"error: {exc}"
+        if checks is None:
+            checks = {}
+            try:
+                await redis.ping()
+                checks["redis"] = "ok"
+            except Exception as exc:
+                checks["redis"] = f"error: {exc}"
 
-        try:
-            await db.collection("system").document("healthcheck").get()
-            checks["firestore"] = "ok"
-        except Exception as exc:
-            checks["firestore"] = f"error: {exc}"
+            try:
+                await db.collection("system").document("healthcheck").get()
+                checks["firestore"] = "ok"
+            except Exception as exc:
+                checks["firestore"] = f"error: {exc}"
+
+            cache["at"] = time.monotonic()
+            cache["checks"] = checks
 
         healthy = all(v == "ok" for v in checks.values())
         return JSONResponse(

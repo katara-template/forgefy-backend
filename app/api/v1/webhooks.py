@@ -1,15 +1,20 @@
 """Recall.ai webhook receiver.
 
-Recall delivers two event types:
-  • transcript.data   — real-time transcript segment for a bot
-  • bot.status_change — bot lifecycle (joining → in_call_recording → call_ended …)
+Recall delivers two kinds of events:
+  • transcript.data — real-time transcript segment for a bot
+  • bot lifecycle — one event per status (bot.joining_call, bot.in_call_recording,
+    bot.call_ended, bot.done, bot.fatal, …) on current API versions, or a single
+    legacy bot.status_change event on older ones; both shapes are handled
 
-Security: every request carries the workspace verification secret in the
-X-Recall-Workspace-Verification-Secret header.  If the secret is configured
-we reject anything that doesn't match.
+Security: requests carry a Svix-style HMAC signature (Webhook-Id / Webhook-
+Timestamp / Webhook-Signature headers), verified against
+RECALL_WORKSPACE_VERIFICATION_SECRET. If the secret is configured we reject
+anything that doesn't verify.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -20,6 +25,7 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from app.config import get_settings
+from app.core.dispatch import dispatch
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -37,19 +43,35 @@ _TERMINAL_STATUSES = {"call_ended", "done", "fatal"}
 @router.post("/recall", status_code=204)
 async def recall_webhook(
     request: Request,
-    x_recall_workspace_verification_secret: str | None = Header(default=None),
+    webhook_id: str | None = Header(default=None, alias="Webhook-Id"),
+    webhook_timestamp: str | None = Header(default=None, alias="Webhook-Timestamp"),
+    webhook_signature: str | None = Header(default=None, alias="Webhook-Signature"),
 ) -> None:
-    """Receive and process Recall.ai webhook events."""
-    settings = get_settings()
+    """Receive and process Recall.ai webhook events.
 
-    if (
-        settings.RECALL_WORKSPACE_VERIFICATION_SECRET
-        and x_recall_workspace_verification_secret != settings.RECALL_WORKSPACE_VERIFICATION_SECRET
-    ):
-        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+    Recall signs requests the same way Svix does — HMAC-SHA256 over
+    "{id}.{timestamp}.{raw body}", keyed by the base64 portion of the
+    workspace secret after its `whsec_` prefix, base64-encoded, and sent
+    as one or more space-separated `v1,<sig>` tokens in Webhook-Signature.
+    """
+    settings = get_settings()
+    raw_body = await request.body()
+
+    if settings.RECALL_WORKSPACE_VERIFICATION_SECRET:
+        if not (webhook_id and webhook_timestamp and webhook_signature):
+            raise HTTPException(status_code=401, detail="Missing webhook signature headers")
+
+        secret_b64 = settings.RECALL_WORKSPACE_VERIFICATION_SECRET.removeprefix("whsec_")
+        key = base64.b64decode(secret_b64)
+        to_sign = f"{webhook_id}.{webhook_timestamp}.{raw_body.decode()}".encode()
+        expected = base64.b64encode(hmac.new(key, to_sign, hashlib.sha256).digest()).decode()
+
+        provided_sigs = [s.split(",", 1)[1] for s in webhook_signature.split() if "," in s]
+        if not any(hmac.compare_digest(expected, sig) for sig in provided_sigs):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     try:
-        body = await request.json()
+        body = json.loads(raw_body)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
 
@@ -60,8 +82,8 @@ async def recall_webhook(
 
     if event_type == "transcript.data":
         await _handle_transcript(data, settings)
-    elif event_type == "bot.status_change":
-        await _handle_status_change(data, settings)
+    elif event_type.startswith("bot."):
+        await _handle_status_change(event_type, data, settings)
     else:
         logger.debug("Unhandled Recall event type: %s", event_type)
 
@@ -71,12 +93,17 @@ async def recall_webhook(
 # ---------------------------------------------------------------------------
 
 async def _handle_transcript(data: dict, settings) -> None:
-    """Publish transcript segment to Redis and enqueue extraction."""
-    bot_id: str = data.get("bot_id", "")
-    transcript: dict = data.get("transcript", {})
-    words: list[dict] = transcript.get("words", [])
-    speaker: str = transcript.get("speaker", "")
-    is_final: bool = bool(transcript.get("is_final", True))
+    """Publish transcript segment to Redis and enqueue extraction.
+
+    Recall only sends `transcript.data` (never `transcript.partial_data`, which
+    we don't subscribe to) — every event here is already a finalized utterance.
+    """
+    bot_id: str = data.get("bot", {}).get("id", "")
+    inner: dict = data.get("data", {})
+    words: list[dict] = inner.get("words", [])
+    participant: dict = inner.get("participant") or {}
+    speaker: str = participant.get("name") or ""
+    is_final = True
 
     text = " ".join(w.get("text", "") for w in words).strip()
     if not text:
@@ -102,19 +129,36 @@ async def _handle_transcript(data: dict, settings) -> None:
     finally:
         await r.aclose()
 
+    logger.info(
+        "Transcript published session=%s chars=%d speaker=%s",
+        session_id, len(text), speaker or "?",
+    )
+
     if is_final:
         from app.workers.extraction_worker import extract_requirements
-        extract_requirements.apply_async(
+        await dispatch(
+            extract_requirements,
             args=[session_id, text],
             queue="meeting.transcribe",
         )
 
 
-async def _handle_status_change(data: dict, settings) -> None:
-    """Transition session status and trigger blueprint generation when meeting ends."""
-    bot: dict = data.get("bot", {})
-    bot_id: str = bot.get("id", "")
-    status_code: str = bot.get("status", {}).get("code", "")
+async def _handle_status_change(event_type: str, data: dict, settings) -> None:
+    """Transition session status and trigger blueprint generation when meeting ends.
+
+    Recall delivers bot lifecycle events in two shapes:
+      • current per-status events (`bot.call_ended`, `bot.done`, …) — the
+        status code lives under `data.data.code` (and in the event name),
+        with the bot id under `data.bot.id`
+      • legacy `bot.status_change` — the code lives under `data.bot.status.code`
+    """
+    bot: dict = data.get("bot") or {}
+    bot_id: str = bot.get("id") or data.get("bot_id") or ""
+    status_code: str = (
+        (data.get("data") or {}).get("code")
+        or (bot.get("status") or {}).get("code")
+        or event_type.removeprefix("bot.")
+    )
 
     session_id = await _lookup_session(bot_id, settings.REDIS_URL)
     if not session_id:
@@ -129,6 +173,20 @@ async def _handle_status_change(data: dict, settings) -> None:
 
     elif status_code in _TERMINAL_STATUSES:
         await _end_session_from_bot(session_id, settings)
+
+        # Purge the recording/transcript from Recall's platform — transcripts
+        # already streamed to us, so their stored copy is never needed.
+        from app.workers.connector_worker import (
+            DELETE_MEDIA_COUNTDOWN_SECONDS,
+            recall_delete_media,
+        )
+        await dispatch(
+            recall_delete_media,
+            args=[bot_id],
+            countdown=DELETE_MEDIA_COUNTDOWN_SECONDS,
+            queue="meeting.audio",
+        )
+
         await _clear_mapping(bot_id, session_id, settings.REDIS_URL)
 
 
@@ -153,35 +211,15 @@ async def _try_transition_session(
 
 
 async def _end_session_from_bot(session_id: str, settings) -> None:
-    """Transition session to PROCESSING and dispatch blueprint generation."""
-    from app.core.exceptions import InvalidStateTransition
+    """Run the same end-of-meeting pipeline as the frontend end button."""
     from app.db.firebase import get_firestore_client
-    from app.db.models.enums import SessionStatus
-    from app.modules.voxa.state_machine import MeetingStateMachine
+    from app.modules.voxa.service import VoxaService
 
     db = get_firestore_client()
-
-    doc = await db.collection("sessions").document(session_id).get()
-    if not doc.exists:
-        return
-
-    current_status = SessionStatus(doc.to_dict()["status"])
-    endable = {SessionStatus.JOINING, SessionStatus.LISTENING}
-    if current_status not in endable:
-        return
-
-    sm = MeetingStateMachine(db)
-    try:
-        await sm.transition(uuid.UUID(session_id), SessionStatus.PROCESSING)
-        await db.collection("sessions").document(session_id).update(
-            {"end_time": datetime.now(UTC)}
-        )
-    except InvalidStateTransition:
-        return
-
-    from app.workers.blueprint_worker import generate_blueprint
-    generate_blueprint.apply_async(args=[session_id], queue="meeting.extract")
-    logger.info("Blueprint enqueued from bot end session=%s", session_id)
+    service = VoxaService(db)
+    session = await service.end_session_from_bot(uuid.UUID(session_id))
+    if session:
+        logger.info("Session auto-ended from bot session=%s", session_id)
 
 
 # ---------------------------------------------------------------------------

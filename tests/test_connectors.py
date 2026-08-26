@@ -4,6 +4,7 @@ from __future__ import annotations
 import uuid
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from app.db.models.enums import Platform
@@ -216,6 +217,124 @@ class TestMeetConnector:
         )
 
 
+# ── Bot avatar tests ──────────────────────────────────────────────────────────
+
+
+class TestBotAvatar:
+    def test_missing_file_returns_none(self, tmp_path):
+        from app.connectors.recall import _load_avatar_b64
+
+        assert _load_avatar_b64(str(tmp_path / "nope.jpg")) is None
+
+    def test_empty_path_returns_none(self):
+        from app.connectors.recall import _load_avatar_b64
+
+        assert _load_avatar_b64(None) is None
+        assert _load_avatar_b64("") is None
+
+    def test_non_jpeg_rejected(self, tmp_path):
+        from app.connectors.recall import _load_avatar_b64
+
+        png = tmp_path / "avatar.png"
+        png.write_bytes(b"\x89PNG fake")
+        assert _load_avatar_b64(str(png)) is None
+
+    def test_oversized_file_rejected(self, tmp_path):
+        from app.connectors.recall import _MAX_AVATAR_BYTES, _load_avatar_b64
+
+        big = tmp_path / "avatar.jpg"
+        big.write_bytes(b"x" * (_MAX_AVATAR_BYTES + 1))
+        assert _load_avatar_b64(str(big)) is None
+
+    def test_valid_jpeg_returns_base64(self, tmp_path):
+        import base64
+
+        from app.connectors.recall import _load_avatar_b64
+
+        jpg = tmp_path / "avatar.jpg"
+        jpg.write_bytes(b"\xff\xd8\xff fake jpeg")
+        result = _load_avatar_b64(str(jpg))
+        assert result == base64.b64encode(b"\xff\xd8\xff fake jpeg").decode()
+
+    def _join_payload(self, avatar_path: str | None) -> dict:
+        """Run RecallConnector.join with mocked HTTP/Redis; return the bot payload."""
+        from app.connectors.recall import RecallConnector
+
+        resp = httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://x/bot/"),
+            json={"id": "bot-1"},
+        )
+        connector = RecallConnector(
+            api_key="fake-key",
+            region="us-east-1",
+            redis_url="redis://test",
+            webhook_base_url="https://api.example.com",
+            avatar_path=avatar_path,
+        )
+        with (
+            patch("app.connectors.recall.httpx.Client") as mock_client_cls,
+            patch.object(connector, "_store_mapping"),
+        ):
+            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client.post.return_value = resp
+            connector.join("https://meet.google.com/abc", "session-1")
+            return mock_client.post.call_args.kwargs["json"]
+
+    def test_join_includes_avatar_when_file_exists(self, tmp_path):
+        import base64
+
+        jpg = tmp_path / "avatar.jpg"
+        jpg.write_bytes(b"\xff\xd8\xff fake jpeg")
+
+        payload = self._join_payload(str(jpg))
+
+        expected_b64 = base64.b64encode(b"\xff\xd8\xff fake jpeg").decode()
+        video_out = payload["automatic_video_output"]
+        assert video_out["in_call_recording"] == {"kind": "jpeg", "b64_data": expected_b64}
+        assert video_out["in_call_not_recording"] == {"kind": "jpeg", "b64_data": expected_b64}
+
+    def test_join_omits_avatar_when_not_configured(self):
+        payload = self._join_payload(None)
+        assert "automatic_video_output" not in payload
+
+
+# ── delete_media tests ────────────────────────────────────────────────────────
+
+
+class TestDeleteMedia:
+    _BASE = "https://us-east-1.recall.ai/api/v1"
+
+    def _run(self, status_code: int) -> MagicMock:
+        """Call delete_media against a mocked httpx client returning status_code."""
+        from app.connectors.recall import delete_media
+
+        resp = httpx.Response(
+            status_code,
+            request=httpx.Request("POST", f"{self._BASE}/bot/bot-1/delete_media/"),
+        )
+        with patch("app.connectors.recall.httpx.Client") as mock_client_cls:
+            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client.post.return_value = resp
+            delete_media("bot-1", self._BASE, "fake-key")
+            return mock_client
+
+    def test_deletes_media_with_auth(self):
+        client = self._run(200)
+        client.post.assert_called_once_with(
+            f"{self._BASE}/bot/bot-1/delete_media/",
+            headers={"Authorization": "Token fake-key"},
+        )
+
+    def test_404_means_already_gone(self):
+        self._run(404)  # must not raise — bot/media already deleted
+
+    def test_error_raises_so_task_can_retry(self):
+        # e.g. media still processing shortly after call end
+        with pytest.raises(httpx.HTTPStatusError):
+            self._run(409)
+
+
 # ── Connector Celery worker tests ─────────────────────────────────────────────
 
 
@@ -246,3 +365,62 @@ class TestConnectorWorker:
         with patch("app.workers.connector_worker.get_connector", return_value=mock_connector):
             # Should not raise
             dispatch_connector(str(uuid.uuid4()), "zoom", "https://zoom.us/j/123")
+
+
+class TestRecallDeleteMediaTask:
+    def test_skips_when_api_key_missing(self):
+        from app.workers.connector_worker import recall_delete_media
+
+        settings = MagicMock(RECALL_API_KEY="")
+        with (
+            patch("app.config.get_settings", return_value=settings),
+            patch("app.connectors.recall.delete_media") as mock_delete,
+        ):
+            recall_delete_media("bot-1")
+
+        mock_delete.assert_not_called()
+
+    def test_deletes_media_via_connector(self):
+        from app.workers.connector_worker import recall_delete_media
+
+        settings = MagicMock(RECALL_API_KEY="fake-key", RECALL_REGION="us-east-1")
+        with (
+            patch("app.config.get_settings", return_value=settings),
+            patch("app.connectors.recall.delete_media") as mock_delete,
+        ):
+            recall_delete_media("bot-1")
+
+        mock_delete.assert_called_once_with(
+            bot_id="bot-1",
+            base_url="https://us-east-1.recall.ai/api/v1",
+            api_key="fake-key",
+        )
+
+    def test_remove_bot_enqueues_media_purge(self):
+        from app.workers.connector_worker import (
+            DELETE_MEDIA_COUNTDOWN_SECONDS,
+            recall_remove_bot,
+        )
+
+        settings = MagicMock(
+            RECALL_API_KEY="fake-key",
+            RECALL_REGION="us-east-1",
+            REDIS_URL="redis://test",
+        )
+        redis_mock = MagicMock()
+        redis_mock.get.return_value = "bot-1"
+
+        with (
+            patch("app.config.get_settings", return_value=settings),
+            patch("app.workers.connector_worker.sync_redis.from_url", return_value=redis_mock),
+            patch("app.connectors.recall.remove_bot") as mock_remove,
+            patch("app.workers.connector_worker.recall_delete_media") as mock_delete,
+        ):
+            recall_remove_bot("session-1")
+
+        mock_remove.assert_called_once()
+        mock_delete.apply_async.assert_called_once_with(
+            args=["bot-1"],
+            countdown=DELETE_MEDIA_COUNTDOWN_SECONDS,
+            queue="meeting.audio",
+        )
