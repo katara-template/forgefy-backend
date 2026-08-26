@@ -50,7 +50,7 @@ class TestRedaction:
 class TestRunLeakage:
     def test_failed_command_does_not_leak_the_token(self, monkeypatch):
         """The exact production leak: a failed clone put a live token in Sentry."""
-        token = "TOKEN HERE"
+        token = "TOKEN HERE tt"
         url = f"https://{token}@github.com/katara-template/next-ts.git"
 
         monkeypatch.setattr(
