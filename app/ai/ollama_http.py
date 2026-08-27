@@ -11,6 +11,7 @@ only changes where the request lands. OpenRouter still wins when both are set.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Any
 
@@ -183,10 +184,8 @@ def open_chat_stream(
 
             # Retryable: prefer Ollama's own Retry-After over our guess.
             retry_after = resp.headers.get("retry-after")
-            try:
+            with contextlib.suppress(TypeError, ValueError):
                 delay = max(delay, float(retry_after or 0))
-            except (TypeError, ValueError):
-                pass
             last_exc = RuntimeError(f"{resp.status_code} {resp.reason} for {url}")
             if log_fn and not told_user:
                 told_user = True

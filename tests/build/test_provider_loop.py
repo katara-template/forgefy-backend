@@ -24,11 +24,10 @@ import pytest
 from app.build import build_agent
 from app.build import provider_loop as pl
 from app.build.provider_loop import (
-    CacheStats,
-    OpenAIAdapter,
-    OpenRouterAdapter,
     AnthropicAdapter,
+    CacheStats,
     OllamaAdapter,
+    OpenAIAdapter,
     TurnResult,
     _anthropic_cache_ctx,
     _gemini_cache_ctx,
@@ -177,11 +176,29 @@ class TestImageCapability:
         assert GeminiAdapter(api_key="k", model="m").supports_images is True
         assert OpenAIAdapter(api_key="k", model="m").supports_images is True
 
-    def test_anthropic_does_not_declare_image_support(self):
-        assert AnthropicAdapter(api_key="k", model="m").supports_images is False
+    def test_anthropic_declares_image_support(self):
+        # Claude is fully multimodal. supports_images means CAN, not SHOULD:
+        # cost policy lives in image_cost_tier so routing can decide without
+        # silently hiding the capability (Part K / Part P).
+        assert AnthropicAdapter(api_key="k", model="m").supports_images is True
 
     def test_ollama_does_not_declare_image_support(self):
         assert OllamaAdapter(base_url="http://x", model="m").supports_images is False
+
+    def test_image_cost_tier_is_separate_from_capability(self):
+        from app.build.provider_loop import GeminiAdapter
+        # Every adapter carries the knob; Anthropic flags its premium image
+        # pricing while still declaring the capability.
+        assert AnthropicAdapter(api_key="k", model="m").image_cost_tier == "premium"
+        assert GeminiAdapter(api_key="k", model="m").image_cost_tier == "standard"
+        assert OllamaAdapter(base_url="http://x", model="m").image_cost_tier == "standard"
+
+    def test_composite_reflects_active_adapter_capability(self, tmp_path):
+        composite = pl.OllamaOpenRouterFallback(
+            _CountingAdapter(), _CountingAdapter(),
+        )
+        # _CountingAdapter inherits the base default.
+        assert composite.supports_images is False
 
 
 # ── wire conversions ──────────────────────────────────────────────────────────
@@ -229,6 +246,23 @@ class TestInstrumentation:
 
 
 class TestFlagWiring:
+    def test_unified_loop_enabled_reads_the_setting(self, monkeypatch):
+        # Defined once (the duplicate truncated definition was removed in
+        # Part K; F811 now guards against a reintroduction).
+        import app.config as config_mod
+
+        class _S:
+            UNIFIED_AGENT_LOOP = True
+
+        monkeypatch.setattr(config_mod, "get_settings", lambda: _S())
+        assert pl.unified_loop_enabled() is True
+
+        class _S2:
+            UNIFIED_AGENT_LOOP = False
+
+        monkeypatch.setattr(config_mod, "get_settings", lambda: _S2())
+        assert pl.unified_loop_enabled() is False
+
     def test_gemini_loop_delegates_when_flag_on(self, tmp_path, monkeypatch):
         called: dict[str, Any] = {}
 
@@ -382,7 +416,6 @@ class TestOllamaOpenRouterFallback:
         assert fallback.calls >= 1  # every turn after the switch goes to OpenRouter
 
     def test_switch_is_sticky(self, tmp_path):
-        primary = _CountingAdapter()  # would succeed — proves stickiness instead
         fallback = _CountingAdapter()
 
         class _FailOnce(pl.ProviderAdapter):

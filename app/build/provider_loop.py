@@ -24,17 +24,20 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from app.build.agent_tools import TOOLS, execute_tool
 from app.build.build_agent import (
     _MAX_EXPLORE_STREAK,
     _MAX_ITERATIONS,
     _MAX_NUDGES,
+    _MAX_OUTPUT_TOKENS_CHAT,
     _READ_ONLY_TOOLS,
     _TOOL_RESULT_LIMIT_LARGE_CTX,
+    _TOOL_RESULT_LIMIT_SMALL_CTX,
     _WRITE_TOOLS,
     _truncate_tool_result,
 )
@@ -109,6 +112,11 @@ class ProviderAdapter:
 
     name: str = "provider"
     supports_images: bool = False  # Part G capability gate — never hardcode names.
+    # Cost policy for image inputs, independent of supports_images: "standard"
+    # unless the provider's image pricing is high enough that routing may want
+    # to prefer a cheaper backend. Routing consults this; the capability flag
+    # above never lies about what the model can do.
+    image_cost_tier: str = "standard"
     supports_cache: bool = False   # Whether the provider exposes a cache to enable.
     # Rolling window, in assistant/tool-response pairs.
     history_pairs: int = 20
@@ -559,7 +567,16 @@ class AnthropicAdapter(ProviderAdapter):
     so it sits at the same ANCHOR/STABLE boundary rather than mid-history."""
 
     name = "anthropic"
-    supports_images = False   # vision is more expensive here (Part G note).
+    # Claude is fully multimodal — supports_images means CAN, not SHOULD.
+    # Routing that wants to skip vision for cost reasons consults
+    # image_cost_tier; silently hiding the capability would strand image
+    # inputs on this backend (Part P).
+    supports_images = True
+    # Cost policy, separate from capability: providers whose per-image token
+    # cost is high relative to text can be tagged so routing (Part P) can
+    # prefer a cheaper backend when one is available. "standard" is the
+    # default; "premium" marks this adapter.
+    image_cost_tier = "premium"
 
     def __init__(self, *, api_key: str, model: str, client: Any = None) -> None:
         super().__init__(api_key=api_key, model=model)
@@ -568,7 +585,12 @@ class AnthropicAdapter(ProviderAdapter):
     def send(self, **kw: Any) -> TurnResult:
         import anthropic
 
-        from app.build.build_agent import _cached_system, _cached_tools_for, _mark_message_breakpoints, _stream_turn
+        from app.build.build_agent import (
+            _cached_system,
+            _cached_tools_for,
+            _mark_message_breakpoints,
+            _stream_turn,
+        )
 
         client = self.cfg.get("client")
         if client is None:
@@ -655,7 +677,6 @@ class OllamaAdapter(ProviderAdapter):
 
     def send(self, **kw: Any) -> TurnResult:
         from app.ai.ollama_http import ollama_headers, ollama_options, open_chat_stream
-
         from app.build.build_agent import _tools_to_ollama_format
 
         base_url = self.cfg["base_url"]
@@ -726,10 +747,6 @@ class OllamaAdapter(ProviderAdapter):
             model=self.cfg["model"],
         )
 
-
-def unified_loop_enabled() -> bool:
-    """Part J flag: route the per-provider loops through the shared loop."""
-    from app.config import get_settings
 
 class OllamaOpenRouterFallback(ProviderAdapter):
     """Qwen3 composite backend: Ollama (local daemon or cloud) first, OpenRouter

@@ -28,6 +28,35 @@ from app.db.models.meeting_session import MeetingSession
 SESSION_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
 USER_ID    = uuid.UUID("22222222-2222-2222-2222-222222222222")
 
+
+@pytest.fixture(autouse=True)
+def _no_real_ai_calls(monkeypatch):
+    """Fail fast if a test reaches the real Gemini/Anthropic HTTP endpoints.
+
+    This module promises "all AI API calls are mocked", but several generate()
+    paths read the *machine's* settings (not _FAKE_SETTINGS) and can pick the
+    Gemini branch. On a networked dev box the call fails fast and the fallback
+    kicks in; in a sandbox it hangs for the full 60s timeout per retry. Raising
+    immediately reproduces the dev-box failure mode deterministically.
+    """
+    import anthropic as _anthropic
+    import requests as _requests
+
+    def _blocked(*a, **k):
+        raise RuntimeError("test tried to make a real network call")
+
+    monkeypatch.setattr(_requests, "post", _blocked)
+
+    class _BlockedMessages:
+        def create(self, *a, **k):
+            raise RuntimeError("test tried to make a real Anthropic call")
+
+    class _BlockedClient:
+        def __init__(self, *a, **k) -> None:
+            self.messages = _BlockedMessages()
+
+    monkeypatch.setattr(_anthropic, "Anthropic", _BlockedClient)
+
 _FAKE_SETTINGS = MagicMock(
     ANTHROPIC_API_KEY="fake-api-key",
     ANTHROPIC_MODEL="claude-test",

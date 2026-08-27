@@ -2697,8 +2697,6 @@ def _ollama_agent_turns(
             tools=tools, written=written,
         )
 
-    import requests as _req
-
     from app.ai.ollama_http import (
         ollama_headers,
         ollama_options,
