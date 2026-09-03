@@ -1,16 +1,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Multi-stage build to keep the final image small.
+# Multi-stage build: compile a Flutter WEB app, then serve the static output.
 #
-# Stage 1 (build):   installs Flutter + Linux toolchain, compiles the Flutter
-#                    app in release mode, then deletes Flutter's engine caches
-#                    in the SAME RUN layer so the ~9 GB of SDK/engine artifacts
-#                    never get persisted into an intermediate image layer.
-#                    This keeps the Cloudflare Workers Builds disk usage well
-#                    below the 20 GB limit.
+# Stage 1 (build):   installs Flutter, runs `flutter build web --release`, and
+#                    deletes the SDK engine/caches in the SAME RUN layer so the
+#                    multi-GB SDK never persists into an image layer. This keeps
+#                    Cloudflare Workers Builds disk usage far below the 20 GB limit.
 #
-# Stage 2 (runtime): minimal Ubuntu image with ONLY the shared libraries a
-#                    Flutter Linux (GTK) app needs at runtime. The Flutter SDK
-#                    does NOT appear in the final image.
+# Stage 2 (runtime): nginx serving the compiled `build/web` directory. The Flutter
+#                    SDK is NOT present in the final image.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ================================================================
@@ -20,22 +17,14 @@ FROM ubuntu:22.04 AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Toolchain needed to extract Flutter and to compile the Linux app.
-# (Flutter's official Ubuntu prerequisites: clang cmake ninja-build pkg-config
-#  libgtk-3-dev liblzma-dev libstdc++-12-dev)
+# Minimal toolchain to download and extract the Flutter SDK. A web build needs no
+# clang/cmake/GTK dev headers, so we leave them out to keep this stage small.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     git \
     unzip \
     xz-utils \
-    clang \
-    cmake \
-    ninja-build \
-    pkg-config \
-    libgtk-3-dev \
-    liblzma-dev \
-    libstdc++-12-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Flutter SDK (pin version — bump to upgrade) ──────────────────────────────
@@ -44,20 +33,25 @@ ENV FLUTTER_HOME=/opt/flutter
 ENV PATH=$PATH:$FLUTTER_HOME/bin
 ENV PUB_CACHE=/root/.pub-cache
 
-COPY . .
+# Directory (relative to the build context) that contains the Flutter app's
+# pubspec.yaml. Override with:  --build-arg FLUTTER_APP_DIR=path/to/app
+ARG FLUTTER_APP_DIR=.
 
-WORKDIR /app
+WORKDIR /src
+COPY . /src
 
-# Extract SDK, build release bundle, then purge Flutter engine/cache artifacts
-# in the same layer so they are not baked into the layer set.
+# Download the SDK, build the web bundle, then purge SDK/cache artifacts in the
+# same layer so they are not baked into the layer set.
 RUN curl -o /tmp/flutter.tar.xz \
       "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz" && \
     tar xf /tmp/flutter.tar.xz -C /opt && \
     rm /tmp/flutter.tar.xz && \
     git config --global --add safe.directory $FLUTTER_HOME && \
     flutter config --no-analytics && \
-    flutter build linux --release && \
-    # Remove SDK engine artifacts, pub cache, temp files, and apt caches now.
+    cd ${FLUTTER_APP_DIR:-.} && \
+    flutter pub get && \
+    flutter build web --release && \
+    # Final image only carries build/web; strip the SDK & caches now.
     rm -rf $FLUTTER_HOME/bin/cache \
            $FLUTTER_HOME/.git \
            /root/.pub-cache \
@@ -66,46 +60,11 @@ RUN curl -o /tmp/flutter.tar.xz \
            /var/cache/apt/archives/*
 
 # ================================================================
-# Stage 2 — runtime (small)
+# Stage 2 — runtime (small static server)
 # ================================================================
-FROM ubuntu:22.04 AS runtime
+FROM nginx:1.27-alpine AS runtime
 
-ENV DEBIAN_FRONTEND=noninteractive
+# Copy ONLY the compiled web bundle from the build stage.
+COPY --from=build /src/build/web /usr/share/nginx/html
 
-# Shared libs a Flutter Linux/GTK app needs at runtime.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgtk-3-0 \
-    libglib2.0-0 \
-    libblkid1 \
-    liblzma5 \
-    libc6 \
-    libstdc++6 \
-    libasound2 \
-    libx11-6 \
-    libxcursor1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxi6 \
-    libxrandr2 \
-    libxrender1 \
-    libxtst6 \
-    libwayland-client0 \
-    libwayland-cursor0 \
-    libfontconfig1 \
-    libfreetype6 \
-    libpng16-16 \
-    libjpeg8 \
-    libsqlite3-0 \
-    zlib1g \
-    xz-utils \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Copy ONLY the compiled release bundle from the build stage.
-COPY --from=build /app/build/linux/x64/release/bundle .
-
-CMD ["./app"]
+EXPOSE 80
