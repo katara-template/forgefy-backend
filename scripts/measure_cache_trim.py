@@ -23,7 +23,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import Any
 
-from app.build.build_agent import _ANTHROPIC_HISTORY_PAIRS, _build_system, _loop
+from app.build.build_agent import _build_system
+from app.build.provider_loop import AnthropicAdapter, run_agent_loop
 
 
 def _digest(obj: Any) -> str:
@@ -142,12 +143,15 @@ def main() -> int:
         workspace = Path(tmp)
         for i in range(iterations + 2):
             (workspace / f"f{i}.txt").write_text("x" * 400, encoding="utf-8")
-        _loop(
-            _Client(requests, iterations),  # type: ignore[arg-type]
-            "claude-sonnet-5",
-            _build_system("next"),
-            workspace,
-            "build it",
+        _ANTHROPIC_HISTORY_PAIRS = AnthropicAdapter.history_pairs
+        adapter = AnthropicAdapter(
+            api_key="", model="claude-sonnet-5", client=_Client(requests, iterations),
+        )
+        run_agent_loop(
+            adapter,
+            system=_build_system("next"),
+            stable="build it",
+            workspace=workspace,
             max_iterations=iterations + 5,
             cache_trace=trace,
         )

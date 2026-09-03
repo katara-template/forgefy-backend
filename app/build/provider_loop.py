@@ -1,12 +1,12 @@
 """One agent loop behind a provider adapter (Part J), with three-zone prefix
 stability (Part E1) and per-provider caching (Part E2).
 
-The five historical loops (Anthropic ``_loop``, ``_ollama_agent_turns``,
-``_gemini_loop``, ``_openai_loop``, ``_openrouter_loop``) implement the same
-control logic — truncated tool results, a rolling VOLATILE window, repeat-read
-suppression, bounded pushbacks, an exploration breaker, DONE detection — but
-they drifted apart: round 1's guards were hand-copied into ``_loop`` and its
-caching landed only there, leaving the default provider without it.
+Since Part L this is the ONLY agent loop: the five historical per-provider
+loops (Anthropic ``_loop``, ``_ollama_agent_turns``, ``_gemini_loop``,
+``_openai_loop``, ``_openrouter_loop``) were deleted after the unified path
+soaked clean. They had drifted apart — round 1's guards were hand-copied into
+``_loop`` and its caching landed only there, leaving the default provider
+without it.
 
 This module extracts the loop and parameterises it with a ``ProviderAdapter``.
 The shared ``run_agent_loop`` owns every guard, the trimming policy (VOLATILE
@@ -229,13 +229,97 @@ def _openai_wire_messages(system: str, messages: list[dict[str, Any]]) -> list[d
 
 
 def _safe_args(raw: Any) -> dict[str, Any]:
+    """Parse tool-call arguments, repairing common LLM JSON errors.
+
+    Handles:
+      * Already-parsed dicts (passthrough).
+      * Valid JSON strings.
+      * Unescaped backslashes in string values (Windows paths, regex).
+      * Unrepairable garbage → ``{}``.
+    """
     if isinstance(raw, dict):
         return raw
-    try:
-        parsed = json.loads(raw or "{}")
-        return parsed if isinstance(parsed, dict) else {}
-    except (json.JSONDecodeError, TypeError):
+    if not isinstance(raw, str) or not raw.strip():
         return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        # Repair: unescaped backslashes inside string values are the most common
+        # LLM emission error.  Walk the string and double any lone backslash.
+        try:
+            repaired = _repair_json_backslashes(raw)
+            parsed = json.loads(repaired)
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+
+def _valid_args_json(raw: Any) -> str:
+    """Return a JSON-serialisable string of ``raw``, always valid.
+
+    Unlike ``_safe_args`` this returns a *string* (the wire format the loop
+    echoes back into history) and guarantees a parseable result even for
+    garbage input — the specific failure this guards against is a raw,
+    provider-400-causing echo landing in ``messages[N]``.
+    """
+    if isinstance(raw, dict):
+        return json.dumps(raw, ensure_ascii=False)
+    if not isinstance(raw, str) or not raw.strip():
+        return "{}"
+    try:
+        json.loads(raw)
+        return raw
+    except json.JSONDecodeError:
+        try:
+            repaired = _repair_json_backslashes(raw)
+            json.loads(repaired)
+            return repaired
+        except (json.JSONDecodeError, TypeError):
+            return "{}"
+
+
+def _repair_json_backslashes(s: str) -> str:
+    """Double lone backslashes inside JSON string values.
+
+    The model emits ``C:\\Users\\app`` (two chars) where the wire wants
+    ``C:\\\\Users\\\\app`` (four chars).  We can't just blanket-replace all
+    backslashes because ``\\n`` and ``\\t`` are already valid escapes —
+    so we walk the string, tracking whether we are inside a string value,
+    and double any backslash that is not already part of a recognised
+    escape sequence.
+    """
+    out: list[str] = []
+    in_string = False
+    valid_escapes = set('\"\\/bfnrtu')
+    chars = list(s)
+    i = 0
+    while i < len(chars):
+        ch = chars[i]
+        if ch == '"' and (i == 0 or chars[i-1] != '\\'):
+            in_string = not in_string
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '\\' and in_string:
+            # Check if this is already a valid JSON escape
+            if i + 1 < len(chars) and chars[i+1] in valid_escapes:
+                # Valid escape, keep as-is
+                out.append(ch)
+                out.append(chars[i+1])
+                i += 2
+                continue
+            # Not a valid escape — double the backslash
+            out.append('\\\\')
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    # If we ended mid-string, the model truncated its JSON; close it.
+    result = ''.join(out)
+    if in_string:
+        result += '"'
+    return result
 
 
 class OpenAIAdapter(ProviderAdapter):
@@ -613,8 +697,10 @@ class AnthropicAdapter(ProviderAdapter):
             elif block.type == "tool_use":
                 tool_calls.append({"id": block.id, "name": block.name, "arguments": block.input or {}})
 
-        if text and kw.get("on_text"):
-            kw["on_text"](text)
+        # NOTE: no on_text re-emit here — _stream_turn already flushes the feed
+        # at sentence/newline boundaries; emitting the accumulated text again
+        # would log every sentence twice.
+
         stop = ("tool_use" if tool_calls
                 else ("max_tokens" if response.stop_reason == "max_tokens" else "end_turn"))
         return TurnResult(
@@ -686,7 +772,9 @@ class OllamaAdapter(ProviderAdapter):
         tools = _tools_to_ollama_format(self.normalize_tools(kw["tools"]))
         payload = {
             "model": self.cfg["model"],
-            "messages": _ollama_wire_messages(kw["messages"]),
+            # The system prompt is byte-identical for the whole phase, so it
+            # opens the wire and stays cacheable in Ollama's local KV (Part M).
+            "messages": [{"role": "system", "content": kw["system"]}, *_ollama_wire_messages(kw["messages"])],
             "tools": tools,
             "stream": True,
             "options": options,

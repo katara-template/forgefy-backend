@@ -90,10 +90,11 @@ class Settings(BaseSettings):
     BUILD_MODEL: str = "gemini"
     # Route all provider build/update/fix loops through the single shared loop
     # behind a provider adapter (app/build/provider_loop.py) instead of the five
-    # historical per-provider loops. Part J lands this behind a flag with the old
-    # loops intact so both can be run on the same build and diffed before the
-    # originals are removed.
-    UNIFIED_AGENT_LOOP: bool = False
+    # The unified agent loop is the default and, since Part L, the ONLY loop:
+    # the five legacy per-provider loops were deleted once it soaked clean. The
+    # flag is kept so a stale False in an operator's .env is logged rather than
+    # silently meaning nothing.
+    UNIFIED_AGENT_LOOP: bool = True
     # When BUILD_MODEL="Qwen3" resolves to Ollama (OLLAMA_API_KEY set) and that
     # endpoint keeps failing — Ollama Cloud rate-limits without warning — finish
     # the run on OpenRouter instead of dying. Needs OPENROUTER_API_KEY. Set false

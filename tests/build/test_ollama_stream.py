@@ -1,4 +1,4 @@
-"""Tests for _ollama_loop's handling of Ollama's streaming chat protocol.
+"""Tests for Ollama streaming chat protocol handling in OllamaAdapter.
 
 Run:
     venv/Scripts/python -m pytest tests/build/test_ollama_stream.py -v
@@ -6,7 +6,8 @@ Run:
 Ollama streams tool calls on an intermediate chunk (done=False) and closes with
 a done chunk whose message is empty. Reading tool_calls off the done chunk
 therefore drops every call, and the agent loops re-requesting the same tool
-without ever writing a file. These tests pin that protocol shape.
+without ever writing a file. These tests pin that protocol shape, driven
+through the shared loop via OllamaAdapter (Part L).
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from app.build import build_agent
+from app.build.provider_loop import OllamaAdapter, run_agent_loop
 
 
 def _chunk(content: str = "", tool_calls: list[dict] | None = None, done: bool = False) -> bytes:
@@ -73,15 +75,15 @@ def workspace(tmp_path: Path) -> Path:
 
 
 def _run(monkeypatch, turns: list[list[bytes]], workspace: Path, **kwargs):
-    # _ollama_loop does `import requests as _req` at call time, so the patch has
-    # to land on the requests module itself rather than a build_agent attribute.
+    # OllamaAdapter.send imports open_chat_stream (which posts via requests) at
+    # call time, so the patch has to land on the requests module itself.
     import requests
 
     poster = _FakePoster(turns)
     monkeypatch.setattr(requests, "post", poster)
-    summary, tokens = build_agent._ollama_loop(
-        "http://ollama:11434", "test-model", "system", workspace, "task",
-        timeout=5, **kwargs,
+    adapter = OllamaAdapter(base_url="http://ollama:11434", model="test-model", timeout=5)
+    summary, tokens = run_agent_loop(
+        adapter, system="system", stable="task", workspace=workspace, **kwargs,
     )
     return summary, tokens, poster
 
