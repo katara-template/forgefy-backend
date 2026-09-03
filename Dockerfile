@@ -25,6 +25,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 #  libgtk-3-dev liblzma-dev libstdc++-12-dev)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    ca-certificates \
     git \
     unzip \
     xz-utils \
