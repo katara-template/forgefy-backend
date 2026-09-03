@@ -194,21 +194,34 @@ async function handleAdmin(request: Request, workerEnv: Env, url: URL): Promise<
   }
 
   const worker = getContainer(workerEnv.WORKER_CONTAINER, WORKER_INSTANCE_NAME);
+  console.log(`[cf] admin ${url.pathname} -> WORKER_CONTAINER binding acquired`);
 
   switch (url.pathname) {
-    case "/__cf/status":
+    case "/__cf/status": {
+      console.log(`[cf] WORKER_CONTAINER.status() before`);
+      const status = await worker.status();
+      console.log(`[cf] WORKER_CONTAINER.status() after -> ${JSON.stringify(status)}`);
       return json({
-        worker: await worker.status(),
+        worker: status,
         workerInstance: WORKER_INSTANCE_NAME,
         apiPoolSize: API_POOL_SIZE,
         apiPort: API_PORT,
       });
+    }
 
-    case "/__cf/worker/start":
-      return json(await worker.ensureRunning());
+    case "/__cf/worker/start": {
+      console.log(`[cf] WORKER_CONTAINER.ensureRunning() before`);
+      const result = await worker.ensureRunning();
+      console.log(`[cf] WORKER_CONTAINER.ensureRunning() after -> ${JSON.stringify(result)}`);
+      return json(result);
+    }
 
-    case "/__cf/worker/stop":
-      return json(await worker.shutdown());
+    case "/__cf/worker/stop": {
+      console.log(`[cf] WORKER_CONTAINER.shutdown() before`);
+      const result = await worker.shutdown();
+      console.log(`[cf] WORKER_CONTAINER.shutdown() after -> ${JSON.stringify(result)}`);
+      return json(result);
+    }
 
     default:
       return json({ error: "not found" }, 404);
@@ -218,18 +231,48 @@ async function handleAdmin(request: Request, workerEnv: Env, url: URL): Promise<
 export default {
   /** Everything that is not an adapter route goes to the API container. */
   async fetch(request: Request, workerEnv: Env): Promise<Response> {
-    const url = new URL(request.url);
+    const startedAt = Date.now();
+    const requestedUrl = request.url;
+    // Observe the request up front so a failing path is still attributable to
+    // the method + URL even if everything below throws.
+    console.log(`[cf] request ${request.method} ${requestedUrl}`);
 
-    if (url.pathname.startsWith("/__cf/")) {
-      return handleAdmin(request, workerEnv, url);
+    try {
+      const url = new URL(requestedUrl);
+
+      if (url.pathname.startsWith("/__cf/")) {
+        return await handleAdmin(request, workerEnv, url);
+      }
+
+      // Stateless spread across the pool. Cross-instance fan-out for WebSockets
+      // is handled by Redis pub/sub inside the app, so any instance can serve
+      // any client. Uses the stub's fetch() — containerFetch() would break the
+      // WebSocket upgrades on /ws/*.
+      console.log(`[cf] getRandom(API_CONTAINER) before for ${request.method} ${url.pathname}`);
+      const api = await getRandom(workerEnv.API_CONTAINER, API_POOL_SIZE);
+      console.log(`[cf] getRandom(API_CONTAINER) after -> stub selected`);
+
+      console.log(`[cf] API_CONTAINER.fetch() before for ${request.method} ${url.pathname}`);
+      const res = await api.fetch(request);
+      console.log(
+        `[cf] API_CONTAINER.fetch() after -> status=${res.status} (${Date.now() - startedAt}ms) for ${request.method} ${url.pathname}`,
+      );
+      return res;
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      console.error(`[cf] unhandled exception for ${request.method} ${requestedUrl}`, {
+        message: err.message,
+        stack: err.stack,
+        elapsedMs: Date.now() - startedAt,
+      });
+      return new Response(
+        JSON.stringify({ error: err.message, stack: err.stack }),
+        {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        },
+      );
     }
-
-    // Stateless spread across the pool. Cross-instance fan-out for WebSockets
-    // is handled by Redis pub/sub inside the app, so any instance can serve
-    // any client. Uses the stub's fetch() — containerFetch() would break the
-    // WebSocket upgrades on /ws/*.
-    const api = await getRandom(workerEnv.API_CONTAINER, API_POOL_SIZE);
-    return api.fetch(request);
   },
 
   /**
@@ -244,10 +287,20 @@ export default {
   ): Promise<void> {
     ctx.waitUntil(
       (async () => {
-        const worker = getContainer(workerEnv.WORKER_CONTAINER, WORKER_INSTANCE_NAME);
-        const result = await worker.ensureRunning();
-        if (result.restarted) {
-          console.log(`[supervisor] worker restarted, status=${result.status}`);
+        try {
+          console.log(`[cf] scheduled supervisor: WORKER_CONTAINER.ensureRunning() before`);
+          const worker = getContainer(workerEnv.WORKER_CONTAINER, WORKER_INSTANCE_NAME);
+          const result = await worker.ensureRunning();
+          console.log(`[cf] scheduled supervisor: WORKER_CONTAINER.ensureRunning() after -> ${JSON.stringify(result)}`);
+          if (result.restarted) {
+            console.log(`[supervisor] worker restarted, status=${result.status}`);
+          }
+        } catch (e) {
+          const err = e instanceof Error ? e : new Error(String(e));
+          console.error(`[supervisor] WORKER_CONTAINER.ensureRunning() failed`, {
+            message: err.message,
+            stack: err.stack,
+          });
         }
       })(),
     );
