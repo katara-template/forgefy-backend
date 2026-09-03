@@ -81,7 +81,11 @@ target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+# F811 is listed explicitly (it is implied by "F") because a truncated def
+# followed by a class of the same scope once slipped through a review — the
+# redefinition made the first (broken) body dead code and only the second
+# definition worked. Explicit is cheaper than hoping "F" is remembered.
+select = ["E", "F", "I", "UP", "B", "SIM", "F811"]
 ignore = ["E501"]
 
 [tool.ruff.lint.flake8-bugbear]

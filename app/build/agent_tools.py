@@ -816,6 +816,14 @@ def _report_findings(workspace: Path, inputs: dict[str, Any], log_fn: LogFn = No
     _REPORTS[str(workspace.resolve())] = report
 
     if log_fn:
+        # A structured event so the dashboard can group findings by severity
+        # instead of rendering one flat sentence. Same contract as the "todo"
+        # event above: json, parsed by the client. The prose line below stays
+        # for log readers and for clients with no renderer for this type.
+        import json as _json
+
+        log_fn("findings", _json.dumps(report))
+
         if status == "clean":
             log_fn("info", "Review result: clean — no issues found.")
         else:

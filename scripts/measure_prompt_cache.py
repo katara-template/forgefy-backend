@@ -30,9 +30,9 @@ from app.build.build_agent import (
     _MAX_OUTPUT_TOKENS,
     _build_system,
     _cached_system,
-    _loop,
     _mark_message_breakpoints,
 )
+from app.build.provider_loop import AnthropicAdapter, run_agent_loop
 from app.config import get_settings
 
 # Three fixed turns — enough to show the prefix being re-read on turns 2 and 3.
@@ -143,7 +143,7 @@ def main() -> int:
         print(f"input cost change  {100 * (new_bill - old_bill) / old_bill:+.1f}%")
     print("=" * 64 + "\n")
 
-    print("-- acceptance: real _loop build " + "-" * 31)
+    print("-- acceptance: real unified-loop build " + "-" * 24)
     capture = _UsageCapture()
     agent_log = logging.getLogger("app.build.build_agent")
     agent_log.setLevel(logging.INFO)
@@ -154,10 +154,14 @@ def main() -> int:
         (workspace / "package.json").write_text(
             '{"name":"demo","version":"1.0.0"}', encoding="utf-8",
         )
-        summary, tokens = _loop(
-            client, model, system, workspace,
-            "Create src/lib/greet.ts exporting greet(name: string): string, "
-            "then reply DONE: <one sentence>.",
+        adapter = AnthropicAdapter(api_key="", model=model, client=client)
+        summary, tokens = run_agent_loop(
+            adapter, system=system,
+            stable=(
+                "Create src/lib/greet.ts exporting greet(name: string): string, "
+                "then reply DONE: <one sentence>."
+            ),
+            workspace=workspace,
             max_iterations=6,
         )
 

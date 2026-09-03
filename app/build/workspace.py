@@ -18,7 +18,10 @@ WORKSPACE_ROOT = Path("/tmp/forgefy_workspaces")
 # (https://<token>@github.com/...). Anything derived from such a command — an
 # exception message, a log line, a Sentry event — carries a working credential
 # unless it is scrubbed first.
-_CREDENTIAL_IN_URL = re.compile(r"(https://)[^/\s@]+@")
+# Credentials live in the userinfo slot: everything between "https://" and the
+# first "@". `[^@]+` rather than `[^/\s@]+` — a malformed URL must not become a
+# redaction bypass (a token containing a space used to slip past untouched).
+_CREDENTIAL_IN_URL = re.compile(r"(https://)[^@]+@")
 
 
 def _npm_install_args() -> list[str]:

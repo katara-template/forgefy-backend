@@ -15,18 +15,11 @@ from app.build.agent_tools import (
     _FINDING_SEVERITIES,
     REPORT_FINDINGS_TOOL,
     TOOLS,
-    execute_tool,
     missing_report,
     reset_report,
     take_report,
 )
-from app.build.build_logger import tool_message
-from app.build.project_memory import (
-    MEMORY_FILENAME,
-    memory_context_block,
-    read_project_memory,
-    update_project_memory_async,
-)
+from app.build.project_memory import update_project_memory_async
 
 logger = logging.getLogger(__name__)
 
@@ -2533,17 +2526,110 @@ def _plan_prefix(plan: dict[str, Any]) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Adapter resolution (Part L)
+#
+# BUILD_MODEL is resolved per user at runtime (app/core/build_model.py) across
+# ("claude", "Qwen3", "gemini", "gpt"). Every provider difference — wire format,
+# cache placement, model chain — lives behind its ProviderAdapter; nothing below
+# branches on the model again. This is the ONLY place that maps BUILD_MODEL to
+# an adapter.
+# ---------------------------------------------------------------------------
+
+_BUILD_MODELS = ("claude", "Qwen3", "gemini", "gpt")
+
+
+def _build_model(override: str | None = None) -> str:
+    """The BUILD_MODEL to use — an explicit per-user override (quota downgrades,
+    per-user resolution from app/core/build_model.py) wins over the setting."""
+    from app.config import get_settings
+
+    raw = (override or getattr(get_settings(), "BUILD_MODEL", "") or "").strip()
+    if raw in ("openai", "openrouter"):  # historical aliases for the gpt chain
+        return "gpt"
+    return raw if raw in _BUILD_MODELS else "claude"
+
+
+def _agent_adapter(*, timeout: float | None = None, build_model: str | None = None):
+    """Build the ProviderAdapter for the configured BUILD_MODEL.
+
+    ``timeout`` (when the backend supports it) applies to the underlying HTTP
+    client — the compile-fix passes use a hard 180s so a hung endpoint cannot
+    stall the auto-fix loop.
+    """
+    import anthropic as _anthropic
+
+    from app.build.provider_loop import (
+        AnthropicAdapter,
+        GeminiAdapter,
+        OllamaAdapter,
+        OllamaOpenRouterFallback,
+        OpenAIAdapter,
+        OpenRouterAdapter,
+        unified_loop_enabled,
+    )
+    from app.config import get_settings
+
+    if not unified_loop_enabled():
+        # The legacy per-provider loops were deleted in Part L; the flag is kept
+        # so a stale env var is reported rather than silently meaning nothing.
+        logger.warning(
+            "UNIFIED_AGENT_LOOP is off, but the legacy per-provider loops were "
+            "removed — running the unified loop anyway."
+        )
+
+    s = get_settings()
+    build_model = _build_model(build_model)
+
+    if build_model == "gemini":
+        return GeminiAdapter(api_key=s.GEMINI_API_KEY, model=s.GEMINI_MODEL)
+    if build_model == "gpt":
+        return OpenAIAdapter(api_key=s.OPENAI_API_KEY, model=s.OPENAI_MODEL)
+    if build_model == "claude":
+        client = _anthropic.Anthropic(api_key=s.ANTHROPIC_API_KEY, timeout=timeout or 600.0)
+        return AnthropicAdapter(api_key=s.ANTHROPIC_API_KEY, model=s.ANTHROPIC_MODEL, client=client)
+
+    # Qwen3: Ollama (local daemon or Ollama Cloud) with automatic failover to
+    # the OpenRouter CODE chain for the rest of the run once Ollama has burned
+    # its retry budget.
+    from app.ai.ollama_http import ollama_base_url, ollama_build_model
+
+    ollama = OllamaAdapter(
+        base_url=ollama_base_url(s), model=ollama_build_model(s),
+        timeout=int(timeout) if timeout else s.OLLAMA_TIMEOUT,
+    )
+    try:
+        from app.ai.qwen import fallback_to_openrouter_enabled
+
+        if fallback_to_openrouter_enabled():
+            from app.ai.openrouter import OPENROUTER_BASE_URL, code_models
+
+            key = (s.OPENROUTER_API_KEY or "").strip()
+            if key:
+                return OllamaOpenRouterFallback(
+                    ollama,
+                    OpenRouterAdapter(api_key=key, base_url=OPENROUTER_BASE_URL, chain=code_models()),
+                )
+    except Exception as exc:  # noqa: BLE001 — fallback is best-effort wiring
+        logger.warning("qwen: OpenRouter fallback unavailable (%s) — Ollama only", exc)
+    return ollama
+
+
 def run_build_agent(
     workspace: Path,
     blueprint: dict[str, Any],
     app_name: str,
     template_key: str,
-    api_key: str,
-    model: str,
     log_fn: Callable[[str, str], None] | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
-    """Run the build agent tool loop; return (summary, total_tokens_used)."""
-    client = anthropic.Anthropic(api_key=api_key)
+    """Run the build agent on the configured BUILD_MODEL; return (summary, tokens).
+
+    One shared loop for every provider: the adapter resolves from BUILD_MODEL
+    and supplies only wire format and cache placement (Part L).
+    """
+    from app.build.provider_loop import run_agent_loop
+
     system = _build_system(template_key)
     user_msg = (
         f"App name: {app_name}\n"
@@ -2552,37 +2638,18 @@ def run_build_agent(
         "Build this application now following the phases in your instructions. "
         "Narrate each step as you go. When finished, write a user-friendly summary starting with DONE: that describes what was built — screens, features, and anything notable."
     )
-    return _loop(client, model, system, workspace, user_msg, log_fn)
+    written: list[str] = []
+    summary, tokens = run_agent_loop(
+        _agent_adapter(), system=system, stable=user_msg, workspace=workspace,
+        log_fn=log_fn, cancel_fn=cancel_fn, written=written,
+    )
+    if written:
+        update_project_memory_async(workspace, user_msg, summary, written)
+    return summary, tokens
 
 
-def _safe_args(raw: Any) -> dict[str, Any]:
-    """Parse model-emitted tool arguments, tolerating invalid JSON.
-
-    A lone backslash in a path or regex ('C:\\apps', '\\d+') makes the raw
-    argument string unparseable. Execution can degrade to {} silently; echoing
-    that same string back into history cannot — strict providers reject the
-    whole request with a 400 from then on.
-    """
-    if isinstance(raw, dict):
-        return raw
-    text = raw if isinstance(raw, str) else "{}"
-    try:
-        parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else {}
-    except (json.JSONDecodeError, TypeError):
-        # Common slip: backslashes that are not valid JSON escapes. Double them
-        # so a Windows path or regex survives as a parseable string.
-        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", text)
-        try:
-            parsed = json.loads(repaired)
-            return parsed if isinstance(parsed, dict) else {}
-        except json.JSONDecodeError:
-            return {}
 
 
-def _valid_args_json(raw: Any) -> str:
-    """Return tool arguments as a JSON-object string safe to echo into history."""
-    return json.dumps(_safe_args(raw), default=str)
 
 
 def _tools_to_ollama_format(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2597,411 +2664,6 @@ def _tools_to_ollama_format(tools: list[dict[str, Any]]) -> list[dict[str, Any]]
         }
         for t in tools
     ]
-
-
-def _ollama_loop(
-    base_url: str,
-    model: str,
-    system: str,
-    workspace: Path,
-    initial_user_msg: str,
-    timeout: int = 300,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-    max_iterations: int = _MAX_ITERATIONS,
-    tools: list[dict[str, Any]] | None = None,
-) -> tuple[str, int]:
-    """Run the agent, then record what it did in the project's MEMORY.md.
-
-    The memory update is fired after the summary is in hand and is not awaited:
-    the caller's result must not wait on bookkeeping.
-    """
-    written: list[str] = []
-    try:
-        summary, tokens = _ollama_agent_turns(
-            base_url, model, system, workspace, initial_user_msg,
-            timeout, log_fn, cancel_fn, max_iterations, written, tools,
-        )
-    except Exception as exc:
-        # Automatic Qwen3 failover: Ollama Cloud rate-limits without warning and
-        # its retry budget is already spent by the time this fires, so finish the
-        # phase on the OpenRouter CODE chain rather than failing the build.
-        from app.ai.qwen import fallback_to_openrouter_enabled
-
-        if not fallback_to_openrouter_enabled():
-            raise
-        if log_fn:
-            # Provider-agnostic: never name backends or leak exc (it can carry
-            # URLs/keys). Detail goes to the operator log below.
-            log_fn("warning", "The primary AI service is unavailable — switching to a backup automatically…")
-        logger.warning(
-            "qwen: Ollama failed (%s) — falling back to the OpenRouter build loop", exc,
-        )
-        return _openrouter_loop(
-            system, workspace, initial_user_msg,
-            log_fn, cancel_fn, max_iterations, tools,
-        )
-    if written:
-        update_project_memory_async(workspace, initial_user_msg, summary, written)
-    return summary, tokens
-
-
-def _ollama_agent_turns(
-    base_url: str,
-    model: str,
-    system: str,
-    workspace: Path,
-    initial_user_msg: str,
-    timeout: int = 300,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-    max_iterations: int = _MAX_ITERATIONS,
-    written: list[str] | None = None,
-    tools: list[dict[str, Any]] | None = None,
-) -> tuple[str, int]:
-    """Ollama tool-use agent loop. Returns (summary, total_tokens).
-
-    Token counts come from each response's final chunk (prompt_eval_count +
-    eval_count), so Ollama builds/updates are billed like the other backends.
-    Targets a local daemon or Ollama Cloud depending on OLLAMA_API_KEY.
-    """
-    from app.build.provider_loop import OllamaAdapter, run_agent_loop, unified_loop_enabled
-
-    if unified_loop_enabled():
-        adapter: Any = OllamaAdapter(base_url=base_url, model=model, timeout=timeout)
-        # Automatic Qwen3 failover: if this Ollama endpoint keeps failing, finish
-        # the run on the OpenRouter CODE chain instead of dying.
-        try:
-            from app.ai.qwen import fallback_to_openrouter_enabled
-
-            if fallback_to_openrouter_enabled():
-                from app.ai.openrouter import OPENROUTER_BASE_URL, code_models
-                from app.build.provider_loop import OllamaOpenRouterFallback, OpenRouterAdapter
-                from app.config import get_settings
-
-                _s = get_settings()
-                adapter = OllamaOpenRouterFallback(
-                    adapter,
-                    OpenRouterAdapter(
-                        api_key=(_s.OPENROUTER_API_KEY or "").strip(),
-                        base_url=OPENROUTER_BASE_URL,
-                        chain=code_models(),
-                    ),
-                )
-        except Exception as exc:  # noqa: BLE001 — fallback is best-effort wiring
-            logger.warning("qwen: OpenRouter fallback unavailable (%s) — Ollama only", exc)
-
-        return run_agent_loop(
-            adapter, system=system, stable=initial_user_msg, workspace=workspace,
-            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
-            tools=tools, written=written,
-        )
-
-    import requests as _req
-
-    from app.ai.ollama_http import (
-        ollama_headers,
-        ollama_options,
-        open_chat_stream,
-        using_cloud,
-    )
-
-    # Keep tool results short so the context doesn't balloon across iterations.
-    # Cloud models run with their full context window, so they get the larger
-    # cap — the small one truncates mid-file and strands the agent.
-    _TOOL_RESULT_LIMIT = (
-        _TOOL_RESULT_LIMIT_LARGE_CTX if using_cloud() else _TOOL_RESULT_LIMIT_SMALL_CTX
-    )
-    # Sliding window: system + first user msg are always kept; only the last N
-    # assistant/tool pairs are retained so the context stays within num_ctx.
-    # Cloud models have a far larger window, so keep more of the build history.
-    _HISTORY_PAIRS = 20 if using_cloud() else 6
-
-    url = f"{base_url.rstrip('/')}/api/chat"
-    headers = ollama_headers()
-    options = ollama_options(num_ctx=8192, num_predict=4096)
-    ollama_tools = _tools_to_ollama_format(tools if tools is not None else TOOLS)
-
-    # Prior runs' notes, if any. Injected rather than left for the agent to find:
-    # an optional read is a read the model usually skips, and the whole point is
-    # to start with the layout already known. Logged, unlike the write-back.
-    memory = read_project_memory(workspace)
-    if memory and log_fn:
-        log_fn("tool", f"Reading `{MEMORY_FILENAME}`")
-
-    # Anchor slots are never dropped by the sliding window.
-    anchor: list[dict[str, Any]] = [{"role": "system", "content": system}]
-    if memory:
-        anchor.append({"role": "user", "content": memory_context_block(memory)})
-    anchor.append({"role": "user", "content": initial_user_msg})
-    history: list[dict[str, Any]] = []  # assistant + tool messages, pruned each turn
-    last_text = ""
-    write_calls = 0  # track whether the agent actually wrote any files
-    total_tokens = 0
-    nudges = 0  # bounded pushbacks when the agent talks instead of writing
-    # Read-only calls already answered since the last workspace mutation.
-    seen_reads: set[str] = set()
-    explore_streak = 0  # consecutive turns of tool use with no write_file
-
-    def _trimmed_messages() -> list[dict[str, Any]]:
-        """Return anchor + a rolling window that never orphans a tool result.
-
-        Slicing purely by count can start the window on a `tool` message whose
-        `assistant` tool_calls message was just dropped. Models handle that
-        badly — it reads as a result to a question never asked — and it shows
-        up as the agent re-running tools it has already run.
-        """
-        window = history[-(_HISTORY_PAIRS * 2):]
-        start = 0
-        while start < len(window) and window[start].get("role") == "tool":
-            start += 1
-        return anchor + window[start:]
-
-    for iteration in range(max_iterations):
-        if cancel_fn and cancel_fn():
-            if log_fn:
-                log_fn("warning", "Agent stopped by user.")
-            return "Stopped by user.", total_tokens
-        warn_at = max(1, max_iterations - 10)
-        if iteration == warn_at and log_fn:
-            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
-
-        try:
-            # stream=True: timeout applies per-chunk, not for the full response,
-            # so long generations don't hit the read timeout. Retries rate-limit /
-            # overload responses (Ollama Cloud 429s without warning) in one place.
-            with open_chat_stream(
-                url,
-                payload={
-                    "model": model,
-                    "messages": _trimmed_messages(),
-                    "tools": ollama_tools,
-                    "stream": True,
-                    "options": options,
-                },
-                headers=headers,
-                timeout=timeout,
-                model=model,
-                log_fn=log_fn,
-            ) as resp:
-                content_parts: list[str] = []
-                tool_calls: list[dict] = []
-                stream_buf = ""       # accumulate content tokens until a flush boundary
-                think_buf = ""        # accumulate thinking tokens separately
-                in_think_tag = False  # track inline <think> blocks in content
-                for raw_line in resp.iter_lines():
-                    if not raw_line:
-                        continue
-                    chunk = json.loads(raw_line)
-                    msg = chunk.get("message", {})
-
-                    # ── Thinking tokens (Ollama thinking-model field) ──────────
-                    think_token = msg.get("thinking") or ""
-                    if think_token:
-                        think_buf += think_token
-                        if log_fn and len(think_buf) >= 120:
-                            log_fn("thinking", think_buf.strip())
-                            think_buf = ""
-
-                    # ── Content tokens ─────────────────────────────────────────
-                    token = msg.get("content") or ""
-                    if token:
-                        # Route inline <think>…</think> to the thinking buffer
-                        # so they don't pollute the content sent back to the model.
-                        if "<think>" in token:
-                            in_think_tag = True
-                        if in_think_tag:
-                            think_buf += token
-                            if log_fn and len(think_buf) >= 120:
-                                log_fn("thinking", think_buf.strip())
-                                think_buf = ""
-                            if "</think>" in token:
-                                in_think_tag = False
-                                think_buf = ""  # done with this think block
-                        else:
-                            content_parts.append(token)
-                            stream_buf += token
-                            # Flush to log at natural sentence boundaries or 120 chars
-                            if log_fn and (
-                                "\n" in stream_buf
-                                or stream_buf.endswith((".", "!", "?", "…"))
-                                or len(stream_buf) >= 120
-                            ):
-                                log_fn("text", stream_buf.strip())
-                                stream_buf = ""
-
-                    # ── Tool calls ─────────────────────────────────────────────
-                    # These stream in on an intermediate chunk (done=False) and
-                    # the final done chunk carries an empty message, so collect
-                    # them as they arrive. Reading them off the done chunk drops
-                    # every call and leaves the agent looping on the same tool.
-                    if chunk_calls := msg.get("tool_calls"):
-                        tool_calls.extend(chunk_calls)
-
-                    if chunk.get("done"):
-                        # Final chunk carries token counts for this turn.
-                        total_tokens += chunk.get("prompt_eval_count", 0) + chunk.get("eval_count", 0)
-                        if log_fn:
-                            if think_buf.strip():
-                                log_fn("thinking", think_buf.strip())
-                                think_buf = ""
-                            if stream_buf.strip():
-                                log_fn("text", stream_buf.strip())
-                                stream_buf = ""
-
-                content_text: str = "".join(content_parts)
-        except Exception as exc:
-            raise RuntimeError(f"Ollama build agent request failed: {exc}") from exc
-
-        history.append({
-            "role": "assistant",
-            "content": content_text,
-            **({"tool_calls": tool_calls} if tool_calls else {}),
-        })
-
-        if content_text:
-            last_text = content_text
-            if "DONE" in content_text.upper():
-                if write_calls == 0 and nudges < _MAX_NUDGES:
-                    # Agent claimed done without writing anything — push back
-                    nudges += 1
-                    if log_fn:
-                        log_fn("info", "Agent said DONE without writing files — asking it to implement…")
-                    # assistant message already appended above — only add the user pushback
-                    history.append({
-                        "role": "user",
-                        "content": (
-                            "You said you were done but you haven't called write_file yet. "
-                            "Please implement the changes now using write_file. "
-                            "Do not just describe what to do — actually write the code."
-                        ),
-                    })
-                    continue
-                # Don't emit done here — update_worker will use the returned summary
-                return content_text, total_tokens
-
-        if not tool_calls:
-            if write_calls == 0 and last_text and nudges < _MAX_NUDGES:
-                # No tool calls and no writes — push back to get actual file
-                # output. Bounded: an unbounded nudge burns every iteration
-                # re-asking a model that isn't going to comply.
-                nudges += 1
-                if log_fn:
-                    log_fn("info", "No files written yet — asking agent to write the code…")
-                # assistant message already appended above — only add the pushback
-                history.append({
-                    "role": "user",
-                    "content": (
-                        "You haven't written any files yet. "
-                        "Use the write_file tool to implement the changes now."
-                    ),
-                })
-                continue
-            # Don't emit done here — update_worker will use the returned summary
-            return last_text or "Done.", total_tokens
-
-        wrote_this_turn = False
-        for call in tool_calls:
-            func = call.get("function", {})
-            tool_name = func.get("name", "")
-            tool_input = func.get("arguments", {})
-            if isinstance(tool_input, str):
-                try:
-                    tool_input = json.loads(tool_input)
-                except json.JSONDecodeError:
-                    tool_input = {}
-            if tool_name in _WRITE_TOOLS:
-                write_calls += 1
-                wrote_this_turn = True
-                if written is not None and (p := tool_input.get("path")):
-                    written.append(str(p))
-                if log_fn:
-                    log_fn("file_written", tool_input.get("path", ""))
-
-            call_key = f"{tool_name}:{json.dumps(tool_input, sort_keys=True, default=str)}"
-            is_repeat = tool_name in _READ_ONLY_TOOLS and call_key in seen_reads
-            if log_fn:
-                # Mark repeats explicitly — an identical-looking log line for a
-                # suppressed call makes a stuck agent impossible to spot.
-                label = tool_message(tool_name, tool_input)
-                log_fn("tool", f"{label} — already read, skipping" if is_repeat else label)
-
-            if is_repeat:
-                # Serving this from a notice rather than re-running it is the
-                # point: re-executing costs a full tool result in context every
-                # time and teaches the model nothing new.
-                result = (
-                    f"[You already ran {tool_name} with these exact arguments and "
-                    "the workspace has not changed since. The result is the same. "
-                    "Stop inspecting and make the change now with write_file.]"
-                )
-            else:
-                result = execute_tool(tool_name, tool_input, workspace, log_fn)
-                if tool_name in _READ_ONLY_TOOLS:
-                    seen_reads.add(call_key)
-                else:
-                    # The workspace changed, so earlier reads may be stale.
-                    seen_reads.clear()
-            # Truncate large results (e.g. read_file on a big file) so they
-            # don't blow up the context window on the next iteration.
-            result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
-            # tool_name is required — without it the model cannot tell which
-            # call a result answers and tends to just issue the call again.
-            history.append({"role": "tool", "tool_name": tool_name, "content": result})
-
-        # Bounded exploration: a run of tool-only turns with nothing written
-        # means the agent is stuck surveying. Push it to act, once per streak.
-        explore_streak = 0 if wrote_this_turn else explore_streak + 1
-        if explore_streak >= _MAX_EXPLORE_STREAK:
-            if nudges < _MAX_NUDGES:
-                nudges += 1
-                explore_streak = 0
-                if log_fn:
-                    log_fn("info", "Agent is still exploring — asking it to start writing…")
-                history.append({
-                    "role": "user",
-                    "content": (
-                        f"You have used {_MAX_EXPLORE_STREAK} turns inspecting the project "
-                        "without writing anything. You have enough context. Implement the "
-                        "change now with write_file, then reply DONE."
-                    ),
-                })
-            else:
-                # Pushed to act and still only surveying. Every further turn
-                # re-sends the whole context for no progress, which is how a
-                # single request burns hundreds of thousands of tokens.
-                if log_fn:
-                    log_fn("warning", "Agent kept exploring without making changes — stopping.")
-                return (
-                    last_text or "Agent stopped: explored the project without making changes.",
-                    total_tokens,
-                )
-
-    if log_fn:
-        log_fn("warning", "Agent reached iteration limit.")
-    return "Agent reached iteration limit.", total_tokens
-
-
-def run_build_agent_ollama(
-    workspace: Path,
-    blueprint: dict[str, Any],
-    app_name: str,
-    template_key: str,
-    base_url: str,
-    model: str,
-    timeout: int = 300,
-    log_fn: Callable[[str, str], None] | None = None,
-) -> tuple[str, int]:
-    """Run the build agent using local Ollama with tool calls; return (summary, total_tokens)."""
-    system = _build_system(template_key)
-    user_msg = (
-        f"App name: {app_name}\n"
-        f"Template: {template_key}\n\n"
-        f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
-        "Build this application now following the phases in your instructions. "
-        "Narrate each step as you go. When finished, write a user-friendly summary starting with DONE: that describes what was built — screens, features, and anything notable."
-    )
-    return _ollama_loop(base_url, model, system, workspace, user_msg, timeout, log_fn)
 
 
 _SCAN_SKIP_DIRS = frozenset({
@@ -3654,66 +3316,56 @@ def run_update_agent(
     blueprint: dict[str, Any],
     app_name: str,
     template_key: str,
-    api_key: str,
-    model: str,
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
+    build_model: str | None = None,
 ) -> tuple[str, int]:
-    """Plan → design? → execute → validate → security? using Claude/Anthropic."""
+    """Plan → design? → execute → validate → security? on the configured BUILD_MODEL.
+
+    ``build_model`` overrides the setting per user (quota downgrades)."""
+    from app.build.provider_loop import run_agent_loop
+    from app.config import get_settings
+
+    effective_model = _build_model(build_model)
+    s = get_settings()
+
     if log_fn:
         log_fn("thinking", "Planning changes…")
-    plan = _call_planner(
-        _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
-        backend="claude", api_key=api_key, model=model,
-    )
-    _log_plan(plan, log_fn)
-    client = anthropic.Anthropic(api_key=api_key)
-
-    def run_phase(
-        system: str, user_msg: str, iters: int,
-        tools: list[dict[str, Any]] | None = None,
-    ) -> tuple[str, int]:
-        return _loop(
-            client, model, system, workspace, user_msg,
-            log_fn, cancel_fn, max_iterations=iters,
-            tools=tools,
+    # Planner creds per backend: only the text-only planner call branches here;
+    # every tool-using phase below runs on the adapter.
+    if effective_model == "gemini":
+        plan = _call_planner(
+            _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
+            backend="gemini", api_key=s.GEMINI_API_KEY, model=s.GEMINI_MODEL,
         )
-
-    return _run_update_sequence(
-        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
-        app_name=app_name, template_key=template_key, plan=plan,
-        log_fn=log_fn, cancel_fn=cancel_fn,
-    )
-
-
-def run_update_agent_ollama(
-    workspace: Path,
-    prompt: str,
-    blueprint: dict[str, Any],
-    app_name: str,
-    template_key: str,
-    base_url: str,
-    model: str,
-    timeout: int = 300,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-) -> tuple[str, int]:
-    """Plan → design? → execute → validate → security? using Ollama/Qwen3."""
-    if log_fn:
-        log_fn("thinking", "Planning changes…")
-    plan = _call_planner(
-        _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
-        backend="Qwen3", base_url=base_url, ollama_model=model, ollama_timeout=timeout,
-    )
+    elif effective_model == "gpt":
+        plan = _call_planner(
+            _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
+            backend="gpt", api_key=s.OPENAI_API_KEY, model=s.OPENAI_MODEL,
+        )
+    elif effective_model == "claude":
+        plan = _call_planner(
+            _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
+            backend="claude", api_key=s.ANTHROPIC_API_KEY, model=s.ANTHROPIC_MODEL,
+        )
+    else:  # Qwen3 — routes to OpenRouter's PLAN chain or Ollama internally
+        plan = _call_planner(
+            _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
+            backend="Qwen3",
+        )
     _log_plan(plan, log_fn)
+    # The planner call may run on a text-only model; its (small) token usage
+    # isn't counted — the tool-loop phases below are the bulk of the cost.
+
+    adapter = _agent_adapter(build_model=build_model)
 
     def run_phase(
         system: str, user_msg: str, iters: int,
         tools: list[dict[str, Any]] | None = None,
     ) -> tuple[str, int]:
-        return _ollama_loop(
-            base_url, model, system, workspace, user_msg,
-            timeout, log_fn, cancel_fn, max_iterations=iters,
+        return run_agent_loop(
+            adapter, system=system, stable=user_msg, workspace=workspace,
+            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=iters,
             tools=tools,
         )
 
@@ -3733,12 +3385,8 @@ _GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:g
 # it for no reason: a stylesheet or a component came back as a fragment, and the
 # agent spent its whole phase paging through the same file with read_file offsets
 # trying to see the rest. Use the same large-context cap as the Claude path.
-_TOOL_RESULT_LIMIT = _TOOL_RESULT_LIMIT_LARGE_CTX
 # Rolling window, in model/tool-response pairs, so a long phase stops resending
 # every earlier turn.
-_GEMINI_HISTORY_PAIRS = 20
-
-
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 _GEMINI_MAX_RETRIES = 4
 _GEMINI_BASE_DELAY_S = 5.0
@@ -3914,443 +3562,9 @@ def _gemini_post_with_retry(
     raise RuntimeError(f"Gemini agent request failed after {_GEMINI_MAX_RETRIES} retries: {last_exc}") from last_exc
 
 
-def _tools_to_gemini_format(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{"functionDeclarations": [
-        {
-            "name": t["name"],
-            "description": t.get("description", ""),
-            "parameters": t.get("input_schema", {}),
-        }
-        for t in tools
-    ]}]
-
-
-def _gemini_loop(
-    api_key: str,
-    model: str,
-    system: str,
-    workspace: Path,
-    initial_user_msg: str,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-    max_iterations: int = _MAX_ITERATIONS,
-    tools: list[dict[str, Any]] | None = None,
-) -> tuple[str, int]:
-    """Gemini tool-use agent loop via REST API. Returns (summary, total_tokens)."""
-    from app.build.provider_loop import GeminiAdapter, run_agent_loop, unified_loop_enabled
-
-    if unified_loop_enabled():
-        adapter = GeminiAdapter(api_key=api_key, model=model)
-        return run_agent_loop(
-            adapter, system=system, stable=initial_user_msg, workspace=workspace,
-            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
-            tools=tools,
-        )
-
-    url = _GEMINI_URL.format(model=model)
-    gemini_tools = _tools_to_gemini_format(tools if tools is not None else TOOLS)
-    contents: list[dict[str, Any]] = [{"role": "user", "parts": [{"text": initial_user_msg}]}]
-    last_text = ""
-    write_calls = 0
-    nudges = 0  # bounded pushbacks when the agent talks instead of writing
-    total_tokens = 0
-    # Read-only calls already answered since the last workspace mutation.
-    seen_reads: set[str] = set()
-    explore_streak = 0  # consecutive turns of tool use with no write
-
-    def _trimmed_contents() -> list[dict[str, Any]]:
-        """First user turn + a window that never orphans a functionResponse.
-
-        Gemini rejects a functionResponse whose functionCall is no longer in the
-        history, so the window advances to the next model turn rather than
-        slicing blindly by count.
-        """
-        window = contents[1:][-(_GEMINI_HISTORY_PAIRS * 2):]
-        start = 0
-        while start < len(window) and window[start].get("role") != "model":
-            start += 1
-        return contents[:1] + window[start:]
-
-    for iteration in range(max_iterations):
-        if cancel_fn and cancel_fn():
-            if log_fn:
-                log_fn("warning", "Agent stopped by user.")
-            return "Stopped by user.", total_tokens
-        warn_at = max(1, max_iterations - 10)
-        if iteration == warn_at and log_fn:
-            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
-
-        data = _gemini_post_with_retry(
-            url,
-            api_key,
-            {
-                "system_instruction": {"parts": [{"text": system}]},
-                "contents": _trimmed_contents(),
-                "tools": gemini_tools,
-                "generationConfig": {"maxOutputTokens": 8192},
-            },
-            timeout=120,
-            log_fn=log_fn,
-        )
-
-        # Gemini reports usage in usageMetadata.totalTokenCount (input + output).
-        total_tokens += (data.get("usageMetadata") or {}).get("totalTokenCount", 0)
-
-        candidates = data.get("candidates", [])
-        if not candidates:
-            raise RuntimeError(f"Gemini returned no candidates: {data}")
-
-        candidate = candidates[0]
-        parts = candidate.get("content", {}).get("parts", [])
-        finish_reason = candidate.get("finishReason", "")
-        contents.append({"role": "model", "parts": parts})
-
-        tool_calls: list[dict] = []
-        done_text: str | None = None
-
-        for part in parts:
-            if "text" in part:
-                txt = part["text"]
-                last_text = txt
-                if log_fn and txt.strip():
-                    log_fn("text", txt.strip()[:160])
-                if "DONE" in txt.upper():
-                    done_text = txt
-            elif "functionCall" in part:
-                tool_calls.append(part["functionCall"])
-
-        if done_text is not None and not tool_calls:
-            if write_calls == 0 and nudges < _MAX_NUDGES:
-                nudges += 1
-                if log_fn:
-                    log_fn("info", "Agent said DONE without writing files — asking it to implement…")
-                contents.append({"role": "user", "parts": [{"text": (
-                    "You said you were done but haven't called write_file yet. "
-                    "Implement the changes now using write_file."
-                )}]})
-                continue
-            return done_text, total_tokens
-
-        if finish_reason in ("STOP", "MAX_TOKENS") and not tool_calls:
-            if write_calls == 0 and nudges < _MAX_NUDGES:
-                nudges += 1
-                if log_fn:
-                    log_fn("info", "No files written yet — asking agent to write the code…")
-                contents.append({"role": "user", "parts": [{"text": (
-                    "You haven't written any files yet. Use write_file to implement the changes."
-                )}]})
-                continue
-            return last_text or "Done.", total_tokens
-
-        tool_responses: list[dict] = []
-        wrote_this_turn = False
-        for call in tool_calls:
-            tool_name = call.get("name", "")
-            tool_input = call.get("args", {})
-            if tool_name in _WRITE_TOOLS:
-                write_calls += 1
-                wrote_this_turn = True
-                if log_fn:
-                    log_fn("file_written", tool_input.get("path", ""))
-
-            call_key = f"{tool_name}:{json.dumps(tool_input, sort_keys=True, default=str)}"
-            is_repeat = tool_name in _READ_ONLY_TOOLS and call_key in seen_reads
-            if log_fn:
-                # Mark repeats explicitly — an identical-looking log line for a
-                # suppressed call makes a stuck agent impossible to spot.
-                label = tool_message(tool_name, tool_input)
-                log_fn("tool", f"{label} — already read, skipping" if is_repeat else label)
-
-            if is_repeat:
-                result = (
-                    f"[You already ran {tool_name} with these exact arguments and "
-                    "the workspace has not changed since. The result is the same. "
-                    "Stop inspecting and make the change now.]"
-                )
-            else:
-                result = execute_tool(tool_name, tool_input, workspace, log_fn)
-                if tool_name in _READ_ONLY_TOOLS:
-                    seen_reads.add(call_key)
-                else:
-                    # The workspace changed, so earlier reads may be stale.
-                    seen_reads.clear()
-            result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
-            tool_responses.append({"functionResponse": {"name": tool_name, "response": {"output": result}}})
-
-        if not tool_responses:
-            continue
-        contents.append({"role": "user", "parts": tool_responses})
-
-        # Bounded exploration: a run of tool-only turns with nothing written
-        # means the agent is stuck surveying. Push it to act, once per streak.
-        explore_streak = 0 if wrote_this_turn else explore_streak + 1
-        if explore_streak >= _MAX_EXPLORE_STREAK:
-            if nudges < _MAX_NUDGES:
-                nudges += 1
-                explore_streak = 0
-                if log_fn:
-                    log_fn("info", "Agent is still exploring — asking it to start writing…")
-                # Appended to the same turn as the tool responses: a functionResponse
-                # must be answered in the turn directly after its functionCall.
-                tool_responses.append({"text": (
-                    f"You have used {_MAX_EXPLORE_STREAK} turns inspecting the project "
-                    "without writing anything. You have enough context. Implement the "
-                    "change now, then reply DONE."
-                )})
-            else:
-                if log_fn:
-                    log_fn("warning", "Agent kept exploring without making changes — stopping.")
-                return (
-                    last_text or "Agent stopped: explored the project without making changes.",
-                    total_tokens,
-                )
-
-    if log_fn:
-        log_fn("warning", "Agent reached iteration limit.")
-    return "Agent reached iteration limit.", total_tokens
-
-
-def run_build_agent_gemini(
-    workspace: Path,
-    blueprint: dict[str, Any],
-    app_name: str,
-    template_key: str,
-    api_key: str,
-    model: str,
-    log_fn: Callable[[str, str], None] | None = None,
-) -> tuple[str, int]:
-    system = _build_system(template_key)
-    user_msg = (
-        f"App name: {app_name}\nTemplate: {template_key}\n\n"
-        f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
-        "Build this application now following the phases in your instructions. "
-        "Narrate each step. When finished, write DONE: <summary of what was built>."
-    )
-    return _gemini_loop(api_key, model, system, workspace, user_msg, log_fn)
-
-
-def run_update_agent_gemini(
-    workspace: Path,
-    prompt: str,
-    blueprint: dict[str, Any],
-    app_name: str,
-    template_key: str,
-    api_key: str,
-    model: str,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-) -> tuple[str, int]:
-    """Plan → design? → execute → validate → security? using Gemini."""
-    if log_fn:
-        log_fn("thinking", "Planning changes…")
-    plan = _call_planner(
-        _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
-        backend="gemini", api_key=api_key, model=model,
-    )
-    _log_plan(plan, log_fn)
-
-    def run_phase(
-        system: str, user_msg: str, iters: int,
-        tools: list[dict[str, Any]] | None = None,
-    ) -> tuple[str, int]:
-        return _gemini_loop(
-            api_key, model, system, workspace, user_msg,
-            log_fn, cancel_fn, max_iterations=iters,
-            tools=tools,
-        )
-
-    return _run_update_sequence(
-        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
-        app_name=app_name, template_key=template_key, plan=plan,
-        log_fn=log_fn, cancel_fn=cancel_fn,
-    )
-
-
 # ---------------------------------------------------------------------------
-# OpenAI / GPT agent loop
-# ---------------------------------------------------------------------------
-
-def _openai_loop(
-    api_key: str,
-    model: str,
-    system: str,
-    workspace: Path,
-    initial_user_msg: str,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-    max_iterations: int = _MAX_ITERATIONS,
-    tools: list[dict[str, Any]] | None = None,
-) -> tuple[str, int]:
-    """OpenAI tool-use agent loop. Returns (summary, total_tokens)."""
-    from app.build.provider_loop import OpenAIAdapter, run_agent_loop, unified_loop_enabled
-
-    if unified_loop_enabled():
-        adapter = OpenAIAdapter(api_key=api_key, model=model)
-        return run_agent_loop(
-            adapter, system=system, stable=initial_user_msg, workspace=workspace,
-            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
-            tools=tools,
-        )
-
-    from openai import OpenAI
-
-    client = OpenAI(api_key=api_key)
-    # same OpenAI-compatible format
-    openai_tools = _tools_to_ollama_format(tools if tools is not None else TOOLS)
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": initial_user_msg},
-    ]
-    last_text = ""
-    write_calls = 0
-    pushback_sent = False
-    total_tokens = 0
-
-    for iteration in range(max_iterations):
-        if cancel_fn and cancel_fn():
-            if log_fn:
-                log_fn("warning", "Agent stopped by user.")
-            return "Stopped by user.", 0
-        warn_at = max(1, max_iterations - 10)
-        if iteration == warn_at and log_fn:
-            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
-
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=openai_tools,
-                tool_choice="auto",
-                max_tokens=_MAX_OUTPUT_TOKENS_CHAT,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"OpenAI agent request failed: {exc}") from exc
-
-        if response.usage:
-            total_tokens += response.usage.total_tokens
-
-        msg = response.choices[0].message
-        # Append as dict so it's serialisable for the next round. Arguments are
-        # re-serialised through a validity check: echoing a model's malformed
-        # JSON (e.g. a lone backslash in a path) back verbatim gets every later
-        # request rejected by strict providers.
-        messages.append({"role": "assistant", "content": msg.content or "", **({"tool_calls": [
-            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": _valid_args_json(tc.function.arguments)}}
-            for tc in (msg.tool_calls or [])
-        ]} if msg.tool_calls else {})})
-
-        tool_calls = msg.tool_calls or []
-        text = msg.content or ""
-        done_text: str | None = None
-
-        if text:
-            last_text = text
-            if log_fn and text.strip():
-                log_fn("text", text.strip()[:160])
-            if "DONE" in text.upper():
-                done_text = text
-
-        if done_text is not None and not tool_calls:
-            if write_calls == 0 and not pushback_sent:
-                pushback_sent = True
-                if log_fn:
-                    log_fn("info", "Agent said DONE without writing files — asking it to implement…")
-                messages.append({"role": "user", "content": (
-                    "You said you were done but haven't called write_file yet. "
-                    "Implement the changes now using write_file."
-                )})
-                continue
-            return done_text, total_tokens
-
-        finish_reason = response.choices[0].finish_reason
-        if finish_reason == "stop" and not tool_calls:
-            if write_calls == 0 and not pushback_sent:
-                pushback_sent = True
-                if log_fn:
-                    log_fn("info", "No files written yet — asking agent to write the code…")
-                messages.append({"role": "user", "content": (
-                    "You haven't written any files yet. Use write_file to implement the changes."
-                )})
-                continue
-            return last_text or "Done.", total_tokens
-
-        for tc in tool_calls:
-            tool_name = tc.function.name
-            tool_input = _safe_args(tc.function.arguments)
-            if tool_name in _WRITE_TOOLS:
-                write_calls += 1
-                if log_fn:
-                    log_fn("file_written", tool_input.get("path", ""))
-            if log_fn:
-                log_fn("tool", tool_message(tool_name, tool_input))
-            result = execute_tool(tool_name, tool_input, workspace, log_fn)
-            result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-
-    if log_fn:
-        log_fn("warning", "Agent reached iteration limit.")
-    return "Agent reached iteration limit.", total_tokens
-
-
-def run_build_agent_openai(
-    workspace: Path,
-    blueprint: dict[str, Any],
-    app_name: str,
-    template_key: str,
-    api_key: str,
-    model: str,
-    log_fn: Callable[[str, str], None] | None = None,
-) -> tuple[str, int]:
-    system = _build_system(template_key)
-    user_msg = (
-        f"App name: {app_name}\nTemplate: {template_key}\n\n"
-        f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
-        "Build this application now following the phases in your instructions. "
-        "Narrate each step. When finished, write DONE: <summary of what was built>."
-    )
-    return _openai_loop(api_key, model, system, workspace, user_msg, log_fn)
-
-
-def run_update_agent_openai(
-    workspace: Path,
-    prompt: str,
-    blueprint: dict[str, Any],
-    app_name: str,
-    template_key: str,
-    api_key: str,
-    model: str,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-) -> tuple[str, int]:
-    """Plan → design? → execute → validate → security? using OpenAI/GPT."""
-    if log_fn:
-        log_fn("thinking", "Planning changes…")
-    plan = _call_planner(
-        _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
-        backend="gpt", api_key=api_key, model=model,
-    )
-    _log_plan(plan, log_fn)
-
-    def run_phase(
-        system: str, user_msg: str, iters: int,
-        tools: list[dict[str, Any]] | None = None,
-    ) -> tuple[str, int]:
-        return _openai_loop(
-            api_key, model, system, workspace, user_msg,
-            log_fn, cancel_fn, max_iterations=iters,
-            tools=tools,
-        )
-
-    return _run_update_sequence(
-        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
-        app_name=app_name, template_key=template_key, plan=plan,
-        log_fn=log_fn, cancel_fn=cancel_fn,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Fix agents — executor-only, no pipeline
-# Used by build_worker auto-fix loop to avoid running 5 agents per compile error.
+# Fix agent — executor-only, no pipeline.
+# Used by build_worker's auto-fix loop to avoid running 5 agents per compile error.
 # ---------------------------------------------------------------------------
 
 def run_fix_agent(
@@ -4358,370 +3572,22 @@ def run_fix_agent(
     prompt: str,
     app_name: str,
     template_key: str,
-    api_key: str,
-    model: str,
     log_fn: Callable[[str, str], None] | None = None,
     cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
-    """Executor-only fix pass using Claude/Anthropic — no planner, design, validator, or security."""
-    import anthropic as _anthropic
-    client = _anthropic.Anthropic(api_key=api_key, timeout=180.0)
-    return _loop(client, model, _UPDATE_SYSTEM, workspace, prompt, log_fn, cancel_fn, max_iterations=_ITERS_FIX)
+    """Executor-only fix pass on the configured BUILD_MODEL — no planner, design,
+    validator, or security."""
+    from app.build.provider_loop import run_agent_loop
 
-
-def run_fix_agent_ollama(
-    workspace: Path,
-    prompt: str,
-    app_name: str,
-    template_key: str,
-    base_url: str,
-    model: str,
-    timeout: int = 300,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-) -> tuple[str, int]:
-    """Executor-only fix pass using Ollama/Qwen3."""
-    return _ollama_loop(base_url, model, _UPDATE_SYSTEM, workspace, prompt, timeout, log_fn, cancel_fn, max_iterations=_ITERS_FIX)
-
-
-def run_fix_agent_gemini(
-    workspace: Path,
-    prompt: str,
-    app_name: str,
-    template_key: str,
-    api_key: str,
-    model: str,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-) -> tuple[str, int]:
-    """Executor-only fix pass using Gemini."""
-    return _gemini_loop(api_key, model, _UPDATE_SYSTEM, workspace, prompt, log_fn, cancel_fn, max_iterations=_ITERS_FIX)
-
-
-def run_fix_agent_openai(
-    workspace: Path,
-    prompt: str,
-    app_name: str,
-    template_key: str,
-    api_key: str,
-    model: str,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-) -> tuple[str, int]:
-    """Executor-only fix pass using OpenAI/GPT."""
-    return _openai_loop(api_key, model, _UPDATE_SYSTEM, workspace, prompt, log_fn, cancel_fn, max_iterations=_ITERS_FIX)
-
-
-# ---------------------------------------------------------------------------
-# OpenRouter agent loop (the hosted "Qwen3" build backend)
-#
-# Self-contained on purpose: it shares no code with the OpenAI/"gpt" loop above,
-# so the two backends can never affect each other. OpenRouter speaks the OpenAI
-# wire protocol, so we use the `openai` SDK purely as an HTTP client, pointed at
-# OpenRouter's base URL — no OpenAI/ChatGPT service or key is involved. Requests
-# run Qwen3-Coder (and the tool-capable fallbacks in app/ai/openrouter.py's CODE
-# chain) with real tool calling.
-# ---------------------------------------------------------------------------
-
-# HTTP conditions worth retrying — free OpenRouter endpoints 429 routinely.
-_OPENROUTER_RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
-
-# Weaker free models sometimes read/list files turn after turn without ever
-# committing an edit. After this many consecutive exploration-only turns, nudge
-# the agent to start writing; give up nudging after _MAX_WRITE_NUDGES so a
-# genuinely read-only task (e.g. a security review) isn't harassed forever.
-_READONLY_STREAK_LIMIT = 8
-_MAX_WRITE_NUDGES = 2
-
-# The OpenRouter loop is non-streaming, so there's a silent gap while each turn's
-# model call is in flight. Emit a rotating status verb (rendered with the
-# "thinking" spinner in the UI) so the build always looks alive. "Forging" nods
-# to the product name.
-_STATUS_VERBS = ("Forging", "Thinking", "Analyzing", "Reasoning", "Working", "Crafting", "Building")
-
-
-def _openrouter_chat_turn(
-    client: Any,
-    chain: list[str],
-    messages: list[dict[str, Any]],
-    tools: list[dict],
-    log_fn: Callable[[str, str], None] | None,
-) -> Any:
-    """One chat turn against the CODE model chain, resilient to rate limits.
-
-    Tries each model in `chain`, retrying a retryable failure once with backoff
-    before moving on. On success, promotes the winning model to the front of
-    `chain` (mutated in place) so the next turn starts with a model that just
-    worked rather than re-hitting a rate-limited free endpoint. Raises
-    RuntimeError only when every model in the chain fails.
-    """
-    last_exc: Exception | None = None
-    for idx, mdl in enumerate(list(chain)):
-        for attempt in range(2):
-            try:
-                resp = client.chat.completions.create(
-                    model=mdl,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice="auto",
-                    max_tokens=_MAX_OUTPUT_TOKENS_CHAT,  # headroom: reasoning tokens are billed here too
-                )
-                if idx > 0:
-                    chain.insert(0, chain.pop(idx))
-                    # Model names never reach the user feed; operators see them here.
-                    logger.info("openrouter: serving with fallback model %s", mdl)
-                    if log_fn:
-                        log_fn("info", "Adjusting the AI route on our side…")
-                return resp
-            except Exception as exc:  # noqa: BLE001 — inspect status, then decide
-                last_exc = exc
-                status = getattr(exc, "status_code", None)
-                if status in _OPENROUTER_RETRYABLE_STATUS and attempt == 0:
-                    time.sleep(3)
-                    continue
-                break  # non-retryable, or already retried — try the next model
-    raise RuntimeError(f"OpenRouter build agent request failed: {last_exc}")
-
-
-def _openrouter_loop(
-    system: str,
-    workspace: Path,
-    initial_user_msg: str,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-    max_iterations: int = _MAX_ITERATIONS,
-    tools: list[dict[str, Any]] | None = None,
-) -> tuple[str, int]:
-    """Tool-use agent loop for the hosted Qwen3 backend (OpenRouter).
-
-    Mirrors the other backends' loops (DONE detection, write pushback, tool-result
-    truncation) but drives the OpenRouter CODE model chain with mid-build failover.
-    """
-    from app.build.provider_loop import OpenRouterAdapter, run_agent_loop, unified_loop_enabled
-
-    if unified_loop_enabled():
-        from app.ai.openrouter import OPENROUTER_BASE_URL, code_models
-        from app.config import get_settings
-
-        _s = get_settings()
-        _key = (_s.OPENROUTER_API_KEY or "").strip()
-        if not _key:
-            raise RuntimeError("OPENROUTER_API_KEY is not set — cannot run the Qwen3/OpenRouter build agent.")
-        adapter = OpenRouterAdapter(api_key=_key, base_url=OPENROUTER_BASE_URL, chain=code_models())
-        return run_agent_loop(
-            adapter, system=system, stable=initial_user_msg, workspace=workspace,
-            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
-            tools=tools,
-        )
-
-    from openai import OpenAI
-
-    from app.ai.openrouter import OPENROUTER_BASE_URL, code_models
-    from app.config import get_settings
-
-    settings = get_settings()
-    api_key = (settings.OPENROUTER_API_KEY or "").strip()
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set — cannot run the Qwen3/OpenRouter build agent.")
-
-    client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
-    chain = code_models()  # ordered, tool-capable; mutated in place by failover
-    # OpenAI-compatible schema
-    openrouter_tools = _tools_to_ollama_format(tools if tools is not None else TOOLS)
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": initial_user_msg},
-    ]
-    last_text = ""
-    write_calls = 0
-    pushback_sent = False
-    readonly_streak = 0  # consecutive turns that used tools but wrote nothing
-    write_nudges = 0
-    total_tokens = 0
-
-    for iteration in range(max_iterations):
-        if cancel_fn and cancel_fn():
-            if log_fn:
-                log_fn("warning", "Agent stopped by user.")
-            return "Stopped by user.", total_tokens
-        warn_at = max(1, max_iterations - 10)
-        if iteration == warn_at and log_fn:
-            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
-
-        # Heartbeat while the (non-streaming) model call is in flight.
-        if log_fn:
-            log_fn("thinking", f"{_STATUS_VERBS[iteration % len(_STATUS_VERBS)]}…")
-
-        response = _openrouter_chat_turn(client, chain, messages, openrouter_tools, log_fn)
-
-        # OpenRouter returns OpenAI-style usage — accumulate so builds/updates are
-        # billed and count toward the user's monthly quota (see core/usage.py).
-        usage = getattr(response, "usage", None)
-        if usage and getattr(usage, "total_tokens", None):
-            total_tokens += usage.total_tokens
-
-        msg = response.choices[0].message
-        # Same validity check as the OpenAI loop: a malformed arguments string
-        # echoed back verbatim poisons history and 400s every later turn.
-        messages.append({"role": "assistant", "content": msg.content or "", **({"tool_calls": [
-            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": _valid_args_json(tc.function.arguments)}}
-            for tc in (msg.tool_calls or [])
-        ]} if msg.tool_calls else {})})
-
-        # Reasoning models return their chain-of-thought in a `reasoning` field —
-        # surface a trimmed slice as real "thinking" when it's there.
-        if log_fn:
-            try:
-                reasoning = (getattr(msg, "reasoning", None) or "").strip()
-            except Exception:
-                reasoning = ""
-            if reasoning:
-                log_fn("thinking", reasoning[:200])
-
-        tool_calls = msg.tool_calls or []
-        text = msg.content or ""
-        done_text: str | None = None
-
-        if text:
-            last_text = text
-            if log_fn and text.strip():
-                log_fn("text", text.strip()[:160])
-            if "DONE" in text.upper():
-                done_text = text
-
-        if done_text is not None and not tool_calls:
-            if write_calls == 0 and not pushback_sent:
-                pushback_sent = True
-                if log_fn:
-                    log_fn("info", "Agent said DONE without writing files — asking it to implement…")
-                messages.append({"role": "user", "content": (
-                    "You said you were done but haven't called write_file yet. "
-                    "Implement the changes now using write_file."
-                )})
-                continue
-            return done_text, total_tokens
-
-        finish_reason = response.choices[0].finish_reason
-        if finish_reason == "stop" and not tool_calls:
-            if write_calls == 0 and not pushback_sent:
-                pushback_sent = True
-                if log_fn:
-                    log_fn("info", "No files written yet — asking agent to write the code…")
-                messages.append({"role": "user", "content": (
-                    "You haven't written any files yet. Use write_file to implement the changes."
-                )})
-                continue
-            return last_text or "Done.", total_tokens
-
-        wrote_this_turn = False
-        for tc in tool_calls:
-            tool_name = tc.function.name
-            tool_input = _safe_args(tc.function.arguments)
-            if tool_name in _WRITE_TOOLS:
-                write_calls += 1
-                wrote_this_turn = True
-                if log_fn:
-                    log_fn("file_written", tool_input.get("path", ""))
-            if log_fn:
-                log_fn("tool", tool_message(tool_name, tool_input))
-            result = execute_tool(tool_name, tool_input, workspace, log_fn)
-            result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT)
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-
-        # Break read-only stalls: if the agent has explored for many turns without
-        # writing, tell it explicitly to start editing (see _READONLY_STREAK_LIMIT).
-        readonly_streak = 0 if wrote_this_turn else readonly_streak + 1
-        if readonly_streak >= _READONLY_STREAK_LIMIT and write_nudges < _MAX_WRITE_NUDGES:
-            write_nudges += 1
-            readonly_streak = 0
-            if log_fn:
-                log_fn("info", "Agent has only been reading files — nudging it to start writing…")
-            messages.append({"role": "user", "content": (
-                "You have spent several steps only reading files without editing any. "
-                "You have enough context now — stop exploring and call write_file to "
-                "implement the changes. Produce real code edits, not more reads."
-            )})
-
-    if log_fn:
-        log_fn("warning", "Agent reached iteration limit.")
-    return "Agent reached iteration limit.", total_tokens
-
-
-def run_build_agent_openrouter(
-    workspace: Path,
-    blueprint: dict[str, Any],
-    app_name: str,
-    template_key: str,
-    log_fn: Callable[[str, str], None] | None = None,
-) -> tuple[str, int]:
-    """Full build via the hosted Qwen3 backend (OpenRouter)."""
-    system = _build_system(template_key)
-    user_msg = (
-        f"App name: {app_name}\nTemplate: {template_key}\n\n"
-        f"Blueprint:\n{json.dumps(blueprint, indent=2)}\n\n"
-        "Build this application now following the phases in your instructions. "
-        "Narrate each step. When finished, write DONE: <summary of what was built>."
-    )
-    return _openrouter_loop(system, workspace, user_msg, log_fn)
-
-
-def run_fix_agent_openrouter(
-    workspace: Path,
-    prompt: str,
-    app_name: str,
-    template_key: str,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-) -> tuple[str, int]:
-    """Executor-only compile-fix pass via the hosted Qwen3 backend (OpenRouter)."""
-    return _openrouter_loop(_UPDATE_SYSTEM, workspace, prompt, log_fn, cancel_fn, max_iterations=_ITERS_FIX)
-
-
-def run_update_agent_openrouter(
-    workspace: Path,
-    prompt: str,
-    blueprint: dict[str, Any],
-    app_name: str,
-    template_key: str,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-) -> tuple[str, int]:
-    """Plan → design? → execute → validate → security? via the hosted Qwen3 backend.
-
-    The planner routes through app/ai/openrouter.py's PLAN chain (backend="Qwen3"
-    resolves to OpenRouter when a key is set); every tool-using phase runs on the
-    CODE chain via _openrouter_loop.
-    """
-    if log_fn:
-        log_fn("thinking", "Planning changes…")
-    plan = _call_planner(
-        _build_planner_msg(prompt, blueprint, workspace, template_key, app_name),
-        backend="Qwen3",
-    )
-    _log_plan(plan, log_fn)
-    # The planner call above routes through chat_openrouter, which doesn't
-    # surface usage — its (small) tokens aren't counted; the tool-loop phases
-    # below are the bulk of the cost.
-
-    def run_phase(
-        system: str, user_msg: str, iters: int,
-        tools: list[dict[str, Any]] | None = None,
-    ) -> tuple[str, int]:
-        return _openrouter_loop(
-            system, workspace, user_msg,
-            log_fn, cancel_fn, max_iterations=iters,
-            tools=tools,
-        )
-
-    return _run_update_sequence(
-        run_phase, workspace=workspace, prompt=prompt, blueprint=blueprint,
-        app_name=app_name, template_key=template_key, plan=plan,
-        log_fn=log_fn, cancel_fn=cancel_fn,
+    return run_agent_loop(
+        _agent_adapter(timeout=180.0), system=_UPDATE_SYSTEM, stable=prompt,
+        workspace=workspace, log_fn=log_fn, cancel_fn=cancel_fn,
+        max_iterations=_ITERS_FIX,
     )
 
 
 # ---------------------------------------------------------------------------
-# Core loop
+# Core loop (shared Anthropic streaming turn — used by AnthropicAdapter)
 # ---------------------------------------------------------------------------
 
 def _stream_turn(
@@ -4798,240 +3664,3 @@ def _stream_turn(
     return _run(None)
 
 
-def _loop(
-    client: anthropic.Anthropic,
-    model: str,
-    system: str,
-    workspace: Path,
-    initial_user_msg: str,
-    log_fn: Callable[[str, str], None] | None = None,
-    cancel_fn: Callable[[], bool] | None = None,
-    max_iterations: int = _MAX_ITERATIONS,
-    tools: list[dict[str, Any]] | None = None,
-    cache_trace: list[dict[str, Any]] | None = None,
-) -> tuple[str, int]:
-    """Agent tool loop. Returns (summary, total_tokens_used).
-
-    Carries the same context-control guards as the Ollama path — truncated tool
-    results, a rolling window that never orphans a tool_result, repeat-read
-    suppression and a bounded-exploration breaker — plus prompt caching, which
-    only pays off because the system prompt and tool array are byte-stable
-    across every iteration of a phase.
-    """
-    from app.build.provider_loop import AnthropicAdapter, run_agent_loop, unified_loop_enabled
-
-    if unified_loop_enabled():
-        adapter = AnthropicAdapter(api_key="", model=model, client=client)
-        return run_agent_loop(
-            adapter, system=system, stable=initial_user_msg, workspace=workspace,
-            log_fn=log_fn, cancel_fn=cancel_fn, max_iterations=max_iterations,
-            tools=tools, cache_trace=cache_trace,
-        )
-
-    messages: list[dict[str, Any]] = [{"role": "user", "content": initial_user_msg}]
-    system_blocks = _cached_system(system)
-    tool_blocks = _cached_tools_for(tools)
-    total_tokens = 0
-    write_calls = 0
-    nudges = 0  # bounded pushbacks when the agent talks instead of writing
-    # Read-only calls already answered since the last workspace mutation.
-    seen_reads: set[str] = set()
-    explore_streak = 0  # consecutive turns of tool use with no write_file
-    last_text = ""
-    trimming_started = False
-
-    def _trimmed_messages() -> list[dict[str, Any]]:
-        """Immutable anchor + a rolling window that starts on an assistant turn.
-
-        The anchor is the first user message plus the opening few turns, and it is
-        never dropped, so everything up to its end is byte-stable for the whole
-        phase and can hold a cache breakpoint that actually gets read. Trimming
-        happens only above it.
-
-        The window cannot simply be sliced by count: it would start on the user
-        message holding a tool_result whose tool_use had just been dropped, which
-        Anthropic rejects outright. Advancing to the next assistant turn is the
-        only position a conversation can safely resume from, and it also avoids
-        leaving two user messages adjacent.
-        """
-        anchor = messages[:_ANCHOR_END]
-        rest = messages[_ANCHOR_END:]
-        window = rest[-(_ANTHROPIC_HISTORY_PAIRS * 2):]
-        start = 0
-        while start < len(window) and window[start].get("role") != "assistant":
-            start += 1
-        return anchor + window[start:]
-
-    for iteration in range(max_iterations):
-        if cancel_fn and cancel_fn():
-            if log_fn:
-                log_fn("warning", "Agent stopped by user.")
-            return "Stopped by user.", total_tokens
-        warn_at = max(1, max_iterations - 10)
-        if iteration == warn_at and log_fn:
-            log_fn("warning", f"Build is complex ({iteration} steps so far) — finishing up…")
-
-        # Marking depends on whether the window has started sliding, which is a
-        # property of the message list, so it is computed before the request.
-        will_trim = len(messages) > _ANCHOR_END + _ANTHROPIC_HISTORY_PAIRS * 2
-        _mark_message_breakpoints(messages, _ANCHOR_END, will_trim)
-        sent = _trimmed_messages()
-        # A trim changes the message prefix, so every message-level cache entry
-        # below it is invalidated. Recorded per iteration so the cost of the
-        # window can be correlated with the cache numbers rather than guessed at.
-        dropped = len(messages) - len(sent)
-        if dropped and not trimming_started:
-            trimming_started = True
-            logger.info("cache: first trim at iteration %d (%d messages dropped)", iteration, dropped)
-
-        response = _stream_turn(
-            client, model, system_blocks, sent, log_fn, tool_blocks,
-        )
-
-        total_tokens += _usage_tokens(response.usage)
-        fresh, created, read = _cache_stats(response.usage)
-        logger.info(
-            "cache iter=%d trimmed=%d fresh=%d creation=%d read=%d",
-            iteration, dropped, fresh, created, read,
-        )
-        if cache_trace is not None:
-            cache_trace.append({
-                "iteration": iteration,
-                "trimmed": dropped,
-                "messages_sent": len(sent),
-                "input_tokens": fresh,
-                "cache_creation_input_tokens": created,
-                "cache_read_input_tokens": read,
-            })
-        _log_cache_usage(response.usage)
-        messages.append({"role": "assistant", "content": response.content})
-
-        if response.stop_reason == "max_tokens" and log_fn:
-            log_fn("warning", "Response hit the output limit — the last file may be incomplete.")
-
-        tool_results: list[dict[str, Any]] = []
-        done_text: str | None = None
-        wrote_this_turn = False
-
-        for block in response.content:
-            if block.type == "text":
-                # Already streamed to the feed above; only the bookkeeping here.
-                if block.text.strip():
-                    last_text = block.text
-                logger.debug("Agent text: %s", block.text[:120])
-                if "DONE" in block.text.upper():
-                    done_text = block.text
-
-            elif block.type == "tool_use":
-                tool_input = block.input or {}
-                if block.name in _WRITE_TOOLS:
-                    write_calls += 1
-                    wrote_this_turn = True
-                    if log_fn:
-                        log_fn("file_written", tool_input.get("path", ""))
-
-                call_key = f"{block.name}:{json.dumps(tool_input, sort_keys=True, default=str)}"
-                is_repeat = block.name in _READ_ONLY_TOOLS and call_key in seen_reads
-                if log_fn:
-                    # Mark repeats explicitly — an identical-looking log line for
-                    # a suppressed call makes a stuck agent impossible to spot.
-                    label = tool_message(block.name, tool_input)
-                    log_fn("tool", f"{label} — already read, skipping" if is_repeat else label)
-
-                if is_repeat:
-                    # Serving this from a notice rather than re-running it is the
-                    # point: re-executing costs a full tool result in context
-                    # every time and teaches the model nothing new.
-                    result = (
-                        f"[You already ran {block.name} with these exact arguments and "
-                        "the workspace has not changed since. The result is the same. "
-                        "Stop inspecting and make the change now.]"
-                    )
-                else:
-                    result = execute_tool(block.name, tool_input, workspace, log_fn)
-                    if block.name in _READ_ONLY_TOOLS:
-                        seen_reads.add(call_key)
-                    else:
-                        # The workspace changed, so earlier reads may be stale.
-                        seen_reads.clear()
-                # Cap large results so they don't blow up the context window on
-                # the next iteration. Claude's context is large — use the big cap.
-                result = _truncate_tool_result(result, _TOOL_RESULT_LIMIT_LARGE_CTX)
-                tool_results.append(
-                    {"type": "tool_result", "tool_use_id": block.id, "content": result}
-                )
-
-        # If agent said DONE but hasn't written any files, push back — bounded,
-        # because an unbounded nudge burns every iteration re-asking a model that
-        # isn't going to comply.
-        if done_text is not None and not tool_results:
-            if write_calls == 0 and nudges < _MAX_NUDGES:
-                nudges += 1
-                if log_fn:
-                    log_fn("info", "Agent said DONE without writing files — asking it to implement…")
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You said you were done but you haven't called write_file yet. "
-                        "Please implement the changes now using write_file. "
-                        "Start with list_files('.') to explore the project, then write the code."
-                    ),
-                })
-                continue
-            return done_text, total_tokens
-
-        if response.stop_reason == "end_turn":
-            if write_calls == 0 and nudges < _MAX_NUDGES:
-                nudges += 1
-                if log_fn:
-                    log_fn("info", "No files written yet — asking agent to write the code…")
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You haven't written any files yet. "
-                        "Use the write_file tool to implement the changes now. "
-                        "Start by calling list_files('.') to see the project structure, "
-                        "then read the relevant files and write the implementation."
-                    ),
-                })
-                continue
-            return last_text or "Done.", total_tokens
-
-        if not tool_results:
-            continue
-        messages.append({"role": "user", "content": tool_results})
-
-        # Bounded exploration: a run of tool-only turns with nothing written
-        # means the agent is stuck surveying. Push it to act, once per streak.
-        explore_streak = 0 if wrote_this_turn else explore_streak + 1
-        if explore_streak >= _MAX_EXPLORE_STREAK:
-            if nudges < _MAX_NUDGES:
-                nudges += 1
-                explore_streak = 0
-                if log_fn:
-                    log_fn("info", "Agent is still exploring — asking it to start writing…")
-                # Appended to the tool_result message rather than sent as its own
-                # user turn: tool results must be answered in the message that
-                # directly follows the tool_use, and a text block may trail them.
-                tool_results.append({
-                    "type": "text",
-                    "text": (
-                        f"You have used {_MAX_EXPLORE_STREAK} turns inspecting the project "
-                        "without writing anything. You have enough context. Implement the "
-                        "change now with write_file, then reply DONE."
-                    ),
-                })
-            else:
-                # Pushed to act and still only surveying. Every further turn
-                # re-sends the whole context for no progress, which is how a
-                # single request burns hundreds of thousands of tokens.
-                if log_fn:
-                    log_fn("warning", "Agent kept exploring without making changes — stopping.")
-                return (
-                    last_text or "Agent stopped: explored the project without making changes.",
-                    total_tokens,
-                )
-
-    if log_fn:
-        log_fn("warning", "Agent reached iteration limit.")
-    return "Agent reached iteration limit.", total_tokens

@@ -15,17 +15,19 @@ import pytest
 
 from app.build import build_agent
 from app.build.build_agent import (
-    _ANTHROPIC_HISTORY_PAIRS,
     _MAX_EXPLORE_STREAK,
     _MAX_NUDGES,
     _MAX_OUTPUT_TOKENS,
     _TOOL_RESULT_LIMIT_LARGE_CTX,
     _cached_system,
     _cached_tools,
-    _loop,
     _mark_message_breakpoints,
     _usage_tokens,
 )
+from app.build.provider_loop import AnthropicAdapter, run_agent_loop
+
+# The rolling window now lives on the adapter (Part L), not a build_agent constant.
+_HISTORY_PAIRS = AnthropicAdapter.history_pairs
 
 # ── scripted Anthropic fake ───────────────────────────────────────────────────
 
@@ -119,8 +121,14 @@ def _delta(kind: str, value: str) -> SimpleNamespace:
     return SimpleNamespace(type="content_block_delta", delta=delta)
 
 
-def _run_loop(client: _FakeClient, workspace, **kw: Any) -> tuple[str, int]:
-    return _loop(client, "claude-sonnet-5", "SYSTEM PROMPT", workspace, "build it", **kw)
+def _run_loop(client: _FakeClient, workspace, pairs: int | None = None, **kw: Any) -> tuple[str, int]:
+    adapter = AnthropicAdapter(api_key="", model="claude-sonnet-5", client=client)
+    if pairs is None:
+        pairs = _HISTORY_PAIRS
+    adapter.history_pairs = pairs
+    return run_agent_loop(
+        adapter, system="SYSTEM PROMPT", stable="build it", workspace=workspace, **kw,
+    )
 
 
 # ── A1: prompt caching ────────────────────────────────────────────────────────
@@ -235,8 +243,11 @@ def _long_run(tmp_path, turns: int, **kw):
     script.append(_message([_text("DONE")], stop_reason="end_turn"))
     client = _FakeClient(script)
     trace: list[dict[str, Any]] = []
-    _loop(
-        client, "claude-sonnet-5", "SYSTEM PROMPT", tmp_path, "build it",
+    pairs = kw.pop("pairs", None)
+    adapter = AnthropicAdapter(api_key="", model="claude-sonnet-5", client=client)
+    adapter.history_pairs = _HISTORY_PAIRS if pairs is None else pairs
+    run_agent_loop(
+        adapter, system="SYSTEM PROMPT", stable="build it", workspace=tmp_path,
         max_iterations=turns + 2, cache_trace=trace, **kw,
     )
     return client, trace
@@ -259,42 +270,37 @@ def _marked(call: dict[str, Any]) -> list[int]:
 
 class TestAnchorAndTrimming:
     def test_the_anchor_is_never_trimmed_away(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
-        client, _ = _long_run(tmp_path, 14)
+        client, _ = _long_run(tmp_path, 14, pairs=2)
 
         for call in client.messages.calls:
             assert call["messages"][0]["content"] == "build it"
-            # The opening turns stay in view for the whole phase.
-            assert len(call["messages"]) >= min(
-                build_agent._ANCHOR_END, len(call["messages"])
-            )
+            # The STABLE seed always opens the request, however far the
+            # VOLATILE window has slid.
+            assert call["messages"][0]["role"] == "user"
 
     def test_once_trimming_starts_the_only_breakpoint_is_in_the_anchor(
         self, tmp_path, monkeypatch,
     ):
         """A breakpoint above the trim point can never match a stored prefix, so
         leaving one there pays the cache-write premium for nothing."""
-        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
-        client, trace = _long_run(tmp_path, 14)
+        client, trace = _long_run(tmp_path, 14, pairs=2)
 
         trimming = [t["iteration"] for t in trace if t["trimmed"]]
         assert trimming, "the window never slid — test is not exercising the case"
         for i in trimming:
             marks = _marked(client.messages.calls[i])
             assert len(marks) == 1, f"iteration {i} marked {len(marks)} message blocks"
-            assert marks[0] < build_agent._ANCHOR_END
+            assert marks[0] == 0, "the only breakpoint must sit in the STABLE seed"
 
     def test_before_trimming_the_two_newest_turns_are_marked(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 20)
-        client, trace = _long_run(tmp_path, 5)
+        client, trace = _long_run(tmp_path, 5, pairs=20)
 
         assert all(t["trimmed"] == 0 for t in trace), "unexpected trim"
         # By the third iteration there are two markable turns to carry marks.
         assert len(_marked(client.messages.calls[3])) == 2
 
     def test_breakpoints_never_exceed_the_api_limit(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
-        client, _ = _long_run(tmp_path, 14)
+        client, _ = _long_run(tmp_path, 14, pairs=2)
 
         for call in client.messages.calls:
             total = sum("cache_control" in t for t in call["tools"])
@@ -305,15 +311,13 @@ class TestAnchorAndTrimming:
     def test_trimming_never_orphans_a_tool_result(self, tmp_path, monkeypatch):
         """The anchor introduces a gap in the history; the window must still
         resume on an assistant turn."""
-        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
-        client, _ = _long_run(tmp_path, 14)
+        client, _ = _long_run(tmp_path, 14, pairs=2)
 
         for call in client.messages.calls:
             _assert_no_orphaned_tool_results(call["messages"])
 
     def test_no_two_adjacent_user_messages_across_the_gap(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
-        client, _ = _long_run(tmp_path, 14)
+        client, _ = _long_run(tmp_path, 14, pairs=2)
 
         for call in client.messages.calls:
             roles = [m["role"] for m in call["messages"]]
@@ -321,8 +325,7 @@ class TestAnchorAndTrimming:
                 assert not (a == "user" and b == "user"), f"adjacent user turns: {roles}"
 
     def test_cache_trace_records_every_iteration(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
-        client, trace = _long_run(tmp_path, 14)
+        client, trace = _long_run(tmp_path, 14, pairs=2)
 
         assert len(trace) == len(client.messages.calls)
         assert {"iteration", "trimmed", "messages_sent", "cache_read_input_tokens"} <= set(
@@ -330,8 +333,7 @@ class TestAnchorAndTrimming:
         )
 
     def test_trim_counts_grow_monotonically_once_started(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 2)
-        _, trace = _long_run(tmp_path, 14)
+        _, trace = _long_run(tmp_path, 14, pairs=2)
 
         trims = [t["trimmed"] for t in trace if t["trimmed"]]
         assert trims == sorted(trims), "the window should slide, not jump around"
@@ -407,24 +409,22 @@ class TestContextGuards:
 
     def test_window_never_orphans_a_tool_result(self, tmp_path, monkeypatch):
         # A tiny window forces trimming within a handful of turns.
-        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 1)
         (tmp_path / "a.txt").write_text("hi", encoding="utf-8")
         script = [_message([_tool(f"t{i}", "list_files", path=".")]) for i in range(6)]
         script.append(_message([_text("DONE")], stop_reason="end_turn"))
         client = _FakeClient(script)
 
-        _run_loop(client, tmp_path)
+        _run_loop(client, tmp_path, pairs=1)
 
         for call in client.messages.calls:
             _assert_no_orphaned_tool_results(call["messages"])
 
     def test_window_keeps_the_first_user_message_as_an_anchor(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(build_agent, "_ANTHROPIC_HISTORY_PAIRS", 1)
         script = [_message([_tool(f"t{i}", "list_files", path=".")]) for i in range(5)]
         script.append(_message([_text("DONE")], stop_reason="end_turn"))
         client = _FakeClient(script)
 
-        _run_loop(client, tmp_path)
+        _run_loop(client, tmp_path, pairs=1)
 
         for call in client.messages.calls:
             assert call["messages"][0]["content"] == "build it"
@@ -527,7 +527,9 @@ def _assert_no_orphaned_tool_results(messages: list[dict[str, Any]]) -> None:
         prev = messages[idx - 1]
         assert prev["role"] == "assistant", f"tool_result at {idx} follows {prev['role']}"
         asked = {
-            b.id for b in prev["content"] if getattr(b, "type", None) == "tool_use"
+            (b.get("id") if isinstance(b, dict) else b.id)
+            for b in prev["content"]
+            if (b.get("type") if isinstance(b, dict) else getattr(b, "type", None)) == "tool_use"
         }
         for block in results:
             assert block["tool_use_id"] in asked, "tool_result answers a dropped tool_use"
@@ -646,6 +648,6 @@ class TestOutputCap:
         assert any("output limit" in m for k, m in logged if k == "warning")
 
 
-@pytest.mark.parametrize("pairs", [_ANTHROPIC_HISTORY_PAIRS])
+@pytest.mark.parametrize("pairs", [_HISTORY_PAIRS])
 def test_history_window_is_generous_for_a_large_context_model(pairs):
     assert pairs >= 20

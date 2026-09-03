@@ -59,6 +59,10 @@ def _doc_to_out(doc) -> ProjectOut:
         firebase_app_id=d.get("firebase_app_id"),
         db_decision_pending=d.get("db_decision_pending", False),
         db_decision_reason=d.get("db_decision_reason"),
+        db_schema_version=d.get("db_schema_version"),
+        db_schema_tables=d.get("db_schema_tables"),
+        db_status=d.get("db_status"),
+        db_schema_error=d.get("db_schema_error"),
     )
 
 
@@ -765,7 +769,12 @@ async def save_chat_history(
     """Persist the chat history for a project (last 100 messages)."""
     await _get_owned(project_id, user.id, db)
     from datetime import datetime
-    messages = body.messages[-100:]
+
+    # by_alias so the document keeps the client's camelCase keys; exclude_none so
+    # a bubble with no pending question does not store three null columns.
+    messages = [
+        m.model_dump(by_alias=True, exclude_none=True) for m in body.messages[-100:]
+    ]
     await db.collection("project_chats").document(str(project_id)).set(
         {"messages": messages, "updated_at": datetime.now(UTC)},
     )
@@ -1014,6 +1023,15 @@ async def wire_database(
         "whole app for places that need updating — every screen or page that currently "
         "uses placeholder data should use the real database instead."
     )
+
+    # Best-effort schema backstop: create the tables (and, for Supabase, the RLS
+    # policies) the rewired app will read/write, derived from the blueprint's
+    # entities. Connecting only ever provisions storage; this materialises it so
+    # the app points at real tables instead of an empty database. Never raises —
+    # a failure is recorded on the project's db_status and the wire still goes
+    # ahead (and re-runs idempotently on the next wire/rebuild).
+    from app.integrations.db_migrations import provision_schema_for_project
+    await provision_schema_for_project(db, str(project_id))
 
     from app.workers.update_worker import apply_update
     await dispatch(apply_update, args=[str(project_id), prompt, str(user.id)], queue="build")

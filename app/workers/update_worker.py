@@ -174,73 +174,20 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         # resuming before it reads either the history or the request.
         contextual_prompt = resume_state.resume_context(unfinished) + contextual_prompt
 
-        if build_model == "Qwen3":
-            from app.ai.qwen import using_openrouter
+        # One entry point for every BUILD_MODEL — the adapter resolves
+        # internally (Part L).
+        from app.build.build_agent import run_update_agent
 
-            if using_openrouter():
-                from app.build.build_agent import run_update_agent_openrouter
-                summary, tokens_used = run_update_agent_openrouter(
-                    workspace=workspace.path,
-                    prompt=contextual_prompt,
-                    blueprint=blueprint_context,
-                    app_name=app_name,
-                    template_key=template_key,
-                    log_fn=log_fn,
-                    cancel_fn=cancel_fn,
-                )
-            else:
-                from app.ai.ollama_http import ollama_base_url, ollama_build_model
-                from app.build.build_agent import run_update_agent_ollama
-                summary, tokens_used = run_update_agent_ollama(
-                    workspace=workspace.path,
-                    prompt=contextual_prompt,
-                    blueprint=blueprint_context,
-                    app_name=app_name,
-                    template_key=template_key,
-                    base_url=ollama_base_url(settings),
-                    model=ollama_build_model(settings),
-                    timeout=settings.OLLAMA_TIMEOUT,
-                    log_fn=log_fn,
-                    cancel_fn=cancel_fn,
-                )
-        elif build_model == "gemini":
-            from app.build.build_agent import run_update_agent_gemini
-            summary, tokens_used = run_update_agent_gemini(
-                workspace=workspace.path,
-                prompt=contextual_prompt,
-                blueprint=blueprint_context,
-                app_name=app_name,
-                template_key=template_key,
-                api_key=settings.GEMINI_API_KEY,
-                model=settings.GEMINI_MODEL,
-                log_fn=log_fn,
-                cancel_fn=cancel_fn,
-            )
-        elif build_model in ("gpt", "openai"):
-            from app.build.build_agent import run_update_agent_openai
-            summary, tokens_used = run_update_agent_openai(
-                workspace=workspace.path,
-                prompt=contextual_prompt,
-                blueprint=blueprint_context,
-                app_name=app_name,
-                template_key=template_key,
-                api_key=settings.OPENAI_API_KEY,
-                model=settings.OPENAI_MODEL,
-                log_fn=log_fn,
-                cancel_fn=cancel_fn,
-            )
-        else:
-            summary, tokens_used = run_update_agent(
-                workspace=workspace.path,
-                prompt=contextual_prompt,
-                blueprint=blueprint_context,
-                app_name=app_name,
-                template_key=template_key,
-                api_key=settings.ANTHROPIC_API_KEY,
-                model=settings.ANTHROPIC_MODEL,
-                log_fn=log_fn,
-                cancel_fn=cancel_fn,
-            )
+        summary, tokens_used = run_update_agent(
+            workspace=workspace.path,
+            prompt=contextual_prompt,
+            blueprint=blueprint_context,
+            app_name=app_name,
+            template_key=template_key,
+            log_fn=log_fn,
+            cancel_fn=cancel_fn,
+            build_model=build_model,
+        )
         logger.info("Update agent used %d tokens project=%s", tokens_used, project_id)
         await record_usage(db, user_id, tokens_used, is_update=True)
 

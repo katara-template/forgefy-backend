@@ -1,11 +1,13 @@
-"""Context-control guards on the Gemini loop.
+"""Context-control guards on the Gemini backend.
 
 Run:
     venv/Scripts/python -m pytest tests/build/test_gemini_guards.py -v
 
 Regression cover for the read/edit treadmill seen in production: a 1,500-char
 tool-result cap meant a stylesheet came back as a fragment, so the agent paged
-through the same file with read_file offsets for a whole phase.
+through the same file with read_file offsets for a whole phase. Since Part L
+the loop itself is shared (run_agent_loop); these tests drive the GeminiAdapter
+wire through it.
 """
 from __future__ import annotations
 
@@ -17,12 +19,11 @@ from app.build import build_agent
 from app.build.build_agent import (
     _MAX_EXPLORE_STREAK,
     _MAX_NUDGES,
-    _TOOL_RESULT_LIMIT,
     _TOOL_RESULT_LIMIT_LARGE_CTX,
     _TOOL_RULES,
-    _gemini_loop,
     _with_tool_rules,
 )
+from app.build.provider_loop import GeminiAdapter, run_agent_loop
 
 
 def _call(name: str, **args: Any) -> dict[str, Any]:
@@ -65,10 +66,13 @@ def _tool_outputs(body: dict[str, Any]) -> list[str]:
     return out
 
 
-def _run(workspace, script, gemini, **kw):
+def _run(workspace, script, gemini, *, pairs: int | None = None, **kw):
     sent = gemini(script)
-    summary, tokens = _gemini_loop(
-        "fake-key", "gemini-2.5-flash", "SYSTEM", workspace, "do the thing", **kw
+    adapter = GeminiAdapter(api_key="fake-key", model="gemini-2.5-flash")
+    if pairs is not None:
+        adapter.history_pairs = pairs
+    summary, tokens = run_agent_loop(
+        adapter, system="SYSTEM", stable="do the thing", workspace=workspace, **kw
     )
     return summary, sent
 
@@ -79,8 +83,8 @@ def _run(workspace, script, gemini, **kw):
 class TestToolResultLimit:
     def test_gemini_uses_the_large_context_limit(self):
         """1,500 chars starved a 1M-token model and caused the paging loop."""
-        assert _TOOL_RESULT_LIMIT == _TOOL_RESULT_LIMIT_LARGE_CTX
-        assert _TOOL_RESULT_LIMIT >= 24000
+        assert GeminiAdapter(api_key="k", model="m").trim_result_limit() == _TOOL_RESULT_LIMIT_LARGE_CTX
+        assert _TOOL_RESULT_LIMIT_LARGE_CTX >= 24000
 
     def test_a_realistic_stylesheet_arrives_whole(self, tmp_path, gemini):
         # ~8 KB, the size that was being fragmented in production.
@@ -153,12 +157,11 @@ class TestExplorationBreaker:
 
 
 class TestRollingWindow:
-    def test_window_never_orphans_a_function_response(self, tmp_path, gemini, monkeypatch):
-        monkeypatch.setattr(build_agent, "_GEMINI_HISTORY_PAIRS", 1)
+    def test_window_never_orphans_a_function_response(self, tmp_path, gemini):
         script = [_turn(_call("list_files", path=str(i))) for i in range(6)]
         script.append(_turn(_text("DONE"), finish="STOP"))
 
-        _, sent = _run(tmp_path, script, gemini)
+        _, sent = _run(tmp_path, script, gemini, pairs=1)
 
         for body in sent:
             turns = body["contents"]
@@ -173,12 +176,11 @@ class TestRollingWindow:
                     "functionResponse answers a dropped functionCall"
                 )
 
-    def test_first_user_turn_is_kept_as_an_anchor(self, tmp_path, gemini, monkeypatch):
-        monkeypatch.setattr(build_agent, "_GEMINI_HISTORY_PAIRS", 1)
+    def test_first_user_turn_is_kept_as_an_anchor(self, tmp_path, gemini):
         script = [_turn(_call("list_files", path=str(i))) for i in range(5)]
         script.append(_turn(_text("DONE"), finish="STOP"))
 
-        _, sent = _run(tmp_path, script, gemini)
+        _, sent = _run(tmp_path, script, gemini, pairs=1)
 
         for body in sent:
             assert body["contents"][0]["parts"][0]["text"] == "do the thing"

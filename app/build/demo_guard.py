@@ -112,7 +112,7 @@ def _demo_evidence(text: str) -> list[str]:
             evidence.append(f"strong marker: {marker!r}")
     weak_hits = [m for m in _WEAK_MARKERS if m in lowered]
     if len(weak_hits) >= 2:
-        evidence.append("weak markers x%d: %s" % (len(weak_hits), ", ".join(weak_hits)))
+        evidence.append(f"weak markers x{len(weak_hits)}: {', '.join(weak_hits)}")
     return evidence
 
 

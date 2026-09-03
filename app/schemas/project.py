@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ProjectOut(BaseModel):
@@ -39,6 +39,14 @@ class ProjectOut(BaseModel):
     firebase_app_id: str | None = None
     db_decision_pending: bool = False
     db_decision_reason: str | None = None
+    # Schema-provisioning backstop state (app/integrations/db_migrations.py).
+    # db_status: "ready" | "empty" | "error" | None. Exposed so the client can
+    # show whether a connected database has real tables vs. code wired to an
+    # empty one.
+    db_schema_version: int | None = None
+    db_schema_tables: list[str] | None = None
+    db_status: str | None = None
+    db_schema_error: str | None = None
 
 
 class UpdateProjectRequest(BaseModel):
@@ -64,5 +72,30 @@ class ChatResponse(BaseModel):
     clarify_options: list[str] | None = None
 
 
+class ChatHistoryMessage(BaseModel):
+    """One persisted transcript bubble.
+
+    Field names are the client's camelCase on purpose — this document is written
+    and read back by the dashboard only, and renaming it on the way through
+    would just cost a mapping layer on both sides.
+
+    ``needs_database`` and ``clarify_options`` carry a question the user has not
+    answered yet ("Add a database / No thanks"). They are part of the stored
+    shape rather than transient UI state: without them a reload restores the
+    question but not its buttons, stranding the user on a prompt they cannot
+    answer. ``answered_option`` records the choice so the row renders settled.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    role: str          # "user" | "assistant"
+    text: str
+    timestamp: str     # ISO 8601, as produced by Date.toISOString()
+    needs_database: bool | None = Field(default=None, alias="needsDatabase")
+    clarify_options: list[str] | None = Field(default=None, alias="clarifyOptions")
+    answered_option: str | None = Field(default=None, alias="answeredOption")
+
+
 class ChatHistoryRequest(BaseModel):
-    messages: list[dict]
+    messages: list[ChatHistoryMessage]

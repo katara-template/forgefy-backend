@@ -11,8 +11,7 @@ Covers the parts that are testable offline:
     trimming only touches VOLATILE;
   * Part J contract — every adapter normalises `cache_stats` to
     `{cached_tokens, uncached_tokens}` and declares its image capability;
-  * Part E2 wiring — `_gemini_loop` routes through the shared loop when the flag
-    is on.
+  * Part L — the flag wiring tests retired with the legacy loops they gated.
 """
 from __future__ import annotations
 
@@ -24,11 +23,10 @@ import pytest
 from app.build import build_agent
 from app.build import provider_loop as pl
 from app.build.provider_loop import (
-    CacheStats,
-    OpenAIAdapter,
-    OpenRouterAdapter,
     AnthropicAdapter,
+    CacheStats,
     OllamaAdapter,
+    OpenAIAdapter,
     TurnResult,
     _anthropic_cache_ctx,
     _gemini_cache_ctx,
@@ -177,11 +175,29 @@ class TestImageCapability:
         assert GeminiAdapter(api_key="k", model="m").supports_images is True
         assert OpenAIAdapter(api_key="k", model="m").supports_images is True
 
-    def test_anthropic_does_not_declare_image_support(self):
-        assert AnthropicAdapter(api_key="k", model="m").supports_images is False
+    def test_anthropic_declares_image_support(self):
+        # Claude is fully multimodal. supports_images means CAN, not SHOULD:
+        # cost policy lives in image_cost_tier so routing can decide without
+        # silently hiding the capability (Part K / Part P).
+        assert AnthropicAdapter(api_key="k", model="m").supports_images is True
 
     def test_ollama_does_not_declare_image_support(self):
         assert OllamaAdapter(base_url="http://x", model="m").supports_images is False
+
+    def test_image_cost_tier_is_separate_from_capability(self):
+        from app.build.provider_loop import GeminiAdapter
+        # Every adapter carries the knob; Anthropic flags its premium image
+        # pricing while still declaring the capability.
+        assert AnthropicAdapter(api_key="k", model="m").image_cost_tier == "premium"
+        assert GeminiAdapter(api_key="k", model="m").image_cost_tier == "standard"
+        assert OllamaAdapter(base_url="http://x", model="m").image_cost_tier == "standard"
+
+    def test_composite_reflects_active_adapter_capability(self, tmp_path):
+        composite = pl.OllamaOpenRouterFallback(
+            _CountingAdapter(), _CountingAdapter(),
+        )
+        # _CountingAdapter inherits the base default.
+        assert composite.supports_images is False
 
 
 # ── wire conversions ──────────────────────────────────────────────────────────
@@ -229,23 +245,79 @@ class TestInstrumentation:
 
 
 class TestFlagWiring:
-    def test_gemini_loop_delegates_when_flag_on(self, tmp_path, monkeypatch):
-        called: dict[str, Any] = {}
+    def test_unified_loop_enabled_reads_the_setting(self, monkeypatch):
+        # Defined once (the duplicate truncated definition was removed in
+        # Part K; F811 now guards against a reintroduction).
+        import app.config as config_mod
 
-        def fake_unified(*args: Any, system, stable, workspace, **kw):
-            called["system"] = system
-            called["stable"] = stable
-            called["workspace"] = workspace
-            return "unified summary", 0
+        class _S:
+            UNIFIED_AGENT_LOOP = True
 
-        # _gemini_loop imports these from provider_loop at call time.
-        monkeypatch.setattr(pl, "unified_loop_enabled", lambda: True)
-        monkeypatch.setattr(pl, "run_agent_loop", fake_unified)
+        monkeypatch.setattr(config_mod, "get_settings", lambda: _S())
+        assert pl.unified_loop_enabled() is True
 
-        summary, _ = build_agent._gemini_loop("key", "model", "SYS", tmp_path, "seed")
-        assert summary == "unified summary"
-        assert called["system"] == "SYS"
-        assert called["stable"] == "seed"
+        class _S2:
+            UNIFIED_AGENT_LOOP = False
+
+        monkeypatch.setattr(config_mod, "get_settings", lambda: _S2())
+        assert pl.unified_loop_enabled() is False
+
+
+# ── adapter factory (Part L): the only BUILD_MODEL branch left ────────────────
+
+
+class TestAdapterFactory:
+    """_agent_adapter must resolve every BUILD_MODEL value to the right adapter,
+    including the Qwen3 Ollama→OpenRouter composite."""
+
+    def _settings(self, build_model: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            BUILD_MODEL=build_model,
+            UNIFIED_AGENT_LOOP=True,
+            ANTHROPIC_API_KEY="a", ANTHROPIC_MODEL="claude-test",
+            GEMINI_API_KEY="g", GEMINI_MODEL="gemini-test",
+            OPENAI_API_KEY="o", OPENAI_MODEL="gpt-test",
+            OPENROUTER_API_KEY="r",
+            OLLAMA_TIMEOUT=300,
+        )
+
+    @pytest.mark.parametrize("build_model,expected", [
+        ("claude", "anthropic"),
+        ("gemini", "gemini"),
+        ("gpt", "openai"),
+    ])
+    def test_cloud_backends_resolve(self, monkeypatch, build_model, expected):
+        s = self._settings(build_model)
+        monkeypatch.setattr("app.config.get_settings", lambda: s)
+        adapter = build_agent._agent_adapter()
+        assert adapter.name == expected
+
+    def test_qwen3_resolves_to_ollama_when_fallback_disabled(self, monkeypatch):
+        s = self._settings("Qwen3")
+        monkeypatch.setattr("app.config.get_settings", lambda: s)
+        monkeypatch.setattr("app.ai.qwen.fallback_to_openrouter_enabled", lambda: False)
+        monkeypatch.setattr("app.ai.ollama_http.ollama_base_url", lambda st: "http://x")
+        monkeypatch.setattr("app.ai.ollama_http.ollama_build_model", lambda st: "qwen3")
+        assert build_agent._agent_adapter().name == "ollama"
+
+    def test_qwen3_wraps_the_openrouter_fallback_when_enabled(self, monkeypatch):
+        s = self._settings("Qwen3")
+        monkeypatch.setattr("app.config.get_settings", lambda: s)
+        monkeypatch.setattr("app.ai.qwen.fallback_to_openrouter_enabled", lambda: True)
+        monkeypatch.setattr("app.ai.ollama_http.ollama_base_url", lambda st: "http://x")
+        monkeypatch.setattr("app.ai.ollama_http.ollama_build_model", lambda st: "qwen3")
+        monkeypatch.setattr("app.ai.openrouter.code_models", lambda: ["qwen/qwen3-coder"])
+        assert build_agent._agent_adapter().name == "ollama+openrouter"
+
+    def test_per_user_override_wins_over_the_setting(self, monkeypatch):
+        s = self._settings("claude")
+        monkeypatch.setattr("app.config.get_settings", lambda: s)
+        assert build_agent._agent_adapter(build_model="gemini").name == "gemini"
+
+    def test_unknown_model_falls_back_to_claude(self, monkeypatch):
+        s = self._settings("weird-new-model")
+        monkeypatch.setattr("app.config.get_settings", lambda: s)
+        assert build_agent._agent_adapter().name == "anthropic"
 
 
 # ── shared Ollama transport retries rate limits ───────────────────────────────
@@ -324,26 +396,26 @@ class TestOllamaChatRetry:
 
 class TestToolArgsSanitisation:
     def test_valid_json_round_trips(self):
-        assert build_agent._safe_args('{"path": "src/a.ts"}') == {"path": "src/a.ts"}
-        assert build_agent._valid_args_json({"path": "a"}) == '{"path": "a"}'
+        assert pl._safe_args('{"path": "src/a.ts"}') == {"path": "src/a.ts"}
+        assert pl._valid_args_json({"path": "a"}) == '{"path": "a"}'
 
     def test_lone_backslash_is_repaired_not_dropped(self):
         # A Windows path or regex the model emitted without escaping.
         raw = '{"path": "C:\\Users\\app", "pattern": "\\d+"}'
-        args = build_agent._safe_args(raw)
+        args = pl._safe_args(raw)
         assert args["path"].startswith("C:")
-        assert build_agent._valid_args_json(raw).startswith("{")
+        assert pl._valid_args_json(raw).startswith("{")
 
     def test_unrepairable_garbage_becomes_empty_object(self):
-        assert build_agent._safe_args("not json at all") == {}
-        assert build_agent._valid_args_json("not json at all") == "{}"
+        assert pl._safe_args("not json at all") == {}
+        assert pl._valid_args_json("not json at all") == "{}"
 
     def test_echoed_history_never_contains_invalid_json(self):
         """The exact production failure: raw echo → provider 400 at messages[25]."""
         import json as _json
 
         raw = '{"path": "lib\\features", "old_string": "a\\b"}'
-        echoed = _json.loads(build_agent._valid_args_json(raw))  # must not raise
+        echoed = _json.loads(pl._valid_args_json(raw))  # must not raise
         assert isinstance(echoed, dict)
 
 
@@ -382,7 +454,6 @@ class TestOllamaOpenRouterFallback:
         assert fallback.calls >= 1  # every turn after the switch goes to OpenRouter
 
     def test_switch_is_sticky(self, tmp_path):
-        primary = _CountingAdapter()  # would succeed — proves stickiness instead
         fallback = _CountingAdapter()
 
         class _FailOnce(pl.ProviderAdapter):
@@ -411,39 +482,4 @@ class TestOllamaOpenRouterFallback:
         composite = pl.OllamaOpenRouterFallback(primary, fallback)
         run_agent_loop(composite, system="SYS", stable="seed", workspace=tmp_path, max_iterations=5)
         assert primary.calls >= 1 and fallback.calls == 0
-
-
-class TestLegacyOllamaLoopFallback:
-    def test_ollama_failure_switches_to_openrouter(self, tmp_path, monkeypatch):
-        from app.build import build_agent as ba
-
-        monkeypatch.setattr("app.ai.qwen.fallback_to_openrouter_enabled", lambda: True)
-        monkeypatch.setattr(ba, "_ollama_agent_turns",
-                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("429")))
-        seen: dict[str, Any] = {}
-
-        monkeypatch.setattr(
-            ba, "_openrouter_loop",
-            lambda system, workspace, msg, *a, **k: (seen.update(system=system), ("or summary", 0))[1],
-        )
-
-        summary, _ = ba._ollama_loop(
-            base_url="http://x", model="m", system="SYS", workspace=tmp_path,
-            initial_user_msg="seed",
-        )
-        assert summary == "or summary"
-        assert seen["system"] == "SYS"
-
-    def test_failure_is_fatal_when_fallback_disabled(self, tmp_path, monkeypatch):
-        from app.build import build_agent as ba
-
-        monkeypatch.setattr("app.ai.qwen.fallback_to_openrouter_enabled", lambda: False)
-        monkeypatch.setattr(ba, "_ollama_agent_turns",
-                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("429")))
-
-        with pytest.raises(RuntimeError, match="429"):
-            ba._ollama_loop(
-                base_url="http://x", model="m", system="SYS", workspace=tmp_path,
-                initial_user_msg="seed",
-            )
 

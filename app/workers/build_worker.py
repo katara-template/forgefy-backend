@@ -149,63 +149,18 @@ def _run_agent_fix(
     """
     fix_prompt = _make_fix_prompt_with_hint(error_msg, template_key, retry_hint)
 
-    if settings.BUILD_MODEL == "Qwen3":
-        from app.ai.qwen import using_openrouter
-        from app.build.build_agent import run_fix_agent_ollama, run_fix_agent_openrouter
+    # One entry point for every BUILD_MODEL: the adapter resolves internally
+    # (Part L). The fix pass is executor-only by design — a compile error fix
+    # needs only the executor, not five agents.
+    from app.build.build_agent import run_fix_agent
 
-        if using_openrouter():
-            summary, _ = run_fix_agent_openrouter(
-                workspace=workspace_path,
-                prompt=fix_prompt,
-                app_name=app_name,
-                template_key=template_key,
-                log_fn=log_fn,
-            )
-        else:
-            from app.ai.ollama_http import ollama_base_url, ollama_build_model
-            summary, _ = run_fix_agent_ollama(
-                workspace=workspace_path,
-                prompt=fix_prompt,
-                app_name=app_name,
-                template_key=template_key,
-                base_url=ollama_base_url(settings),
-                model=ollama_build_model(settings),
-                timeout=settings.OLLAMA_TIMEOUT,
-                log_fn=log_fn,
-            )
-    elif settings.BUILD_MODEL == "gemini":
-        from app.build.build_agent import run_fix_agent_gemini
-        summary, _ = run_fix_agent_gemini(
-            workspace=workspace_path,
-            prompt=fix_prompt,
-            app_name=app_name,
-            template_key=template_key,
-            api_key=settings.GEMINI_API_KEY,
-            model=settings.GEMINI_MODEL,
-            log_fn=log_fn,
-        )
-    elif settings.BUILD_MODEL in ("gpt", "openai"):
-        from app.build.build_agent import run_fix_agent_openai
-        summary, _ = run_fix_agent_openai(
-            workspace=workspace_path,
-            prompt=fix_prompt,
-            app_name=app_name,
-            template_key=template_key,
-            api_key=settings.OPENAI_API_KEY,
-            model=settings.OPENAI_MODEL,
-            log_fn=log_fn,
-        )
-    else:
-        from app.build.build_agent import run_fix_agent
-        summary, _ = run_fix_agent(
-            workspace=workspace_path,
-            prompt=fix_prompt,
-            app_name=app_name,
-            template_key=template_key,
-            api_key=settings.ANTHROPIC_API_KEY,
-            model=settings.ANTHROPIC_MODEL,
-            log_fn=log_fn,
-        )
+    summary, _ = run_fix_agent(
+        workspace=workspace_path,
+        prompt=fix_prompt,
+        app_name=app_name,
+        template_key=template_key,
+        log_fn=log_fn,
+    )
     return summary or ""
 
 
@@ -793,63 +748,17 @@ async def _run(session_id: str, project_id: str) -> dict:
         syncer = WorkspaceAutoSync(workspace, push_url, label="build")
         syncer.start()
 
-        # 9. Run build agent — model selected by BUILD_MODEL (independent of BP_MODEL)
-        if settings.BUILD_MODEL == "Qwen3":
-            from app.ai.qwen import using_openrouter
-            from app.build.build_agent import run_build_agent_ollama, run_build_agent_openrouter
+        # 9. Run build agent — model selected by BUILD_MODEL (independent of BP_MODEL);
+        # the adapter resolves internally (Part L).
+        from app.build.build_agent import run_build_agent
 
-            if using_openrouter():
-                summary, tokens_used = run_build_agent_openrouter(
-                    workspace=workspace.path,
-                    blueprint=json_output,
-                    app_name=app_name,
-                    template_key=template_key,
-                    log_fn=log_fn,
-                )
-            else:
-                from app.ai.ollama_http import ollama_base_url, ollama_build_model
-                summary, tokens_used = run_build_agent_ollama(
-                    workspace=workspace.path,
-                    blueprint=json_output,
-                    app_name=app_name,
-                    template_key=template_key,
-                    base_url=ollama_base_url(settings),
-                    model=ollama_build_model(settings),
-                    timeout=settings.OLLAMA_TIMEOUT,
-                    log_fn=log_fn,
-                )
-        elif settings.BUILD_MODEL == "gemini":
-            from app.build.build_agent import run_build_agent_gemini
-            summary, tokens_used = run_build_agent_gemini(
-                workspace=workspace.path,
-                blueprint=json_output,
-                app_name=app_name,
-                template_key=template_key,
-                api_key=settings.GEMINI_API_KEY,
-                model=settings.GEMINI_MODEL,
-                log_fn=log_fn,
-            )
-        elif settings.BUILD_MODEL in ("gpt", "openai"):
-            from app.build.build_agent import run_build_agent_openai
-            summary, tokens_used = run_build_agent_openai(
-                workspace=workspace.path,
-                blueprint=json_output,
-                app_name=app_name,
-                template_key=template_key,
-                api_key=settings.OPENAI_API_KEY,
-                model=settings.OPENAI_MODEL,
-                log_fn=log_fn,
-            )
-        else:
-            summary, tokens_used = run_build_agent(
-                workspace=workspace.path,
-                blueprint=json_output,
-                app_name=app_name,
-                template_key=template_key,
-                api_key=settings.ANTHROPIC_API_KEY,
-                model=settings.ANTHROPIC_MODEL,
-                log_fn=log_fn,
-            )
+        summary, tokens_used = run_build_agent(
+            workspace=workspace.path,
+            blueprint=json_output,
+            app_name=app_name,
+            template_key=template_key,
+            log_fn=log_fn,
+        )
         logger.info("Build agent used %d tokens session=%s", tokens_used, session_id)
 
         # Forgefy UI SDK (layout/animation) — gated by FORGEFY_UI_ENABLED; applies
@@ -877,6 +786,14 @@ async def _run(session_id: str, project_id: str) -> dict:
                 "messagingSenderId": proj_data.get("firebase_messaging_sender_id"),
                 "appId": proj_data.get("firebase_app_id"),
             })
+
+        # Best-effort schema backstop: materialise the tables (and Supabase RLS)
+        # the connected database needs, derived from blueprint entities. Reuses
+        # the document already fetched for env injection. Never raises — a
+        # failure lands on db_status and the build continues (migrations re-run
+        # idempotently on the next build/wire).
+        from app.integrations.db_migrations import provision_schema_for_project
+        await provision_schema_for_project(db, project_id, raw=proj_data or {})
 
         # 9.5 Deterministic demo-screen guard. The prompt asks the agent to
         # replace the template's demo launch page and the validator re-checks;
