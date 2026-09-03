@@ -1,82 +1,110 @@
-FROM python:3.14-slim
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-stage build to keep the final image small.
+#
+# Stage 1 (build):   installs Flutter + Linux toolchain, compiles the Flutter
+#                    app in release mode, then deletes Flutter's engine caches
+#                    in the SAME RUN layer so the ~9 GB of SDK/engine artifacts
+#                    never get persisted into an intermediate image layer.
+#                    This keeps the Cloudflare Workers Builds disk usage well
+#                    below the 20 GB limit.
+#
+# Stage 2 (runtime): minimal Ubuntu image with ONLY the shared libraries a
+#                    Flutter Linux (GTK) app needs at runtime. The Flutter SDK
+#                    does NOT appear in the final image.
+# ─────────────────────────────────────────────────────────────────────────────
 
-WORKDIR /app
+# ================================================================
+# Stage 1 — build
+# ================================================================
+FROM ubuntu:22.04 AS build
 
-# ── Base system tools ─────────────────────────────────────────────────────────
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Toolchain needed to extract Flutter and to compile the Linux app.
+# (Flutter's official Ubuntu prerequisites: clang cmake ninja-build pkg-config
+#  libgtk-3-dev liblzma-dev libstdc++-12-dev)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
     curl \
     git \
     unzip \
-    wget \
     xz-utils \
-    file \
+    clang \
+    cmake \
+    ninja-build \
+    pkg-config \
+    libgtk-3-dev \
+    liblzma-dev \
+    libstdc++-12-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Node.js 22.x (LTS) ───────────────────────────────────────────────────────
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
-    rm -rf /var/lib/apt/lists/*
-
-# ── OpenJDK 21 (Trixie ships 21; Flutter 3.24 + Android SDK 34 both support it)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    openjdk-21-jdk-headless \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
-
-# ── Android SDK ───────────────────────────────────────────────────────────────
-ENV ANDROID_HOME=/opt/android-sdk
-ENV PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/build-tools/34.0.0
-
-RUN mkdir -p $ANDROID_HOME/cmdline-tools && \
-    curl -o /tmp/cmdline-tools.zip \
-      "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" && \
-    unzip -q /tmp/cmdline-tools.zip -d /tmp/ct && \
-    mv /tmp/ct/cmdline-tools $ANDROID_HOME/cmdline-tools/latest && \
-    rm -rf /tmp/cmdline-tools.zip /tmp/ct
-
-RUN yes | sdkmanager --licenses > /dev/null 2>&1 && \
-    sdkmanager \
-      "platform-tools" \
-      "build-tools;34.0.0" \
-      "platforms;android-34"
-
-# ── Flutter SDK (pin version — update ARG to upgrade) ────────────────────────
+# ── Flutter SDK (pin version — bump to upgrade) ──────────────────────────────
 ARG FLUTTER_VERSION=3.24.4
 ENV FLUTTER_HOME=/opt/flutter
 ENV PATH=$PATH:$FLUTTER_HOME/bin
 ENV PUB_CACHE=/root/.pub-cache
 
+COPY . .
+
+WORKDIR /app
+
+# Extract SDK, build release bundle, then purge Flutter engine/cache artifacts
+# in the same layer so they are not baked into the layer set.
 RUN curl -o /tmp/flutter.tar.xz \
       "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz" && \
     tar xf /tmp/flutter.tar.xz -C /opt && \
     rm /tmp/flutter.tar.xz && \
-    git config --global --add safe.directory /opt/flutter && \
+    git config --global --add safe.directory $FLUTTER_HOME && \
     flutter config --no-analytics && \
-    flutter precache --android && \
-    flutter doctor --android-licenses || true
+    flutter build linux --release && \
+    # Remove SDK engine artifacts, pub cache, temp files, and apt caches now.
+    rm -rf $FLUTTER_HOME/bin/cache \
+           $FLUTTER_HOME/.git \
+           /root/.pub-cache \
+           /tmp/* \
+           /var/lib/apt/lists/* \
+           /var/cache/apt/archives/*
 
-# ── Python dependencies ───────────────────────────────────────────────────────
-COPY requirements.txt ./
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+# ================================================================
+# Stage 2 — runtime (small)
+# ================================================================
+FROM ubuntu:22.04 AS runtime
 
-# Install Chromium for the Meet connector bot
-RUN playwright install chromium --with-deps
+ENV DEBIAN_FRONTEND=noninteractive
 
-COPY . .
+# Shared libs a Flutter Linux/GTK app needs at runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgtk-3-0 \
+    libglib2.0-0 \
+    libblkid1 \
+    liblzma5 \
+    libc6 \
+    libstdc++6 \
+    libasound2 \
+    libx11-6 \
+    libxcursor1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxi6 \
+    libxrandr2 \
+    libxrender1 \
+    libxtst6 \
+    libwayland-client0 \
+    libwayland-cursor0 \
+    libfontconfig1 \
+    libfreetype6 \
+    libpng16-16 \
+    libjpeg8 \
+    libsqlite3-0 \
+    zlib1g \
+    xz-utils \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-EXPOSE 8000
+WORKDIR /app
 
-HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
+# Copy ONLY the compiled release bundle from the build stage.
+COPY --from=build /app/build/linux/x64/release/bundle .
 
-# Shell form so the platform can tune via env without an image rebuild:
-#   WEB_CONCURRENCY — worker processes (default 4; match the instance's CPU count)
-#   PORT            — listen port (Render/Railway inject this; defaults to 8000)
-# --proxy-headers trusts X-Forwarded-For from the platform's load balancer so
-# rate limiting sees real client IPs instead of the proxy's.
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} \
-    --workers ${WEB_CONCURRENCY:-4} \
-    --proxy-headers --forwarded-allow-ips="*"
+CMD ["./app"]
