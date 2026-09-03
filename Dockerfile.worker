@@ -1,14 +1,28 @@
 # syntax=docker/dockerfile:1
-# Forgefy Celery build worker - multi-stage, SDKs kept (runtime), caches pruned.
+# Forgefy Celery build worker - multi-stage, pruned caches, minimal layers.
 #
-# This worker compiles user projects (Flutter / React Native / Next.js) so
-# Flutter, the Android SDK, OpenJDK 21 and Node 22 are RUNTIME requirements
-# here (unlike the lean API image). To keep disk usage down we:
-#   - build Python wheels in a separate stage so gcc/cpp/binutils/perl never
-#     ship in the final image,
-#   - clean apt lists, pip cache, npm cache and SDK temp files in the SAME RUN
-#     layer that creates them,
-#   - prune Flutter / Android sdkmanager temp artifacts.
+# RUNTIME requirements here (verified in the codebase):
+#   - Python 3.14 + every pip package          -> the celery app itself
+#   - Flutter SDK + Android SDK + OpenJDK 21   -> `build` queue compiles user
+#      Flutter projects and uploads the APK (build_worker._deploy_appetize)
+#   - Node.js 22                               -> build_worker.py runs
+#      `npx --yes wrangler@3 pages deploy` (Cloudflare Pages preview) and the
+#      Next.js / React-Native templates are built with npm
+#      (app/config.py installs npm deps with --ignore-scripts)
+#
+# Build-time-only tools (gcc, cpp, binutils, perl, make, unzip, xz-utils) live
+# in the wheel-builder stage or are purged in the SAME RUN layer that used them,
+# so they never ship in the final image.
+#
+# Size levers (estimates vs the previous single-stage image):
+#   - wheel-builder split .................. ~300 MB (toolchain excluded)
+#   - pip cache purged in-layer ............ ~400-700 MB
+#   - apt lists removed in every layer ..... ~100 MB
+#   - sdkmanager temp/.cache/.temp pruned .. ~200-500 MB
+#   - Flutter analyzer/.dart_tool/web-sdk .. ~300-400 MB
+#   - npm cache cleaned in-layer ........... ~50 MB
+#   - optional: INSTALL_NODE=false ......... ~259 MB (breaks Pages/Next/RN!)
+#   - optional: PRUNE_FLUTTER_RELEASE ...... ~600 MB (breaks release APKs!)
 
 # ---- Stage 1: build Python wheels ----------------------------------------
 FROM python:3.14-slim AS wheel-builder
@@ -16,14 +30,10 @@ FROM python:3.14-slim AS wheel-builder
 WORKDIR /build
 
 ENV DEBIAN_FRONTEND=noninteractive
+# Compiler toolchain for native wheels (greenlet, orjson, cryptography, cffi,
+# bcrypt, httptools, watchfiles, pydantic-core, ...). Never copied onward.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      gcc \
-      cpp \
-      binutils \
-      perl \
-      make \
-      xz-utils \
-      ca-certificates \
+      gcc cpp binutils perl make xz-utils ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
@@ -40,29 +50,27 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# ---- Base system packages (runtime + build-time extraction) --------------
-# git/curl/unzip are needed to clone & unpack scaffolded projects. xz-utils is
-# needed (build-time) to extract the Flutter .tar.xz. No gcc/cpp/binutils/perl
-# are shipped - wheels come from stage 1.
+# ---- Base: runtime only. git is used by the build agent and by flutter ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl \
-      git \
-      unzip \
-      xz-utils \
-      ca-certificates \
+      curl git ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-# ---- Node.js 22 (runtime: Next.js / React Native builds, npm install) -----
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-  && apt-get install -y --no-install-recommends nodejs \
+# ---- Node.js 22 (RUNTIME: npx wrangler pages deploy + Next/RN npm builds) -
+# Set --build-arg INSTALL_NODE=false ONLY if Cloudflare Pages deploys and
+# Next.js/React-Native templates are not used; that drops ~259 MB.
+ARG INSTALL_NODE=true
+RUN if [ "$INSTALL_NODE" = "true" ]; then \
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+      && apt-get install -y --no-install-recommends nodejs \
+      && npm cache clean --force 2>/dev/null || true; \
+    fi \
   && rm -rf /var/lib/apt/lists/*
 
-# The worker's CMD runs as --uid=nobody; $HOME=/root/.npm is unwritable to
-# nobody, so point npm/npx at a world-writable cache and create it up front.
+# npm/npx run as --uid=nobody (see CMD); $HOME=/root is unwritable to nobody.
 ENV npm_config_cache=/tmp/.npm
 RUN mkdir -p /tmp/.npm && chmod 777 /tmp/.npm
 
-# ---- OpenJDK 21 (runtime: Gradle Android builds) -------------------------
+# ---- OpenJDK 21 (RUNTIME: Gradle compiles the Android APK) ----------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
       openjdk-21-jdk-headless \
   && rm -rf /var/lib/apt/lists/*
@@ -72,71 +80,75 @@ ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
 
 ENV PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/build-tools/34.0.0
 
-# ---- Android SDK (runtime: flutter build apk) ----------------------------
-RUN mkdir -p $ANDROID_HOME/cmdline-tools \
+# ---- Android SDK (RUNTIME: flutter build apk) -----------------------------
+# unzip is build-time only: installed, used and purged in THIS layer.
+RUN apt-get update && apt-get install -y --no-install-recommends unzip \
+  && mkdir -p $ANDROID_HOME/cmdline-tools \
   && curl -o /tmp/cmdline-tools.zip \
        "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
   && unzip -q /tmp/cmdline-tools.zip -d /tmp/ct \
   && mv /tmp/ct/cmdline-tools $ANDROID_HOME/cmdline-tools/latest \
-  && rm -rf /tmp/cmdline-tools.zip /tmp/ct
+  && rm -rf /tmp/cmdline-tools.zip /tmp/ct \
+  && yes | sdkmanager --licenses > /dev/null 2>&1 \
+  && sdkmanager "platform-tools" "build-tools;34.0.0" "platforms;android-34" \
+  && rm -rf /tmp/* $ANDROID_HOME/.temp $ANDROID_HOME/.cache /root/.android/cache \
+  && apt-get purge -y --auto-remove unzip \
+  && rm -rf /var/lib/apt/lists/*
 
-# sdkmanager temp/cache are removed in the SAME layer as the download.
-RUN yes | sdkmanager --licenses > /dev/null 2>&1 \
-  && sdkmanager \
-       "platform-tools" \
-       "build-tools;34.0.0" \
-       "platforms;android-34" \
-  && rm -rf /tmp/* \
-       $ANDROID_HOME/.temp \
-       $ANDROID_HOME/.cache
-
-# ---- Flutter SDK (runtime: flutter build apk) ----------------------------
+# ---- Flutter SDK (RUNTIME: flutter build apk / flutter test / dart) -------
 ARG FLUTTER_VERSION=3.24.4
+# Release engine artifacts (android-*-release) are REQUIRED for
+# `flutter build apk --release`. Set PRUNE_FLUTTER_RELEASE=true only if the
+# worker never ships release APKs ? Flutter would then re-download them on
+# demand at build time (needs network, adds minutes to the first build).
+ARG PRUNE_FLUTTER_RELEASE=false
 
 ENV FLUTTER_HOME=/opt/flutter \
     PUB_CACHE=/opt/pub-cache
 
 ENV PATH=$PATH:$FLUTTER_HOME/bin:$FLUTTER_HOME/bin/cache/dart-sdk/bin
 
-RUN curl -o /tmp/flutter.tar.xz \
-      "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz" \
+# xz-utils is build-time only: installed, used and purged in THIS layer.
+RUN apt-get update && apt-get install -y --no-install-recommends xz-utils \
+  && curl -o /tmp/flutter.tar.xz \
+       "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz" \
   && tar xf /tmp/flutter.tar.xz -C /opt \
-  && rm /tmp/flutter.tar.xz \
+  && rm -f /tmp/flutter.tar.xz \
   && git config --global --add safe.directory /opt/flutter \
   && flutter config --no-analytics \
   && flutter precache --android \
-  && flutter doctor --android-licenses || true
+  && (yes | flutter doctor --android-licenses) || true \
+  && rm -rf /tmp/flutter* \
+       $FLUTTER_HOME/bin/cache/dart-sdk/pkg/analyzer \
+       $FLUTTER_HOME/bin/cache/flutter_web_sdk \
+       $FLUTTER_HOME/bin/cache/downloads \
+       $FLUTTER_HOME/.dart_tool \
+       /root/.pub-cache/_temp /root/.pub-cache/log \
+  && if [ "$PRUNE_FLUTTER_RELEASE" = "true" ]; then \
+       rm -rf $FLUTTER_HOME/bin/cache/artifacts/engine/*-release*; \
+     fi \
+  && apt-get purge -y --auto-remove xz-utils \
+  && rm -rf /var/lib/apt/lists/*
 
-# Prune Flutter / Dart caches that only duplicate on first real run. Keep
-# /opt/flutter/bin/cache (the tool + Android engine needed to build).
-RUN rm -rf /tmp/flutter* \
-    /opt/flutter/bin/cache/dart-sdk/pkg/analyzer \
-    /opt/flutter/.dart_tool
-
-# ---- Python (installed wheels from stage 1) -------------------------------
+# ---- Python (wheels from stage 1; no gcc/cpp/binutils/perl/make here) -----
 COPY --from=wheel-builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
 COPY --from=wheel-builder /usr/local/bin /usr/local/bin
 
-# ---- Playwright ----------------------------------------------------------
-# The worker's bot path goes through Recall.ai; the legacy Playwright
-# MeetConnector is not wired in. Playwright's Python package stays installed,
-# and Chromium is fetched only when INSTALL_PLAYWRIGHT_BROWSERS=true.
+# ---- Playwright (pip package stays; Chromium only when explicitly enabled) -
+# Meet/Teams run through Recall.ai, so the browser is off by default.
 ARG INSTALL_PLAYWRIGHT_BROWSERS=false
 RUN if [ "$INSTALL_PLAYWRIGHT_BROWSERS" = "true" ]; then \
-      playwright install chromium --with-deps ; \
+      playwright install chromium --with-deps; \
     fi
 
-# ---- Application ----------------------------------------------------------
+# ---- Application -----------------------------------------------------------
 COPY . .
 
-# ---- Final environment ----------------------------------------------------
-ENV HOME=/home/nobody \
-    PUB_CACHE=/opt/pub-cache
-
-# Keep the toolchain paths available for build tasks.
-ENV PATH=$PATH:$FLUTTER_HOME/bin:$FLUTTER_HOME/bin/cache/dart-sdk/bin:$ANDROID_HOME/platform-tools
+# World-writable caches: the worker runs as --uid=nobody, and both `flutter
+# pub get` (shared packages) and `npm install` (npm_config_cache) write here.
+# /tmp/.npm is recreated because the Android layer wiped /tmp/*.
+RUN mkdir -p /opt/pub-cache /tmp/.npm && chmod 777 /opt/pub-cache /tmp/.npm
 
 # Concurrency is NOT passed here - a --concurrency flag overrides
-# celery_app.conf, which is what let this image and docker-compose.yml drift
-# apart; it now comes from CELERY_CONCURRENCY (default 2).
+# celery_app.conf; it comes from CELERY_CONCURRENCY (default 2).
 CMD ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=info", "-Q", "meeting.audio,meeting.transcribe,meeting.extract,build", "-B", "-s", "/tmp/celerybeat-schedule", "--uid=nobody"]
