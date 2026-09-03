@@ -1,0 +1,51 @@
+# .dockerignore - keep the build context small. Only files needed to compile the
+# Flutter Linux app (lib/, pubspec.yaml, the linux/ runner, and assets/) are
+# copied into the image. Heavy and generated directories are excluded so the
+# context upload is fast and does not waste worker bandwidth.
+# -----------------------------------------------------------------------------
+
+# Version control / CI
+.git
+.gitignore
+.github
+
+# Python / backend monolith artifacts (unrelated to compiling the Flutter app)
+venv/
+forgefy_backend.egg-info/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+celerybeat-schedule*
+*.log
+
+# Environments / secrets - never ship these into an image
+.env
+.env.example
+firebase-credentials.json
+
+# Generated / local tooling state
+.wrangler/
+.dart_tool/
+.build/
+.cache/
+.pub-cache/
+.gradle/
+.windows/
+.android/
+
+# Dart/Flutter SDK sub-packages in this repo - large and not part of the deployed
+# Linux app source. (If your app uses these via path dependencies, remove this.)
+sdks/
+
+# Local worker / scratch folders
+gentle-meadow-b376/
+zoom-bot/
+
+# Docs and tests are only needed locally, not at build or runtime
+docs/
+tests/
