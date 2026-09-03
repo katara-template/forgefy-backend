@@ -52,8 +52,6 @@ export class ApiContainer extends Container<Env> {
 
   envVars = CONTAINER_ENV;
 
-  private booted = false;
-
   override onStart(): void {
     console.log(`[ApiContainer] uvicorn listening on :${API_PORT}`);
   }
@@ -65,22 +63,38 @@ export class ApiContainer extends Container<Env> {
   /**
    * The default port-ready window is 20s. This image is ~8.23 GB and the app
    * imports playwright, firebase and the AI SDKs at module scope, so a cold
-   * start can run past that. Boot explicitly with a longer window, once, then
-   * hand off to the base implementation (which preserves WebSocket upgrades).
+   * start can run past that. Boot explicitly with a longer window.
+   *
+   * Start state is re-checked on EVERY request (no cached `booted` flag). The
+   * old flag went stale after `sleepAfter` stopped the instance, a crash, or a
+   * platform-initiated restart, so requests were proxied to a stopped
+   * container and surfaced as:
+   *   "Error: The container is not running, consider calling start()"
+   *
+   * containerFetch() is the library's supported proxy path: it starts the
+   * container if it is not running/healthy, waits for the port, and forwards
+   * the request — preserving WebSocket upgrades on /ws/* (it accepts both
+   * WebSocketPair ends internally). Manual start() calls are NOT needed and
+   * are in fact forbidden while using the Container base class.
    */
   override async fetch(request: Request): Promise<Response> {
-    if (!this.booted) {
+    // `container` itself is private in @cloudflare/containers; getState() is
+    // the public view of the same lifecycle state.
+    const state = await this.getState();
+    if (state.status !== "healthy" && state.status !== "running") {
+      // Coalesce concurrent cold starts so parallel requests do not race
+      // startAndWaitForPorts into "already running" errors.
       await this.ctx.blockConcurrencyWhile(async () => {
-        if (this.booted) return;
-        await this.startAndWaitForPorts({
-          ports: [API_PORT],
-          cancellationOptions: { portReadyTimeoutMS: 60_000 },
+        const rechecked = await this.getState();
+        if (rechecked.status === "healthy" || rechecked.status === "running") return;
+        await this.startAndWaitForPorts([API_PORT], {
+          portReadyTimeoutMS: 60_000,
+          abort: request.signal,
         });
-        this.booted = true;
       });
     }
 
-    return super.fetch(request);
+    return this.containerFetch(request, API_PORT);
   }
 }
 
@@ -169,6 +183,54 @@ const json = (body: unknown, status = 200) =>
     headers: { "content-type": "application/json" },
   });
 
+/**
+ * Cold-start retry for requests proxied to the API container.
+ *
+ * containerFetch() does not throw on startup/proxy problems — it converts them
+ * into plain-text error Responses (500 "Failed to start container: …",
+ * 500 "Container suddenly disconnected…", 500 "Error proxying request to
+ * container: …", 503 "There is no Container instance available…"). A request
+ * that lands while the container is still booting therefore looks like one of
+ * those responses, not an exception. Retry such responses exactly once after a
+ * short delay; by then the container is normally healthy. Genuinely app-level
+ * 4xx/5xx bodies do not match and are returned untouched.
+ */
+const COLD_START_RETRY_STATUSES = new Set([500, 502, 503]);
+const COLD_START_RETRY_DELAY_MS = 2_000;
+const COLD_START_ERROR_RE =
+  /Failed to start container|Container suddenly disconnected|Error proxying request to container|no Container instance available/i;
+
+async function fetchApiWithColdStartRetry(
+  api: DurableObjectStub<ApiContainer>,
+  request: Request,
+): Promise<Response> {
+  let first: Response | null = null;
+  let thrown: unknown = null;
+
+  try {
+    first = await api.fetch(request);
+  } catch (e) {
+    thrown = e;
+  }
+
+  if (thrown === null && first !== null) {
+    if (!COLD_START_RETRY_STATUSES.has(first.status)) return first;
+    const body = await first.clone().text().catch(() => "");
+    if (!COLD_START_ERROR_RE.test(body)) return first;
+    console.log(
+      `[cf] cold-start response status=${first.status}; retrying once in ${COLD_START_RETRY_DELAY_MS}ms`,
+    );
+  } else {
+    console.error(
+      `[cf] cold-start error proxying to API_CONTAINER; retrying once in ${COLD_START_RETRY_DELAY_MS}ms`,
+      thrown instanceof Error ? { message: thrown.message, stack: thrown.stack } : String(thrown),
+    );
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, COLD_START_RETRY_DELAY_MS));
+  return api.fetch(request);
+}
+
 /** Length-independent comparison, so the token is not guessable by timing. */
 function tokenMatches(provided: string | null, expected: string): boolean {
   if (!provided || provided.length !== expected.length) return false;
@@ -246,14 +308,15 @@ export default {
 
       // Stateless spread across the pool. Cross-instance fan-out for WebSockets
       // is handled by Redis pub/sub inside the app, so any instance can serve
-      // any client. Uses the stub's fetch() — containerFetch() would break the
-      // WebSocket upgrades on /ws/*.
+      // any client. The stub's fetch() reaches ApiContainer.fetch(), which
+      // auto-starts the container and proxies through containerFetch() — that
+      // path accepts both WebSocketPair ends, so /ws/* upgrades still work.
       console.log(`[cf] getRandom(API_CONTAINER) before for ${request.method} ${url.pathname}`);
       const api = await getRandom(workerEnv.API_CONTAINER, API_POOL_SIZE);
       console.log(`[cf] getRandom(API_CONTAINER) after -> stub selected`);
 
       console.log(`[cf] API_CONTAINER.fetch() before for ${request.method} ${url.pathname}`);
-      const res = await api.fetch(request);
+      const res = await fetchApiWithColdStartRetry(api, request);
       console.log(
         `[cf] API_CONTAINER.fetch() after -> status=${res.status} (${Date.now() - startedAt}ms) for ${request.method} ${url.pathname}`,
       );
