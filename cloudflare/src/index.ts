@@ -43,12 +43,21 @@ export class ApiContainer extends Container<Env> {
   defaultPort = API_PORT;
 
   /**
-   * The API is allowed to scale to zero. Note the trade-off for WebSockets:
-   * a socket held open with no new HTTP requests for an hour can be dropped
-   * when the instance sleeps. Clients should reconnect; the WS handlers
-   * rebuild state from Redis pub/sub anyway (app/api/ws/connection_manager.py).
+   * sleepMode: "afterIdle" equivalent. The Container class exposes this as
+   * `sleepAfter` — the idle duration before the instance sleeps. After this
+   * period with no requests the container is stopped (scales to zero) and the
+   * next request triggers a cold start.
+   *
+   * Note the trade-off for WebSockets: a socket held open with no new HTTP
+   * requests for this long can be dropped when the instance sleeps. Clients
+   * should reconnect; the WS handlers rebuild state from Redis pub/sub anyway
+   * (app/api/ws/connection_manager.py).
+   *
+   * Chosen to keep the container warm during active bursts (cold start here
+   * costs ~90-150s) while still sleeping during genuine idle. Tune up/down
+   * based on traffic patterns and cold-start tolerance.
    */
-  sleepAfter = "1h";
+  sleepAfter = "10m";
 
   envVars = CONTAINER_ENV;
 
@@ -61,53 +70,82 @@ export class ApiContainer extends Container<Env> {
   }
 
   /**
-   * The default port-ready window is 20s. This image is ~8.23 GB and the app
-   * imports playwright, firebase and the AI SDKs at module scope, so a cold
-   * start can run past that. Boot explicitly with a longer window.
+   * Non-blocking cold start with retry.
    *
-   * Start state is re-checked on EVERY request (no cached `booted` flag). The
-   * old flag went stale after `sleepAfter` stopped the instance, a crash, or a
-   * platform-initiated restart, so requests were proxied to a stopped
-   * container and surfaced as:
-   *   "Error: The container is not running, consider calling start()"
+   * The previous implementation wrapped the heavy container start in
+   * `this.ctx.blockConcurrencyWhile()`, which has a hard 30s limit. This
+   * image's cold start (playwright / firebase / AI SDKs import at module
+   * scope) routinely exceeds that, so the call was cancelled and the DO was
+   * reset — surfacing as "container is not running".
    *
-   * containerFetch() is the library's supported proxy path: it starts the
-   * container if it is not running/healthy, waits for the port, and forwards
-   * the request — preserving WebSocket upgrades on /ws/* (it accepts both
-   * WebSocketPair ends internally). Manual start() calls are NOT needed and
-   * are in fact forbidden while using the Container base class.
-          */
+   * Fix: delegate to `containerFetch()`, the library's supported proxy path.
+   * Internally it checks `this.container.running`, starts the container if
+   * needed, and waits for the port — all OUTSIDE `blockConcurrencyWhile`
+   * (the library only wraps the lightweight setHealthy()+onStart() in it).
+   * This also preserves WebSocket upgrades on /ws/* (containerFetch accepts
+   * both WebSocketPair ends), which the low-level port.fetch() path does not.
+   *
+   * containerFetch() returns a 5xx Response on startup failure rather than
+   * throwing, so we retry those (up to 5×, 2s apart) and pass real app
+   * responses straight through.
+   */
   override async fetch(request: Request): Promise<Response> {
     const state = await this.getState();
-    if (state.status !== "healthy" && state.status !== "running") {
-      console.log(`[ApiContainer] start triggered; current status=${state.status}`);
-      // Coalesce concurrent cold starts so parallel requests do not race
-      // startAndWaitForPorts into "already running" errors.
-      await this.ctx.blockConcurrencyWhile(async () => {
-        const rechecked = await this.getState();
-        if (rechecked.status === "healthy" || rechecked.status === "running") return;
-        try {
-          await this.startAndWaitForPorts([API_PORT], {
-            portReadyTimeoutMS: 60_000,
-            abort: request.signal,
-          });
-          const after = await this.getState();
-          console.log(`[ApiContainer] start complete; status=${after.status} port=${API_PORT}`);
-        } catch (e) {
-          const stateAfter = await this.getState();
-          console.error("[ApiContainer] startAndWaitForPorts failed", {
-            message: e instanceof Error ? e.message : String(e),
-            stack: e instanceof Error ? e.stack : undefined,
-            statusAfter: stateAfter.status,
-          });
-          throw e;
-        }
-      });
-    } else {
-      console.log(`[ApiContainer] already ${state.status}; proxying directly`);
+    // Capture this up front: a 5xx is only retried when the container was
+    // starting. If it was already running, a 5xx is an app-level error and
+    // must be returned to the client as-is (never retried).
+    const wasStarting = state.status !== "healthy" && state.status !== "running";
+    console.log(`[ApiContainer] running status=${state.status}`);
+
+    const MAX_RETRIES = 5;
+    const RETRY_DELAY_MS = 2_000;
+    let response: Response | undefined;
+
+    for (let i = 0; i < MAX_RETRIES; i++) {
+      if (i > 0) {
+        console.log(
+          `[ApiContainer] cold-start retry ${i + 1}/${MAX_RETRIES} after ${RETRY_DELAY_MS}ms`,
+        );
+      }
+      try {
+        response = await this.containerFetch(request, API_PORT);
+      } catch (e) {
+        // containerFetch normally returns a 5xx Response instead of throwing,
+        // but handle throws defensively.
+        const err = e instanceof Error ? e.message : String(e);
+        console.error(
+          `[ApiContainer] containerFetch threw on attempt ${i + 1}/${MAX_RETRIES}: ${err}`,
+        );
+        if (i === MAX_RETRIES - 1) break;
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+        continue;
+      }
+
+      // Success or an app-level response (incl. app 4xx/5xx): return as-is.
+      // Only retry container-startup failures — a 5xx observed while the
+      // container was starting.
+      if (response.status < 500 || !wasStarting) {
+        return response;
+      }
+
+      console.log(
+        `[ApiContainer] startup failure (status=${response.status}) attempt ${i + 1}/${MAX_RETRIES}`,
+      );
+      if (i === MAX_RETRIES - 1) break;
+      await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
     }
 
-    return this.containerFetch(request, API_PORT);
+    // All retries exhausted. Surface a clear 503 rather than a cryptic
+    // "container is not running" error.
+    console.error(
+      `[ApiContainer] all ${MAX_RETRIES} cold-start attempts failed, returning 503`,
+    );
+    return new Response(
+      JSON.stringify({
+        error: "API container unavailable after repeated cold-start attempts",
+      }),
+      { status: 503, headers: { "content-type": "application/json" } },
+    );
   }
 }
 
@@ -208,42 +246,6 @@ const json = (body: unknown, status = 200) =>
  * short delay; by then the container is normally healthy. Genuinely app-level
  * 4xx/5xx bodies do not match and are returned untouched.
  */
-const COLD_START_RETRY_STATUSES = new Set([500, 502, 503]);
-const COLD_START_RETRY_DELAY_MS = 2_000;
-const COLD_START_ERROR_RE =
-  /Failed to start container|Container suddenly disconnected|Error proxying request to container|no Container instance available/i;
-
-async function fetchApiWithColdStartRetry(
-  api: DurableObjectStub<ApiContainer>,
-  request: Request,
-): Promise<Response> {
-  let first: Response | null = null;
-  let thrown: unknown = null;
-
-  try {
-    first = await api.fetch(request);
-  } catch (e) {
-    thrown = e;
-  }
-
-  if (thrown === null && first !== null) {
-    if (!COLD_START_RETRY_STATUSES.has(first.status)) return first;
-    const body = await first.clone().text().catch(() => "");
-    if (!COLD_START_ERROR_RE.test(body)) return first;
-    console.log(
-      `[cf] cold-start response status=${first.status}; retrying once in ${COLD_START_RETRY_DELAY_MS}ms`,
-    );
-  } else {
-    console.error(
-      `[cf] cold-start error proxying to API_CONTAINER; retrying once in ${COLD_START_RETRY_DELAY_MS}ms`,
-      thrown instanceof Error ? { message: thrown.message, stack: thrown.stack } : String(thrown),
-    );
-  }
-
-  await new Promise((resolve) => setTimeout(resolve, COLD_START_RETRY_DELAY_MS));
-  return api.fetch(request);
-}
-
 /** Length-independent comparison, so the token is not guessable by timing. */
 function tokenMatches(provided: string | null, expected: string): boolean {
   if (!provided || provided.length !== expected.length) return false;
@@ -329,7 +331,9 @@ export default {
       console.log(`[cf] getRandom(API_CONTAINER) after -> stub selected`);
 
       console.log(`[cf] API_CONTAINER.fetch() before for ${request.method} ${url.pathname}`);
-      const res = await fetchApiWithColdStartRetry(api, request);
+      // The DO's ApiContainer.fetch() handles cold-start + retry internally, so
+      // this is a straight proxy — no Worker-level retry wrapper needed.
+      const res = await api.fetch(request);
       console.log(
         `[cf] API_CONTAINER.fetch() after -> status=${res.status} (${Date.now() - startedAt}ms) for ${request.method} ${url.pathname}`,
       );
