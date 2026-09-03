@@ -1,7 +1,9 @@
-# .dockerignore - keep the build context small. Only the Python backend files
-# needed by the forgefy-api image are copied in. Heavy and generated directories,
-# plus the separately-developed SDK packages, are excluded so the context upload
-# is fast and does not waste Cloudflare build disk.
+# .dockerignore - keep the build context small so CI/Cloudflare build upload
+# stays fast and does not waste disk. Context drops from ~289 MB to a few MB.
+# -----------------------------------------------------------------------------
+# NOTE: patterns without a leading "/" are matched at ANY depth (gitignore
+# semantics). Generic artifact dirs (build, dist, out) are therefore anchored
+# as /... to avoid excluding real source modules like app/build/.
 # -----------------------------------------------------------------------------
 
 # Version control / CI
@@ -9,46 +11,65 @@
 .gitignore
 .github
 
-# Python / backend artifacts
+# Node (Cloudflare adapter + SDK lockfiles pull in huge node_modules)
+node_modules
+
+# Python / virtualenvs / caches
+.venv
 venv/
+venv
 forgefy_backend.egg-info/
-__pycache__/
+__pycache__
 *.py[cod]
+*.pyc
 *$py.class
 *.so
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
 .coverage
-celerybeat-schedule*
-*.log
 
 # Environments / secrets - never ship these into an image
 .env
 .env.example
 firebase-credentials.json
+*.pem
+*.key
 
-# Generated / local tooling state
+# Documentation / tests - not needed at build or runtime
+*.md
+docs/
+tests/
+
+# Logs / local state
+*.log
+celerybeat-schedule*
+celerybeat-schedule-shm
+celerybeat-schedule-wal
+
+# Generated / local tooling state (anchored so app/build/ is NOT excluded)
 .wrangler/
 .dart_tool/
-.build/
-.cache/
+/.cache/
 .pub-cache/
 .gradle/
 .windows/
 .android/
+.expo/
+.next/
+/build/
+/dist/
+/out/
+
+# Cloudflare deployment adapter - runs on Cloudflare, not inside the image
+cloudflare/
 
 # SDK packages developers publish from this repo. Not part of the deployed
 # backend service and not needed to build the API image.
 sdks/
 
-# The Zoom bot has its own Dockerfile (./zoom-bot/Dockerfile) and image; its
-# SDK sources/images are not needed in the backend/image context here.
+# The Zoom bot has its own Dockerfile (./zoom-bot/Dockerfile) and image.
 zoom-bot/
 
 # Local worker / scratch folders
 gentle-meadow-b376/
-
-# Docs and tests are only needed locally, not at build or runtime
-docs/
-tests/

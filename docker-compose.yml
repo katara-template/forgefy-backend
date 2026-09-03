@@ -34,7 +34,13 @@ services:
     command: uvicorn app.main:app --host 0.0.0.0 --port 5000 --reload
 
   worker:
-    build: .
+    # The Celery worker also runs the `build` queue, which compiles user
+    # projects (Flutter/Android/JDK/Node), so it uses the heavier
+    # Dockerfile.worker. The lean `api` image (Dockerfile) does NOT include
+    # those SDKs.
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
     env_file:
       - path: .env
         required: false
@@ -68,7 +74,12 @@ services:
       -Q meeting.audio,meeting.transcribe,meeting.extract,build
 
   beat:
-    build: .
+    # Beat shares the worker image (it embeds the same app package). It does
+    # not need the build toolchain at runtime, but reusing Dockerfile.worker
+    # keeps a single code-carrying image for the celery deployment.
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
     env_file:
       - path: .env
         required: false
