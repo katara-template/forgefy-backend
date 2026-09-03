@@ -1,70 +1,95 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Multi-stage build: compile a Flutter WEB app, then serve the static output.
+# forgefy-api backend image.
 #
-# Stage 1 (build):   installs Flutter, runs `flutter build web --release`, and
-#                    deletes the SDK engine/caches in the SAME RUN layer so the
-#                    multi-GB SDK never persists into an image layer. This keeps
-#                    Cloudflare Workers Builds disk usage far below the 20 GB limit.
+# This is a Python (FastAPI/uvicorn) service. It does NOT build a Flutter bundle
+# in the image. The heavy mobile/web toolchain below (Node, JDK, Android SDK,
+# Flutter) is installed so the BACKEND'S build-agent code can generate user apps
+# at RUNTIME. Docker build only sets them up — it never runs `flutter build`.
 #
-# Stage 2 (runtime): nginx serving the compiled `build/web` directory. The Flutter
-#                    SDK is NOT present in the final image.
+# To keep the Cloudflare 20 GB build disk safe, we:
+#   * avoid `flutter precache` / `flutter doctor --android-licenses`, which pull
+#     the huge engine/artifact caches that are only needed when building apps,
+#   * delete temp archives & apt caches in the same RUN layer as their install.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ================================================================
-# Stage 1 — build
-# ================================================================
-FROM ubuntu:22.04 AS build
+FROM python:3.14-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
 
-# Minimal toolchain to download and extract the Flutter SDK. A web build needs no
-# clang/cmake/GTK dev headers, so we leave them out to keep this stage small.
+# ── Base system tools ─────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
     curl \
-    ca-certificates \
     git \
     unzip \
+    wget \
     xz-utils \
+    file \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Flutter SDK (pin version — bump to upgrade) ──────────────────────────────
+# ── Node.js 22.x (LTS) ───────────────────────────────────────────────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── OpenJDK 21 ───────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-21-jdk-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+
+# ── Android SDK ───────────────────────────────────────────────────────────────
+ENV ANDROID_HOME=/opt/android-sdk
+ENV PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/build-tools/34.0.0
+
+RUN mkdir -p $ANDROID_HOME/cmdline-tools && \
+    curl -o /tmp/cmdline-tools.zip \
+      "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" && \
+    unzip -q /tmp/cmdline-tools.zip -d /tmp/ct && \
+    mv /tmp/ct/cmdline-tools $ANDROID_HOME/cmdline-tools/latest && \
+    rm -rf /tmp/cmdline-tools.zip /tmp/ct
+
+# Licenses are required even at runtime, but they don't need the SDK's own
+# big engines unconditionally — accept them, then install platform tooling.
+RUN yes | sdkmanager --licenses > /dev/null 2>&1 && \
+    sdkmanager --install \
+      "platform-tools" \
+      "build-tools;34.0.0" \
+      "platforms;android-34"
+
+# ── Flutter SDK (pin version — update ARG to upgrade) ────────────────────────
 ARG FLUTTER_VERSION=3.24.4
 ENV FLUTTER_HOME=/opt/flutter
 ENV PATH=$PATH:$FLUTTER_HOME/bin
 ENV PUB_CACHE=/root/.pub-cache
 
-# Directory (relative to the build context) that contains the Flutter app's
-# pubspec.yaml. Override with:  --build-arg FLUTTER_APP_DIR=path/to/app
-ARG FLUTTER_APP_DIR=.
-
-WORKDIR /src
-COPY . /src
-
-# Download the SDK, build the web bundle, then purge SDK/cache artifacts in the
-# same layer so they are not baked into the layer set.
 RUN curl -o /tmp/flutter.tar.xz \
       "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz" && \
     tar xf /tmp/flutter.tar.xz -C /opt && \
-    rm /tmp/flutter.tar.xz && \
-    git config --global --add safe.directory $FLUTTER_HOME && \
-    flutter config --no-analytics && \
-    cd ${FLUTTER_APP_DIR:-.} && \
-    flutter pub get && \
-    flutter build web --release && \
-    # Final image only carries build/web; strip the SDK & caches now.
-    rm -rf $FLUTTER_HOME/bin/cache \
-           $FLUTTER_HOME/.git \
-           /root/.pub-cache \
-           /tmp/* \
-           /var/lib/apt/lists/* \
-           /var/cache/apt/archives/*
+    rm -rf /tmp/flutter.tar.xz && \
+    git config --global --add safe.directory /opt/flutter && \
+    flutter config --no-analytics
 
-# ================================================================
-# Stage 2 — runtime (small static server)
-# ================================================================
-FROM nginx:1.27-alpine AS runtime
+# ── Python dependencies ───────────────────────────────────────────────────────
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Copy ONLY the compiled web bundle from the build stage.
-COPY --from=build /src/build/web /usr/share/nginx/html
+# Install Chromium for the Meet connector bot
+RUN playwright install chromium --with-deps
 
-EXPOSE 80
+# Copy the backend source (sdks/ is excluded via .dockerignore).
+COPY . .
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
+
+# Shell form so the platform can tune via env without an image rebuild:
+#   WEB_CONCURRENCY — worker processes (default 4)
+#   PORT            — listen port (defaults to 8000)
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} \
+    --workers ${WEB_CONCURRENCY:-4} \
+    --proxy-headers --forwarded-allow-ips="*"

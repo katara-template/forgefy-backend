@@ -1,7 +1,7 @@
-# .dockerignore - keep the build context small. Only files needed to compile the
-# Flutter Linux app (lib/, pubspec.yaml, the linux/ runner, and assets/) are
-# copied into the image. Heavy and generated directories are excluded so the
-# context upload is fast and does not waste worker bandwidth.
+# .dockerignore - keep the build context small. Only the Python backend files
+# needed by the forgefy-api image are copied in. Heavy and generated directories,
+# plus the separately-developed SDK packages, are excluded so the context upload
+# is fast and does not waste Cloudflare build disk.
 # -----------------------------------------------------------------------------
 
 # Version control / CI
@@ -9,7 +9,7 @@
 .gitignore
 .github
 
-# Python / backend monolith artifacts (unrelated to compiling the Flutter app)
+# Python / backend artifacts
 venv/
 forgefy_backend.egg-info/
 __pycache__/
@@ -38,13 +38,16 @@ firebase-credentials.json
 .windows/
 .android/
 
-# Dart/Flutter SDK sub-packages in this repo - large and not part of the deployed
-# Linux app source. (If your app uses these via path dependencies, remove this.)
+# SDK packages developers publish from this repo. Not part of the deployed
+# backend service and not needed to build the API image.
 sdks/
+
+# The Zoom bot has its own Dockerfile (./zoom-bot/Dockerfile) and image; its
+# SDK sources/images are not needed in the backend/image context here.
+zoom-bot/
 
 # Local worker / scratch folders
 gentle-meadow-b376/
-zoom-bot/
 
 # Docs and tests are only needed locally, not at build or runtime
 docs/
