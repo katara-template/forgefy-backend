@@ -76,22 +76,35 @@ export class ApiContainer extends Container<Env> {
    * the request — preserving WebSocket upgrades on /ws/* (it accepts both
    * WebSocketPair ends internally). Manual start() calls are NOT needed and
    * are in fact forbidden while using the Container base class.
-   */
+          */
   override async fetch(request: Request): Promise<Response> {
-    // `container` itself is private in @cloudflare/containers; getState() is
-    // the public view of the same lifecycle state.
     const state = await this.getState();
     if (state.status !== "healthy" && state.status !== "running") {
+      console.log(`[ApiContainer] start triggered; current status=${state.status}`);
       // Coalesce concurrent cold starts so parallel requests do not race
       // startAndWaitForPorts into "already running" errors.
       await this.ctx.blockConcurrencyWhile(async () => {
         const rechecked = await this.getState();
         if (rechecked.status === "healthy" || rechecked.status === "running") return;
-        await this.startAndWaitForPorts([API_PORT], {
-          portReadyTimeoutMS: 60_000,
-          abort: request.signal,
-        });
+        try {
+          await this.startAndWaitForPorts([API_PORT], {
+            portReadyTimeoutMS: 60_000,
+            abort: request.signal,
+          });
+          const after = await this.getState();
+          console.log(`[ApiContainer] start complete; status=${after.status} port=${API_PORT}`);
+        } catch (e) {
+          const stateAfter = await this.getState();
+          console.error("[ApiContainer] startAndWaitForPorts failed", {
+            message: e instanceof Error ? e.message : String(e),
+            stack: e instanceof Error ? e.stack : undefined,
+            statusAfter: stateAfter.status,
+          });
+          throw e;
+        }
       });
+    } else {
+      console.log(`[ApiContainer] already ${state.status}; proxying directly`);
     }
 
     return this.containerFetch(request, API_PORT);
