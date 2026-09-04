@@ -402,7 +402,7 @@ export default {
   /**
    * Supervisor tick (every 2 minutes, see `triggers.crons` in wrangler.json).
    * The worker keeps itself awake; this only recovers it after a
-   * platform-initiated stop. hhh
+   * platform-initiated stop. 
    */
   async scheduled(
     _controller: ScheduledController,
