@@ -33,7 +33,7 @@ Nothing outside this directory is Cloudflare-aware:
                   │ sleepAfter 1h            │
                   └────────────┬─────────────┘
                                │
-     cron */2min               │  rediss://…:14027
+     cron */2min               │  redis://…:11801
   ┌──────────────┐             ▼
   │ scheduled()  │      ┌─────────────┐        ┌──────────────────────┐
   │ ensureRunning├─────▶│ Redis Cloud │◀───────┤ WorkerContainer ×1   │
@@ -151,14 +151,21 @@ npx wrangler tail --format pretty
 
 Look for Celery's banner listing the broker and the four queues
 (`meeting.audio`, `meeting.transcribe`, `meeting.extract`, `build`), then
-`celery@… ready.`. A repeating `consumer: Cannot connect to rediss://…` means
-outbound TLS to port 14027 is not working — see the checklist item below.
+`celery@… ready.`. A repeating `consumer: Cannot connect to redis://…` means
+outbound TCP to port 11801 is not working — see the checklist item below.
 
 Confirm from the Redis side too:
 
 ```
-redis-cli -u "$REDIS_URL" --tls CLIENT LIST
+redis-cli -u "$REDIS_URL" CLIENT LIST
 ```
+
+> The current Redis Cloud database has **TLS disabled** — the endpoint speaks
+> plain RESP on 11801 and `rediss://` fails with `WRONG_VERSION_NUMBER`. If you
+> enable TLS on the database, switch the three `.env` URLs back to `rediss://`
+> and re-run `push-secrets.ps1`; `app/config.py` and `celery_app.py` already
+> handle the `rediss://` case (they append `ssl_cert_reqs=none` and set
+> `broker_use_ssl`), so no code change is needed.
 
 You should see connections from a Cloudflare egress IP. Then enqueue a real job
 through the API and watch it get picked up in `wrangler tail`.
