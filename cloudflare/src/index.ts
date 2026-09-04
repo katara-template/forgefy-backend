@@ -39,6 +39,30 @@ const CONTAINER_ENV = buildContainerEnv(env as unknown as Record<string, unknown
 // API container
 // ---------------------------------------------------------------------------
 
+/**
+ * Cold-start budget for the API container.
+ *
+ * `containerFetch()` calls `startAndWaitForPorts(port, { abort })` internally
+ * with NO cancellationOptions, so it falls back to the library default of
+ * 20s (TIMEOUT_TO_GET_PORTS_MS, @cloudflare/containers 0.3.7). uvicorn here
+ * imports firebase / the AI SDKs at module scope in each of WEB_CONCURRENCY
+ * workers and does not bind :8000 within that window, so every cold start
+ * died in waitForPort before the app was ever listening.
+ *
+ * The fix is to run the wait ourselves with a realistic budget: once the
+ * instance reaches `healthy`, containerFetch() skips its own wait entirely
+ * and goes straight to proxying.
+ *
+ * Kept under Cloudflare's ~100s edge response limit on purpose — a larger
+ * budget would just hand the client a 524 while this DO kept waiting. Boot
+ * continues in the background after we give up, so the retry that the client
+ * makes normally lands on a warm instance.
+ */
+const PORT_READY_TIMEOUT_MS = 85_000;
+
+/** Time allowed to acquire and start the instance itself (library default: 8s). */
+const INSTANCE_GET_TIMEOUT_MS = 30_000;
+
 export class ApiContainer extends Container<Env> {
   defaultPort = API_PORT;
 
@@ -85,9 +109,11 @@ export class ApiContainer extends Container<Env> {
    * This also preserves WebSocket upgrades on /ws/* (containerFetch accepts
    * both WebSocketPair ends), which the low-level port.fetch() path does not.
    *
-   * containerFetch() returns a 5xx Response on startup failure rather than
-   * throwing, so we retry those (up to 5×, 2s apart) and pass real app
-   * responses straight through.
+   * Cold start is handled explicitly before the proxy: containerFetch()'s own
+   * port wait is fixed at 20s, which this image cannot meet, so the wait runs
+   * here with PORT_READY_TIMEOUT_MS instead. By the time we proxy, the port is
+   * known ready — so the request is sent exactly once and whatever the app
+   * answers is passed through untouched.
    */
   override async fetch(request: Request): Promise<Response> {
     const state = await this.getState();
@@ -97,55 +123,73 @@ export class ApiContainer extends Container<Env> {
     const wasStarting = state.status !== "healthy" && state.status !== "running";
     console.log(`[ApiContainer] running status=${state.status}`);
 
-    const MAX_RETRIES = 5;
-    const RETRY_DELAY_MS = 2_000;
-    let response: Response | undefined;
-
-    for (let i = 0; i < MAX_RETRIES; i++) {
-      if (i > 0) {
-        console.log(
-          `[ApiContainer] cold-start retry ${i + 1}/${MAX_RETRIES} after ${RETRY_DELAY_MS}ms`,
-        );
-      }
+    if (wasStarting) {
+      // Check config before boot rather than after. uvicorn exits immediately
+      // when SECRET_KEY is missing (app/main.py:96 refuses to serve production
+      // traffic with the dev defaults), and a process that exits during boot
+      // is indistinguishable from a slow one from waitForPort's side — you get
+      // a port timeout 85s later with nothing pointing at the real cause.
       try {
-        response = await this.containerFetch(request, API_PORT);
+        assertRequiredEnv(CONTAINER_ENV);
       } catch (e) {
-        // containerFetch normally returns a 5xx Response instead of throwing,
-        // but handle throws defensively.
-        const err = e instanceof Error ? e.message : String(e);
+        const message = e instanceof Error ? e.message : String(e);
+        console.error(`[ApiContainer] refusing to start: ${message}`);
+        return new Response(JSON.stringify({ error: message }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      }
+
+      try {
+        await this.startAndWaitForPorts({
+          ports: API_PORT,
+          cancellationOptions: {
+            abort: request.signal,
+            instanceGetTimeoutMS: INSTANCE_GET_TIMEOUT_MS,
+            portReadyTimeoutMS: PORT_READY_TIMEOUT_MS,
+          },
+        });
+        console.log(`[ApiContainer] :${API_PORT} ready, proxying`);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
         console.error(
-          `[ApiContainer] containerFetch threw on attempt ${i + 1}/${MAX_RETRIES}: ${err}`,
+          `[ApiContainer] :${API_PORT} not ready within ${PORT_READY_TIMEOUT_MS}ms: ${message}`,
         );
-        if (i === MAX_RETRIES - 1) break;
-        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-        continue;
+        // Boot carries on in the background; the client's retry usually lands
+        // on a warm instance. Signal that rather than burning the retry loop
+        // below on a container that is still importing.
+        return new Response(
+          JSON.stringify({
+            error: "API container still starting — retry shortly",
+            detail: message,
+          }),
+          { status: 503, headers: { "content-type": "application/json", "retry-after": "30" } },
+        );
       }
-
-      // Success or an app-level response (incl. app 4xx/5xx): return as-is.
-      // Only retry container-startup failures — a 5xx observed while the
-      // container was starting.
-      if (response.status < 500 || !wasStarting) {
-        return response;
-      }
-
-      console.log(
-        `[ApiContainer] startup failure (status=${response.status}) attempt ${i + 1}/${MAX_RETRIES}`,
-      );
-      if (i === MAX_RETRIES - 1) break;
-      await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
     }
 
-    // All retries exhausted. Surface a clear 503 rather than a cryptic
-    // "container is not running" error.
-    console.error(
-      `[ApiContainer] all ${MAX_RETRIES} cold-start attempts failed, returning 503`,
-    );
-    return new Response(
-      JSON.stringify({
-        error: "API container unavailable after repeated cold-start attempts",
-      }),
-      { status: 503, headers: { "content-type": "application/json" } },
-    );
+    // Single pass, deliberately. The old loop re-sent the request up to 5× on
+    // any 5xx seen while the container was starting — which meant a POST could
+    // be delivered to the app more than once (create-project, start-build and
+    // the Stripe webhook are all non-idempotent). Now that the port is known
+    // ready before we get here, a 5xx is the app's own answer and belongs to
+    // the client unaltered.
+    try {
+      const response = await this.containerFetch(request, API_PORT);
+      if (response.status >= 500) {
+        console.log(`[ApiContainer] app returned status=${response.status}`);
+      }
+      return response;
+    } catch (e) {
+      // containerFetch returns a 5xx Response rather than throwing for the
+      // startup/proxy cases, so a throw here is genuinely unexpected.
+      const err = e instanceof Error ? e.message : String(e);
+      console.error(`[ApiContainer] containerFetch threw: ${err}`);
+      return new Response(
+        JSON.stringify({ error: "API container proxy failed", detail: err }),
+        { status: 502, headers: { "content-type": "application/json" } },
+      );
+    }
   }
 }
 

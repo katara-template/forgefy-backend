@@ -264,11 +264,27 @@ slows cold start. `vars` sets `WEB_CONCURRENCY=2`. Raise it in `wrangler.json` i
 you move the API to a bigger instance — no Dockerfile change needed, which is why
 that CMD uses shell form.
 
-### 7. Cold start can exceed the default 20s port-ready window
+### 7. Cold start exceeds the default 20s port-ready window
 
-Given the image size and import graph, `ApiContainer.fetch()` explicitly boots
-with `portReadyTimeoutMS: 60_000` instead of the 20s default. If you still see
-start timeouts, lower `WEB_CONCURRENCY` further or raise that number.
+`containerFetch()` waits for the port with the library's hardcoded 20s default —
+it takes no cancellation options ([`lib/container.js`][cf-fetch] calls
+`startAndWaitForPorts(port, { abort })`). uvicorn does not bind `:8000` inside
+that window, so every cold start failed in `waitForPort` before the app was
+listening, surfacing as `API container unavailable after repeated cold-start
+attempts`.
+
+`ApiContainer.fetch()` therefore does the wait itself, with
+`portReadyTimeoutMS: 85_000` and `instanceGetTimeoutMS: 30_000`, before handing
+off to `containerFetch()` — which then finds the instance `healthy` and skips
+its own wait. 85s is deliberate: Cloudflare's edge gives up on a response at
+~100s, so a longer budget would only turn the 503 into a 524.
+
+If start timeouts persist, lower `WEB_CONCURRENCY` or check the container logs
+for a *crash* rather than slowness — `assertRequiredEnv` now runs before boot,
+so missing `SECRET_KEY`/`REDIS_URL` returns a named 503 instead of a mystery
+port timeout.
+
+[cf-fetch]: node_modules/@cloudflare/containers/dist/lib/container.js
 
 ### 8. `linux/amd64` required
 
