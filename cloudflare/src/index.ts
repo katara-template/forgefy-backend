@@ -11,7 +11,6 @@
  */
 
 import { Container, getContainer, getRandom } from "@cloudflare/containers";
-import { env } from "cloudflare:workers";
 
 import {
   API_POOL_SIZE,
@@ -28,12 +27,6 @@ export interface Env {
   CF_ADMIN_TOKEN?: string;
   [key: string]: unknown;
 }
-
-/**
- * Built once per isolate from the Worker env. Contains REDIS_URL,
- * CELERY_BROKER_URL, every API key — under their original names.
- */
-const CONTAINER_ENV = buildContainerEnv(env as unknown as Record<string, unknown>);
 
 // ---------------------------------------------------------------------------
 // API container
@@ -67,6 +60,18 @@ export class ApiContainer extends Container<Env> {
   defaultPort = API_PORT;
 
   /**
+   * Built per Durable Object instance from `this.env`, not once per isolate.
+   *
+   * Field initializers run after `super(ctx, env)` has set `this.env`, and the
+   * library reads `this.envVars` at container-start time (not in its
+   * constructor), so this is safe. Every string-valued binding is passed
+   * through under its own name — see ./container-env.ts.
+   */
+  private readonly containerEnv = buildContainerEnv(
+    this.env as unknown as Record<string, unknown>,
+  );
+
+  /**
    * sleepMode: "afterIdle" equivalent. The Container class exposes this as
    * `sleepAfter` — the idle duration before the instance sleeps. After this
    * period with no requests the container is stopped (scales to zero) and the
@@ -83,7 +88,7 @@ export class ApiContainer extends Container<Env> {
    */
   sleepAfter = "10m";
 
-  envVars = CONTAINER_ENV;
+  envVars = this.containerEnv;
 
   override onStart(): void {
     console.log(`[ApiContainer] uvicorn listening on :${API_PORT}`);
@@ -130,7 +135,7 @@ export class ApiContainer extends Container<Env> {
       // is indistinguishable from a slow one from waitForPort's side — you get
       // a port timeout 85s later with nothing pointing at the real cause.
       try {
-        assertRequiredEnv(CONTAINER_ENV);
+        assertRequiredEnv(this.containerEnv);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         console.error(`[ApiContainer] refusing to start: ${message}`);
@@ -204,7 +209,12 @@ export class WorkerContainer extends Container<Env> {
    */
   sleepAfter = "12h";
 
-  envVars = CONTAINER_ENV;
+  /** Per-instance, same as ApiContainer.containerEnv. */
+  private readonly containerEnv = buildContainerEnv(
+    this.env as unknown as Record<string, unknown>,
+  );
+
+  envVars = this.containerEnv;
 
   override onStart(): void {
     console.log("[WorkerContainer] celery worker started, consuming from Redis");
@@ -246,7 +256,7 @@ export class WorkerContainer extends Container<Env> {
       return { status: state.status, restarted: false };
     }
 
-    assertRequiredEnv(CONTAINER_ENV);
+    assertRequiredEnv(this.containerEnv);
     await this.start();
 
     const started = await this.getState();
