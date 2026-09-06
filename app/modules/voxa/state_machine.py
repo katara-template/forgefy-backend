@@ -6,6 +6,10 @@ Valid transition graph:
 JOINING → PROCESSING is also allowed as a cancellation path when the bot
 joins but the meeting never reaches the LISTENING phase.
 
+WAITING/JOINING → FAILED covers the bot never being created at all — server
+misconfig, meeting-provider rejection, or repeated transport failure — so the
+session page can stop waiting instead of sitting on "Joining meeting…".
+
 FAILED → PROCESSING lets a user retry blueprint generation without starting a
 new session; the transcript is already captured, so only the aggregation step
 needs repeating.
@@ -24,8 +28,8 @@ from app.db.models.enums import Platform, SessionStatus
 from app.db.models.meeting_session import MeetingSession
 
 _TRANSITIONS: dict[SessionStatus, frozenset[SessionStatus]] = {
-    SessionStatus.WAITING: frozenset({SessionStatus.JOINING, SessionStatus.LISTENING, SessionStatus.PROCESSING}),
-    SessionStatus.JOINING: frozenset({SessionStatus.LISTENING, SessionStatus.PROCESSING}),
+    SessionStatus.WAITING: frozenset({SessionStatus.JOINING, SessionStatus.LISTENING, SessionStatus.PROCESSING, SessionStatus.FAILED}),
+    SessionStatus.JOINING: frozenset({SessionStatus.LISTENING, SessionStatus.PROCESSING, SessionStatus.FAILED}),
     SessionStatus.LISTENING: frozenset({SessionStatus.PROCESSING}),
     SessionStatus.PROCESSING: frozenset({SessionStatus.BLUEPRINT_READY, SessionStatus.FAILED}),
     SessionStatus.BLUEPRINT_READY: frozenset({SessionStatus.APPROVED}),

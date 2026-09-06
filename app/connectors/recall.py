@@ -17,6 +17,16 @@ logger = logging.getLogger(__name__)
 
 _BOT_NAME = "Forgefy Bot"
 
+
+class RecallBotCreationError(RuntimeError):
+    """Recall refused to create the bot with a response that will not succeed on retry.
+
+    Raised for 4xx other than 429 (bad meeting URL, wrong region, revoked key,
+    rejected payload field) and for a 2xx body with no bot id. Carries Recall's
+    own error text so the caller can surface it. Transient failures (429, 5xx,
+    transport errors) are left as ``httpx`` exceptions so the task retries.
+    """
+
 # Conservative cap — Recall receives the image base64-inlined in the bot
 # payload, so a large file slows every join and risks rejection.
 _MAX_AVATAR_BYTES = 2 * 1024 * 1024
@@ -121,13 +131,33 @@ class RecallConnector:
                 json=payload,
                 headers=self._auth_headers(),
             )
+
+            # 429 / 5xx are worth another attempt — hand the caller an
+            # httpx.HTTPStatusError so its retry policy fires.
+            if resp.status_code == 429 or resp.status_code >= 500:
+                logger.warning(
+                    "Recall transient error session=%s status=%s body=%s",
+                    session_id, resp.status_code, resp.text,
+                )
+                resp.raise_for_status()
+
+            # Any other 4xx fails identically on retry — surface it as terminal
+            # with Recall's own error body attached.
             if resp.is_error:
                 logger.error(
                     "Recall bot creation failed session=%s status=%s body=%s",
                     session_id, resp.status_code, resp.text,
                 )
-            resp.raise_for_status()
-            bot_id = resp.json()["id"]
+                raise RecallBotCreationError(
+                    f"Recall returned {resp.status_code}: {resp.text[:500]}"
+                )
+
+            try:
+                bot_id = resp.json()["id"]
+            except (ValueError, KeyError) as exc:
+                raise RecallBotCreationError(
+                    f"Recall response had no bot id: {resp.text[:300]}"
+                ) from exc
 
         self._bot_id = bot_id
         self._store_mapping(bot_id, session_id)

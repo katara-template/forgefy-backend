@@ -60,7 +60,7 @@ export class Forgefy {
     this.baseUrl = (
       options.baseUrl ??
       globalThis.process?.env?.FORGEFY_API_URL ??
-      "https://forgefy.onrender.com"
+      "https://server.forgefy.dev"
     ).replace(/\/$/, "");
     this.maxRetries = options.maxRetries ?? 2;
     this.timeoutMs = options.timeoutMs ?? 120_000;
