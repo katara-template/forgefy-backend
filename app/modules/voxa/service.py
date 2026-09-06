@@ -144,7 +144,11 @@ class VoxaService:
 
         if session.platform != Platform.PHYSICAL:
             from app.workers.connector_worker import dispatch_connector
-            dispatch_connector.apply_async(
+
+            # Through dispatch(): apply_async does a blocking broker round trip
+            # that must not stall the request event loop.
+            await dispatch(
+                dispatch_connector,
                 # user_id lets a self-hosted Zoom bot mint the OBF token it
                 # needs from this user's Zoom grant; Recall ignores it.
                 args=[

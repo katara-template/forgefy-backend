@@ -149,6 +149,14 @@ COPY . .
 # /tmp/.npm is recreated because the Android layer wiped /tmp/*.
 RUN mkdir -p /opt/pub-cache /tmp/.npm && chmod 777 /opt/pub-cache /tmp/.npm
 
+# Liveness: a worker whose broker connection has died still has a running PID
+# and looks healthy to the orchestrator while consuming nothing. `inspect ping`
+# round-trips through the broker, so it only answers if this worker is actually
+# picking up tasks. Shell form on purpose — needs $(hostname) for the nodename.
+HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
+    CMD celery -A app.workers.celery_app:celery_app inspect ping \
+        -d "celery@$(hostname)" > /dev/null 2>&1 || exit 1
+
 # Concurrency is NOT passed here - a --concurrency flag overrides
 # celery_app.conf; it comes from CELERY_CONCURRENCY (default 2).
 CMD ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=info", "-Q", "meeting.audio,meeting.transcribe,meeting.extract,build", "-B", "-s", "/tmp/celerybeat-schedule", "--uid=nobody"]

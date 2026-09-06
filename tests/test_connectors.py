@@ -299,6 +299,52 @@ class TestBotAvatar:
         assert "automatic_video_output" not in payload
 
 
+# ── join() error handling ────────────────────────────────────────────────────
+
+
+class TestRecallJoinErrors:
+    def _join_with_status(self, status_code: int, body: dict | None = None):
+        from app.connectors.recall import RecallConnector
+
+        resp = httpx.Response(
+            status_code,
+            request=httpx.Request("POST", "https://x/bot/"),
+            json=body if body is not None else {"detail": "nope"},
+        )
+        connector = RecallConnector(
+            api_key="fake-key",
+            region="us-east-1",
+            redis_url="redis://test",
+            webhook_base_url="https://api.example.com",
+        )
+        with (
+            patch("app.connectors.recall.httpx.Client") as mock_client_cls,
+            patch.object(connector, "_store_mapping"),
+        ):
+            mock_client_cls.return_value.__enter__.return_value.post.return_value = resp
+            connector.join("https://meet.google.com/abc", "session-1")
+
+    def test_4xx_raises_terminal_error_with_body(self):
+        from app.connectors.recall import RecallBotCreationError
+
+        with pytest.raises(RecallBotCreationError, match="400"):
+            self._join_with_status(400, {"meeting_url": ["invalid"]})
+
+    def test_5xx_raises_httpx_error_so_task_retries(self):
+        with pytest.raises(httpx.HTTPStatusError):
+            self._join_with_status(503)
+
+    def test_429_raises_httpx_error_so_task_retries(self):
+        with pytest.raises(httpx.HTTPStatusError):
+            self._join_with_status(429)
+
+    def test_2xx_without_bot_id_raises_terminal_error(self):
+        from app.connectors.recall import RecallBotCreationError
+
+        with pytest.raises(RecallBotCreationError, match="no bot id"):
+            self._join_with_status(200, {"unexpected": "shape"})
+
+
 # ── delete_media tests ────────────────────────────────────────────────────────
 
 
@@ -350,11 +396,25 @@ class TestConnectorWorker:
 
         mock_connector.join.assert_called_once_with("https://meet.google.com/abc", session_id)
 
-    def test_dispatch_unknown_platform_logs_and_returns(self):
+    def test_dispatch_unknown_platform_fails_session(self):
         from app.workers.connector_worker import dispatch_connector
 
-        # Should not raise
-        dispatch_connector(str(uuid.uuid4()), "discord", None)
+        sid = str(uuid.uuid4())
+        with patch("app.workers.connector_worker._fail_session") as mock_fail:
+            dispatch_connector(sid, "discord", None)  # must not raise
+
+        mock_fail.assert_called_once()
+        assert mock_fail.call_args.args[0] == sid
+
+    def test_dispatch_missing_meeting_url_fails_session(self):
+        from app.workers.connector_worker import dispatch_connector
+
+        sid = str(uuid.uuid4())
+        with patch("app.workers.connector_worker._fail_session") as mock_fail:
+            dispatch_connector(sid, "meet", "   ")  # blank URL
+
+        mock_fail.assert_called_once()
+        assert mock_fail.call_args.args[0] == sid
 
     def test_dispatch_not_implemented_logs_warning(self):
         from app.workers.connector_worker import dispatch_connector
@@ -362,9 +422,64 @@ class TestConnectorWorker:
         mock_connector = MagicMock()
         mock_connector.join.side_effect = NotImplementedError("stub")
 
-        with patch("app.workers.connector_worker.get_connector", return_value=mock_connector):
-            # Should not raise
+        with (
+            patch("app.workers.connector_worker.get_connector", return_value=mock_connector),
+            patch("app.workers.connector_worker._fail_session") as mock_fail,
+        ):
+            # Stub connector: log and return, no retry, no FAILED.
             dispatch_connector(str(uuid.uuid4()), "zoom", "https://zoom.us/j/123")
+
+        mock_fail.assert_not_called()
+
+    def test_dispatch_misconfigured_connector_fails_session_with_alert(self):
+        from app.workers.connector_worker import dispatch_connector
+
+        sid = str(uuid.uuid4())
+        with (
+            patch(
+                "app.workers.connector_worker.get_connector",
+                side_effect=RuntimeError("RECALL_API_KEY is not configured"),
+            ),
+            patch("app.workers.connector_worker._fail_session") as mock_fail,
+        ):
+            dispatch_connector(sid, "meet", "https://meet.google.com/abc")  # must not raise
+
+        mock_fail.assert_called_once()
+        assert mock_fail.call_args.kwargs.get("alert") is not None
+
+    def test_dispatch_recall_rejection_fails_session_without_retry(self):
+        from app.connectors.recall import RecallBotCreationError
+        from app.workers.connector_worker import dispatch_connector
+
+        mock_connector = MagicMock()
+        mock_connector.join.side_effect = RecallBotCreationError("Recall returned 400: bad meeting_url")
+
+        with (
+            patch("app.workers.connector_worker.get_connector", return_value=mock_connector),
+            patch.object(dispatch_connector, "retry") as mock_retry,
+            patch("app.workers.connector_worker._fail_session") as mock_fail,
+        ):
+            dispatch_connector(str(uuid.uuid4()), "meet", "https://meet.google.com/abc")
+
+        mock_retry.assert_not_called()
+        mock_fail.assert_called_once()
+
+    def test_dispatch_transient_error_retries(self):
+        from app.workers.connector_worker import dispatch_connector
+
+        mock_connector = MagicMock()
+        mock_connector.join.side_effect = httpx.ConnectError("boom")
+
+        with (
+            patch("app.workers.connector_worker.get_connector", return_value=mock_connector),
+            patch.object(dispatch_connector, "retry", side_effect=RuntimeError("retried")) as mock_retry,
+            patch("app.workers.connector_worker._fail_session") as mock_fail,
+            pytest.raises(RuntimeError, match="retried"),
+        ):
+            dispatch_connector(str(uuid.uuid4()), "meet", "https://meet.google.com/abc")
+
+        mock_retry.assert_called_once()
+        mock_fail.assert_not_called()
 
 
 class TestRecallDeleteMediaTask:

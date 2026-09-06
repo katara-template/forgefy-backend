@@ -11,7 +11,7 @@ import 'errors.dart';
 import 'models.dart';
 
 const _userAgent = 'forgefy-sdk-dart/0.1.0';
-const _defaultBaseUrl = 'https://forgefy.onrender.com';
+const _defaultBaseUrl = 'https://server.forgefy.dev';
 
 /// Client for the Forgefy Developer API.
 ///
