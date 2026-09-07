@@ -46,9 +46,15 @@ FROM python:3.14-slim AS runtime
 
 WORKDIR /app
 
+# C_FORCE_ROOT: the container runs as root (no USER line) and celery refuses
+# to start as root without it. This replaces the old `--uid=nobody` on the CMD,
+# which failed silently (exit 1, no stdout) under the Cloudflare Containers
+# sandbox. PYTHONFAULTHANDLER dumps a native traceback if the interpreter dies.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONFAULTHANDLER=1 \
+    C_FORCE_ROOT=1
 
 # ---- Base: runtime only. git is used by the build agent and by flutter ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -144,19 +150,27 @@ RUN if [ "$INSTALL_PLAYWRIGHT_BROWSERS" = "true" ]; then \
 # ---- Application -----------------------------------------------------------
 COPY . .
 
-# World-writable caches: the worker runs as --uid=nobody, and both `flutter
-# pub get` (shared packages) and `npm install` (npm_config_cache) write here.
-# /tmp/.npm is recreated because the Android layer wiped /tmp/*.
+# World-writable caches: `flutter pub get` (shared packages) and `npm install`
+# (npm_config_cache) write here. /tmp/.npm is recreated because the Android
+# layer wiped /tmp/*.
 RUN mkdir -p /opt/pub-cache /tmp/.npm && chmod 777 /opt/pub-cache /tmp/.npm
 
 # Liveness: a worker whose broker connection has died still has a running PID
 # and looks healthy to the orchestrator while consuming nothing. `inspect ping`
-# round-trips through the broker, so it only answers if this worker is actually
-# picking up tasks. Shell form on purpose — needs $(hostname) for the nodename.
-HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
-    CMD celery -A app.workers.celery_app:celery_app inspect ping \
-        -d "celery@$(hostname)" > /dev/null 2>&1 || exit 1
+# round-trips through the broker and exits non-zero if no worker replies, so it
+# only passes while this worker is actually reachable for tasks.
+HEALTHCHECK --interval=30s --timeout=20s --start-period=90s --retries=3 \
+    CMD celery -A app.workers.celery_app:celery_app inspect ping > /dev/null 2>&1 || exit 1
 
 # Concurrency is NOT passed here - a --concurrency flag overrides
 # celery_app.conf; it comes from CELERY_CONCURRENCY (default 2).
-CMD ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=info", "-Q", "meeting.audio,meeting.transcribe,meeting.extract,build", "-B", "-s", "/tmp/celerybeat-schedule", "--uid=nobody"]
+#
+# --pool=threads: the default prefork pool needs POSIX semaphores in
+# /dev/shm, which the Cloudflare Containers sandbox does not provide — celery
+# died with a bare `exit 1` and no stdout before the app ever logged. These
+# tasks are I/O-bound (Recall/Deepgram/Firestore HTTP) or shell out to a
+# subprocess for builds, so threads is a fine fit.
+# --without-mingle/--without-gossip: no peer workers to sync with (max 1
+# replica), and mingle adds ~7s of dead time to every restart.
+# -B runs beat in-process (single replica; a 2nd would double-fire schedules).
+CMD ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=info", "--pool=threads", "--without-mingle", "--without-gossip", "-Q", "meeting.audio,meeting.transcribe,meeting.extract,build", "-B", "-s", "/tmp/celerybeat-schedule"]
