@@ -51,16 +51,33 @@ export function buildContainerEnv(
   return containerEnv;
 }
 
-/** Throws with every missing key at once, rather than one deploy at a time. */
+/**
+ * Throws with every missing key at once, rather than one deploy at a time.
+ *
+ * `containerEnv` here is already `buildContainerEnv(this.env)` — i.e. the
+ * handler's `env` binding, the only env a Worker has. So "missing" does not
+ * mean the code read the wrong object; it means the secret is not on THIS
+ * Worker: pushed to a different environment/account, added in the dashboard
+ * as a plaintext var (CLI deploys overwrite those), or `wrangler secret bulk`
+ * was never run. The message lists the names (never values) the adapter can
+ * see so that is unambiguous — if all you see is APP_ENV / PORT /
+ * WEB_CONCURRENCY / PYTHONUNBUFFERED (the wrangler.json `vars`) plus a stray
+ * secret, the bulk upload did not land on this Worker.
+ */
 export function assertRequiredEnv(containerEnv: Record<string, string>): void {
   const missing = REQUIRED_KEYS.filter((key) => !containerEnv[key]);
+  if (missing.length === 0) return;
 
-  if (missing.length > 0) {
-    throw new Error(
-      `Missing required environment variable(s): ${missing.join(", ")}. ` +
-        `Upload them with: wrangler secret bulk ../.env -c wrangler.json`,
-    );
-  }
+  const visible = Object.keys(containerEnv).sort();
+  throw new Error(
+    `Missing required environment variable(s): ${missing.join(", ")}. ` +
+      `The adapter can see ${visible.length} var(s) on this Worker: ` +
+      `${visible.join(", ") || "(none)"}. ` +
+      `If the ones you expect are absent they are not deployed here — run ` +
+      `cloudflare/scripts/push-secrets.ps1 (or ` +
+      `wrangler secret bulk ../.env -c wrangler.json) against the correct ` +
+      `Cloudflare account, then redeploy.`,
+  );
 }
 
 /**
