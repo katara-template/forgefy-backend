@@ -39,6 +39,13 @@ class ForbiddenError(ForgefyError):
     title = "Forbidden"
 
 
+class EmailNotVerifiedError(ForgefyError):
+    """Raised at login when the account's email hasn't been verified yet."""
+
+    status_code = 403
+    title = "Email Not Verified"
+
+
 class ConflictError(ForgefyError):
     status_code = 409
     title = "Conflict"

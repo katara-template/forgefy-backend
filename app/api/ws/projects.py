@@ -88,6 +88,8 @@ def _coerce(d: dict) -> dict:
         "blueprint_id": uuid.UUID(d["blueprint_id"]) if d.get("blueprint_id") else None,
         "preview_url": d.get("preview_url"),
         "artifact_url": d.get("artifact_url"),
+        "published_url": d.get("published_url"),
+        "published_domain": d.get("published_domain"),
         "is_updating": d.get("is_updating", False),
         "build_error": d.get("build_error"),
     }

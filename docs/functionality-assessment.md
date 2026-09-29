@@ -53,6 +53,8 @@ Fixed in this revision:
 | **Build agent (file writing)** | 70% | Claude tool loop works; 60-iteration cap can still truncate very large apps |
 | **GitHub push** | 85% | Standard REST API, token handling correct |
 | **Cloudflare Pages deploy (Next.js)** | 60% | ⚠️ Depends on valid credentials + `next.config.js` patch holding |
+| **Local static preview (no cloud)** | 80% | Set `LOCAL_PREVIEW_ENABLED=true` to serve the compiled artifact over HTTP with no Cloudflare account. Static files only — SSR/API routes are not reproduced |
+
 | **Appetize preview (Flutter)** | 55% | ⚠️ APK build in Docker is the risky step |
 | **Expo Snack preview (React Native)** | 45% | ⚠️ Expo Snack API is flaky; file size limits bite on large projects |
 | **Project editor (prompt → update)** | 80% | Update agent + GitHub push; failures now surface via `build_error` |

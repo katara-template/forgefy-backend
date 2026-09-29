@@ -361,37 +361,94 @@ async function handleAdmin(request: Request, workerEnv: Env, url: URL): Promise<
 
 export default {
   /** Everything that is not an adapter route goes to the API container. */
+  // async fetch(request: Request, workerEnv: Env): Promise<Response> {
+  //   const startedAt = Date.now();
+  //   const requestedUrl = request.url;
+  //   // Observe the request up front so a failing path is still attributable to
+  //   // the method + URL even if everything below throws.
+  //   console.log(`[cf] request ${request.method} ${requestedUrl}`);
+
+  //   try {
+  //     const url = new URL(requestedUrl);
+
+  //     if (url.pathname.startsWith("/__cf/")) {
+  //       return await handleAdmin(request, workerEnv, url);
+  //     }
+
+  //     // Stateless spread across the pool. Cross-instance fan-out for WebSockets
+  //     // is handled by Redis pub/sub inside the app, so any instance can serve
+  //     // any client. The stub's fetch() reaches ApiContainer.fetch(), which
+  //     // auto-starts the container and proxies through containerFetch() — that
+  //     // path accepts both WebSocketPair ends, so /ws/* upgrades still work.
+  //     console.log(`[cf] getRandom(API_CONTAINER) before for ${request.method} ${url.pathname}`);
+  //     const api = await getRandom(workerEnv.API_CONTAINER, API_POOL_SIZE);
+  //     console.log(`[cf] getRandom(API_CONTAINER) after -> stub selected`);
+
+  //     console.log(`[cf] API_CONTAINER.fetch() before for ${request.method} ${url.pathname}`);
+  //     // The DO's ApiContainer.fetch() handles cold-start + retry internally, so
+  //     // this is a straight proxy — no Worker-level retry wrapper needed.
+  //     const res = await api.fetch(request);
+  //     console.log(
+  //       `[cf] API_CONTAINER.fetch() after -> status=${res.status} (${Date.now() - startedAt}ms) for ${request.method} ${url.pathname}`,
+  //     );
+  //     return res;
+  //   } catch (e) {
+  //     const err = e instanceof Error ? e : new Error(String(e));
+  //     console.error(`[cf] unhandled exception for ${request.method} ${requestedUrl}`, {
+  //       message: err.message,
+  //       stack: err.stack,
+  //       elapsedMs: Date.now() - startedAt,
+  //     });
+  //     return new Response(
+  //       JSON.stringify({ error: err.message, stack: err.stack }),
+  //       {
+  //         status: 500,
+  //         headers: { "content-type": "application/json" },
+  //       },
+  //     );
+  //   }
+  // },
   async fetch(request: Request, workerEnv: Env): Promise<Response> {
     const startedAt = Date.now();
     const requestedUrl = request.url;
-    // Observe the request up front so a failing path is still attributable to
-    // the method + URL even if everything below throws.
-    console.log(`[cf] request ${request.method} ${requestedUrl}`);
+    const requestOrigin = request.headers.get("Origin");
+    const allowedOrigins = JSON.parse(String(workerEnv.CORS_ORIGINS ?? "[]")) as string[];
+    const isAllowedOrigin = !!requestOrigin && allowedOrigins.includes(requestOrigin);
 
+    console.log(`[cf] request ${request.method} ${requestedUrl}`);
     try {
       const url = new URL(requestedUrl);
-
       if (url.pathname.startsWith("/__cf/")) {
         return await handleAdmin(request, workerEnv, url);
       }
 
-      // Stateless spread across the pool. Cross-instance fan-out for WebSockets
-      // is handled by Redis pub/sub inside the app, so any instance can serve
-      // any client. The stub's fetch() reaches ApiContainer.fetch(), which
-      // auto-starts the container and proxies through containerFetch() — that
-      // path accepts both WebSocketPair ends, so /ws/* upgrades still work.
-      console.log(`[cf] getRandom(API_CONTAINER) before for ${request.method} ${url.pathname}`);
-      const api = await getRandom(workerEnv.API_CONTAINER, API_POOL_SIZE);
-      console.log(`[cf] getRandom(API_CONTAINER) after -> stub selected`);
+      // ── CORS ──
+      const origin = requestOrigin || "";
+      const isAllowed = isAllowedOrigin ?? false;
 
-      console.log(`[cf] API_CONTAINER.fetch() before for ${request.method} ${url.pathname}`);
-      // The DO's ApiContainer.fetch() handles cold-start + retry internally, so
-      // this is a straight proxy — no Worker-level retry wrapper needed.
+      // Handle preflight
+      if (request.method === "OPTIONS") {
+        const headers: Record<string, string> = {};
+        if (isAllowed) {
+          headers["Access-Control-Allow-Origin"] = origin;
+          headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
+          headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With";
+          headers["Access-Control-Allow-Credentials"] = "true";
+          headers["Access-Control-Max-Age"] = "86400";
+        }
+        return new Response(null, { status: 204, headers });
+      }
+
+      const api = await getRandom(workerEnv.API_CONTAINER, API_POOL_SIZE);
       const res = await api.fetch(request);
-      console.log(
-        `[cf] API_CONTAINER.fetch() after -> status=${res.status} (${Date.now() - startedAt}ms) for ${request.method} ${url.pathname}`,
-      );
-      return res;
+
+      // Add CORS headers to the response
+      const newHeaders = new Headers(res.headers);
+      if (isAllowed) {
+        newHeaders.set("Access-Control-Allow-Origin", origin);
+        newHeaders.set("Access-Control-Allow-Credentials", "true");
+      }
+      return new Response(res.body, { status: res.status, headers: newHeaders });
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e));
       console.error(`[cf] unhandled exception for ${request.method} ${requestedUrl}`, {
@@ -399,16 +456,20 @@ export default {
         stack: err.stack,
         elapsedMs: Date.now() - startedAt,
       });
-      return new Response(
-        JSON.stringify({ error: err.message, stack: err.stack }),
-        {
-          status: 500,
-          headers: { "content-type": "application/json" },
+      return new Response(JSON.stringify({ error: err.message, stack: err.stack }), {
+        status: 500,
+        headers: {
+          "content-type": "application/json",
+          ...(isAllowedOrigin && requestOrigin
+            ? {
+                "Access-Control-Allow-Origin": requestOrigin,
+                "Access-Control-Allow-Credentials": "true",
+              }
+            : {}),
         },
-      );
+      });
     }
   },
-
   /**
    * Supervisor tick (every 2 minutes, see `triggers.crons` in wrangler.json).
    * The worker keeps itself awake; this only recovers it after a
@@ -440,3 +501,4 @@ export default {
     );
   },
 };
+

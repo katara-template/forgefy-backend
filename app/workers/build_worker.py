@@ -129,6 +129,13 @@ def _kill_agent_jobs(workspace_path: Path) -> None:
         kill_all_jobs(workspace_path)
     except Exception as exc:  # noqa: BLE001 — cleanup must never mask the outcome
         logger.warning("Could not stop background jobs: %s", exc)
+    # Also terminate any Claude Code processes wedged in this workspace.
+    try:
+        from app.build.agents.claude_code import kill_workspace_claude
+
+        kill_workspace_claude(workspace_path)
+    except Exception as exc:  # noqa: BLE001 — cleanup must never mask the outcome
+        logger.warning("Could not stop Claude Code processes: %s", exc)
 
 
 def _run_agent_fix(
@@ -140,27 +147,33 @@ def _run_agent_fix(
     settings,
     log_fn,
     retry_hint: bool = False,
+    agent_key: str = "forgefy",
+    claude_code_model: str | None = None,
 ) -> str:
     """Run the executor-only fix agent to repair compilation errors.
 
     Returns the agent's summary string so callers can detect iteration-limit failures.
     Deliberately bypasses the full Plan→Design→Execute→Validate→Security pipeline —
-    a compile error fix needs only the executor, not five agents.
+    a compile error fix needs only the executor, not five agents. Routes through
+    the selected coding agent (Forgefy or Claude Code) so both agents are fixed by
+    whichever one built the project.
     """
     fix_prompt = _make_fix_prompt_with_hint(error_msg, template_key, retry_hint)
 
-    # One entry point for every BUILD_MODEL: the adapter resolves internally
-    # (Part L). The fix pass is executor-only by design — a compile error fix
-    # needs only the executor, not five agents.
-    from app.build.build_agent import run_fix_agent
+    from app.build.agents import get_coding_agent
 
-    summary, _ = run_fix_agent(
+    agent = get_coding_agent(agent_key)
+    summary, _ = agent.run_fix(
         workspace=workspace_path,
         prompt=fix_prompt,
         app_name=app_name,
         template_key=template_key,
         log_fn=log_fn,
+        claude_code_model=claude_code_model,
     )
+    lowered = (summary or "").strip().lower()
+    if "iteration limit" in lowered or "max_turns" in lowered:
+        return "iteration limit"
     return summary or ""
 
 
@@ -170,11 +183,19 @@ def _slugify(name: str) -> str:
 
 
 def _cf_project_name(name: str) -> str:
-    """Cloudflare Pages project names: lowercase, alphanumeric + hyphens, max 28 chars."""
-    slug = re.sub(r"[^a-z0-9-]", "-", name.lower())
-    slug = re.sub(r"-+", "-", slug).strip("-")
-    return (slug or "forgefy-app")[:28].rstrip("-")
-def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
+    """Cloudflare Pages project names: lowercase, alphanumeric + hyphens, max 28 chars.
+
+    Delegates to the shared slug helper so the Pages project name and the
+    published subdomain label can never drift apart.
+    """
+    from app.build.cloudflare_pages import slugify_name
+
+    return slugify_name(name)
+
+
+def _deploy_cloudflare_pages(
+    build_dir: Path, project_name: str, *, production: bool = False
+) -> str | None:
     import os
     import subprocess
 
@@ -209,12 +230,14 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
         else:
             logger.info("Cloudflare Pages project '%s' may already exist: %s", cf_name, create_output[-300:])
 
-        # Step 2: Deploy as preview (non-production branch)
+        # Step 2: Deploy. `--branch main` (the project's production branch) makes
+        # this a *production* deployment — what publishing ships. Anything else
+        # lands as a preview deployment.
         result = subprocess.run(
             [
                 "npx", "--yes", "wrangler@3", "pages", "deploy", str(build_dir),
                 "--project-name", cf_name,
-                "--branch", "preview",
+                "--branch", "main" if production else "preview",
                 "--commit-dirty", "true",
             ],
             capture_output=True, text=True, env=env, timeout=180,
@@ -243,6 +266,39 @@ def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
         print(f"Wrangler deploy failed: {exc}")
         logger.warning("Cloudflare Pages deploy failed (non-fatal): %s", exc)
         return None
+
+
+def _deploy_web_preview(build_dir: Path, project_name: str, settings: Any) -> str | None:
+    """Deploy a compiled web artifact, preferring Cloudflare Pages.
+
+    Falls back to the local static preview server (app/build/preview_server.py)
+    when Cloudflare isn't configured or the deploy fails — so a web app still
+    gets a preview with no cloud account at all.
+    """
+    url = _deploy_cloudflare_pages(build_dir, project_name)
+    if url:
+        return url
+    from app.build.preview_server import deploy_local_preview
+
+    return deploy_local_preview(build_dir, project_name, settings)
+
+
+def _publish_domain(app_name: str, project_id: str, settings: Any) -> str | None:
+    """Attach ``<slug>.<PUBLISH_BASE_DOMAIN>`` to the app's Pages project.
+
+    Returns the domain, or ``None`` when publishing has no base domain configured
+    (or the name could not be attached) — the caller then falls back to the
+    project's ``*.pages.dev`` URL.
+    """
+    from app.build.cloudflare_pages import publish_domain
+
+    return publish_domain(
+        app_name,
+        project_id,
+        settings.PUBLISH_BASE_DOMAIN,
+        account_id=settings.CLOUDFLARE_ACCOUNT_ID,
+        api_token=settings.CLOUDFLARE_API_TOKEN,
+    )
 
 # def _deploy_cloudflare_pages(build_dir: Path, project_name: str) -> str | None:
 #     """Deploy to Cloudflare Pages. Returns the preview URL on success.
@@ -748,16 +804,47 @@ async def _run(session_id: str, project_id: str) -> dict:
         syncer = WorkspaceAutoSync(workspace, push_url, label="build")
         syncer.start()
 
-        # 9. Run build agent — model selected by BUILD_MODEL (independent of BP_MODEL);
-        # the adapter resolves internally (Part L).
-        from app.build.build_agent import run_build_agent
+        # 9. Run the selected coding agent — model selected by BUILD_MODEL
+        # (independent of BP_MODEL); the agent abstraction resolves internally.
+        # The agent comes from the project/blueprint "agent" field (default forgefy),
+        # so Claude Code and Forgefy participate in the exact same pipeline.
+        from app.build.agents import resolve_agent
+        from app.build.cancel import is_cancelled
 
-        summary, tokens_used = run_build_agent(
+        # Agent selection: blueprint first, then the project's persisted choice,
+        # falling back to the default (forgefy). The frontend records the choice on
+        # the project before queuing a build/update.
+        _bp_agent = bp.get("agent") or (json_output or {}).get("agent")
+        _proj_agent: str | None = None
+        _proj_claude_code_model: str | None = None
+        try:
+            _proj_doc = await db.collection("projects").document(project_id).get()
+            if _proj_doc.exists:
+                _proj_data = _proj_doc.to_dict() or {}
+                _proj_agent = _proj_data.get("agent")
+                _proj_claude_code_model = _proj_data.get("claude_code_model") or None
+        except Exception:  # noqa: BLE001 — best-effort; default to forgefy
+            _proj_agent = None
+            _proj_claude_code_model = None
+        agent_key = resolve_agent(_bp_agent or _proj_agent)
+        if not bp.get("agent"):
+            await _patch_blueprint(blueprint_id, {"agent": agent_key})
+        log_fn("info", f"Using {agent_key} agent…")
+
+        def build_cancel_fn() -> bool:
+            return is_cancelled(settings.REDIS_URL, session_id)
+
+        from app.build.agents import get_coding_agent
+
+        agent = get_coding_agent(agent_key)
+        summary, tokens_used = agent.run_build(
             workspace=workspace.path,
             blueprint=json_output,
             app_name=app_name,
             template_key=template_key,
             log_fn=log_fn,
+            cancel_fn=build_cancel_fn,
+            claude_code_model=_proj_claude_code_model,
         )
         logger.info("Build agent used %d tokens session=%s", tokens_used, session_id)
 
@@ -822,6 +909,8 @@ async def _run(session_id: str, project_id: str) -> dict:
                 blueprint=json_output,
                 settings=settings,
                 log_fn=log_fn,
+                agent_key=agent_key,
+                claude_code_model=_proj_claude_code_model,
             )
             _still_hit, _ = demo_screen_present(workspace.path, template_key)
             if _still_hit:
@@ -884,7 +973,7 @@ async def _run(session_id: str, project_id: str) -> dict:
                     retry_context = " (same error — trying a different approach)" if _same_err_streak > 0 else ""
                     log_fn("info", f"Compilation failed — running auto-fix (attempt {_fix_attempt}){retry_context}…")
                     logger.warning("Auto-fix triggered session=%s attempt=%d streak=%d: %s", session_id, _fix_attempt, _same_err_streak, _err[:200])
-                    fix_summary = _run_agent_fix(workspace.path, _err, template_key, app_name, json_output, settings, log_fn, retry_hint=_same_err_streak > 0)
+                    fix_summary = _run_agent_fix(workspace.path, _err, template_key, app_name, json_output, settings, log_fn, retry_hint=_same_err_streak > 0, agent_key=agent_key, claude_code_model=_proj_claude_code_model)
                     hit_limit = "iteration limit" in fix_summary.lower()
                     workspace.commit_all("fix: auto-fix compilation errors")
                     workspace.push(push_url)
@@ -898,7 +987,7 @@ async def _run(session_id: str, project_id: str) -> dict:
                             raise _BuildFixExhausted(
                                 f"Fix agent hit iteration limit {_hit_limit_streak} times consecutively"
                             ) from _compile_exc
-                        log_fn("warning", "Fix agent hit its iteration limit — partial changes saved, retrying compilation…")
+                        log_fn("warning", "Fix agent hit its iteration limit — retrying compilation…")
                         _same_err_streak += 1
                     else:
                         _hit_limit_streak = 0
@@ -910,13 +999,8 @@ async def _run(session_id: str, project_id: str) -> dict:
                     if settings.APPETIZE_API_TOKEN:
                         preview_url = _deploy_appetize(artifact_path, settings.APPETIZE_API_TOKEN)
 
-                elif template_key == "next" and artifact_path.is_dir():
-                    preview_url = _deploy_cloudflare_pages(artifact_path, app_name)
-
-                elif template_key == "react_native" and artifact_path.is_dir():
-                    cf_url = _deploy_cloudflare_pages(artifact_path, app_name)
-                    if cf_url:
-                        preview_url = cf_url
+                elif template_key in ("next", "react_native") and artifact_path.is_dir():
+                    preview_url = _deploy_web_preview(artifact_path, app_name, settings)
 
                 if settings.CLOUDINARY_CLOUD_NAME:
                     artifact_url = _upload_artifact(artifact_path, session_id)
@@ -1019,10 +1103,10 @@ async def _run(session_id: str, project_id: str) -> dict:
     except Exception as exc:
         # Last chance to save the agent's work: `finally` deletes the workspace.
         # No-op when the failure happened before the repo existed.
+        # Silent by design: the workspace→GitHub sync is background data-safety,
+        # not work the user asked for — it never posts to the build feed.
         if syncer is not None:
-            saved = syncer.stop("chore: partial build (run did not complete)")
-            if saved or syncer.pushed_anything:
-                log_fn("info", "Partial code was saved to GitHub before the failure.")
+            syncer.stop("chore: partial build (run did not complete)")
 
         from app.core.build_errors import GENERIC_OPERATOR_MESSAGE, sanitize_build_error
         build_err = sanitize_build_error(exc)
@@ -1078,8 +1162,13 @@ def run_build(self, session_id: str, project_id: str) -> dict:
         loop.close()
 
 
-async def _run_preview(project_id: str, user_id: str) -> dict:
-    """Clone the project repo, compile, deploy preview, update Firestore."""
+async def _run_preview(project_id: str, user_id: str, *, publish: bool = False) -> dict:
+    """Clone the project repo, compile, deploy, update Firestore.
+
+    ``publish=True`` ships a *production* Cloudflare Pages deployment and attaches
+    the app's stable ``<slug>.<PUBLISH_BASE_DOMAIN>`` subdomain. The default
+    (``False``) is the throwaway preview deployment.
+    """
     from app.build.build_logger import make_log_publisher
     from app.build.github_token import get_valid_github_token
     from app.build.workspace import EditWorkspace
@@ -1101,6 +1190,13 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         raise ValueError(f"Project {project_id} not found")
     project_data = doc.to_dict()
 
+    # The preview only compiles/fixes (it never runs the main agent), but the
+    # auto-fix pass must use whichever agent built the project.
+    from app.build.agents import resolve_agent
+
+    agent_key = resolve_agent(project_data.get("agent"))
+    claude_code_model = project_data.get("claude_code_model") or None
+
     repo_full_name: str = project_data["repo_full_name"]
     template_key: str = project_data.get("template_key", "next")
     app_name: str = project_data["app_name"]
@@ -1108,6 +1204,24 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
 
     github_token = await get_valid_github_token(user_id, settings.GITHUB_TOKEN)
     log_fn = make_log_publisher(project_id, settings.REDIS_URL)
+
+    # No GitHub repo means the initial build never reached the push step, so
+    # there is nothing to clone. Fail fast instead of letting
+    # EditWorkspace.ensure() attempt `git clone https://…@github.com/.git`.
+    if not repo_full_name:
+        msg = (
+            "This project hasn't been published to GitHub yet — its first build "
+            "didn't finish. Re-run the build before building a preview."
+        )
+        log_fn("error", msg)
+        await db.collection("projects").document(project_id).update({
+            "is_updating": False,
+            "build_error": msg,
+            "build_error_action": "retry",
+            "updated_at": datetime.now(UTC),
+        })
+        logger.warning("Preview skipped — project %s has no repo_full_name", project_id)
+        return {}
     stack_label = {"flutter": "Flutter", "react_native": "React Native", "next": "Next.js"}.get(template_key, template_key)
 
     # Mark project as busy so the frontend log panel activates and the WebSocket
@@ -1117,7 +1231,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         "build_error": None,
         "updated_at": datetime.now(UTC),
     })
-    log_fn("started", f"Building preview for {app_name}…")
+    log_fn("started", f"Publishing {app_name}…" if publish else f"Building preview for {app_name}…")
 
     workspace = EditWorkspace(uuid.UUID(project_id), repo_full_name, github_token)
     push_url = f"https://{github_token}@github.com/{repo_full_name}.git"
@@ -1185,7 +1299,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
                 retry_context = " (same error — trying a different approach)" if _same_err_streak > 0 else ""
                 log_fn("info", f"Compilation failed — running auto-fix (attempt {_fix_attempt}){retry_context}…")
                 logger.warning("Auto-fix triggered project=%s attempt=%d streak=%d: %s", project_id, _fix_attempt, _same_err_streak, _err[:200])
-                fix_summary = _run_agent_fix(workspace.path, _err, template_key, app_name, blueprint, settings, log_fn, retry_hint=_same_err_streak > 0)
+                fix_summary = _run_agent_fix(workspace.path, _err, template_key, app_name, blueprint, settings, log_fn, retry_hint=_same_err_streak > 0, agent_key=agent_key, claude_code_model=claude_code_model)
                 hit_limit = "iteration limit" in fix_summary.lower()
                 # Through the syncer so it shares the lock with the background
                 # checkpoints and cannot run git concurrently with one.
@@ -1200,7 +1314,7 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
                         raise _BuildFixExhausted(
                             f"Fix agent hit iteration limit {_hit_limit_streak} times consecutively"
                         ) from _compile_exc
-                    log_fn("warning", "Fix agent hit its iteration limit — partial changes saved, retrying compilation…")
+                    log_fn("warning", "Fix agent hit its iteration limit — retrying compilation…")
                     _same_err_streak += 1
                 else:
                     _hit_limit_streak = 0
@@ -1208,18 +1322,31 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
 
         preview_url: str | None = None
         artifact_url: str | None = None
+        published_url: str | None = None
+        published_domain: str | None = None
 
         if artifact_path:
-            log_fn("info", "Compilation successful — deploying preview…")
+            log_fn("info", "Compilation successful — deploying…")
 
             try:
                 if template_key == "flutter" and artifact_path.is_file() and settings.APPETIZE_API_TOKEN:
                     preview_url = _deploy_appetize(artifact_path, settings.APPETIZE_API_TOKEN)
                 elif template_key in ("next", "react_native") and artifact_path.is_dir():
-                    preview_url = _deploy_cloudflare_pages(artifact_path, app_name)
+                    if publish:
+                        # Production deploy + the app's stable subdomain. Cloudflare
+                        # is required here — the local preview server cannot serve a
+                        # public subdomain.
+                        preview_url = _deploy_cloudflare_pages(artifact_path, app_name, production=True)
+                        if preview_url:
+                            published_domain = _publish_domain(app_name, project_id, settings)
+                            published_url = (
+                                f"https://{published_domain}" if published_domain else preview_url
+                            )
+                    else:
+                        preview_url = _deploy_web_preview(artifact_path, app_name, settings)
             except Exception as deploy_exc:
-                logger.warning("Cloudflare deploy failed project=%s: %s", project_id, deploy_exc)
-                log_fn("warning", f"Preview deployment failed:\n{deploy_exc}")
+                logger.warning("Deploy failed project=%s: %s", project_id, deploy_exc)
+                log_fn("warning", f"Deployment failed:\n{deploy_exc}")
 
             if settings.CLOUDINARY_CLOUD_NAME:
                 artifact_url = _upload_artifact(artifact_path, session_id)
@@ -1230,16 +1357,27 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
         updates: dict = {"is_updating": False, "updated_at": now}
         if preview_url:
             updates["preview_url"] = preview_url
-            log_fn("done", f"Preview deployed → {preview_url}")
+            log_fn("done", f"Deployed → {preview_url}")
         elif artifact_path and not preview_url:
             # Artifact compiled fine but deploy returned None — credentials not configured
-            log_fn("info", "Preview not deployed — Cloudflare credentials not configured on this server.")
+            log_fn("info", "Preview not deployed — no Cloudflare credentials and local preview is disabled.")
+        if published_url:
+            updates["published_url"] = published_url
+            updates["published_domain"] = published_domain
+            updates["published_at"] = now
+            log_fn("done", f"Published → {published_url}")
+            if not published_domain:
+                log_fn("info", "No custom subdomain attached — set PUBLISH_BASE_DOMAIN to serve this app on your own domain.")
         if artifact_url:
             updates["artifact_url"] = artifact_url
 
         syncer.stop()
         await db.collection("projects").document(project_id).update(updates)
-        return {"preview_url": preview_url, "artifact_url": artifact_url}
+        return {
+            "preview_url": preview_url,
+            "published_url": published_url,
+            "artifact_url": artifact_url,
+        }
 
     except _BuildFixExhausted as exc:
         syncer.stop("chore: preview stopped after auto-fix attempts")
@@ -1259,8 +1397,9 @@ async def _run_preview(project_id: str, user_id: str) -> dict:
 
     except Exception as exc:
         # `finally` deletes the workspace — save any fix-agent output first.
-        if syncer.stop("chore: partial preview fixes (run did not complete)") or syncer.pushed_anything:
-            log_fn("info", "Partial fixes were saved to GitHub before the failure.")
+        # Silent by design: the workspace→GitHub sync is background data-safety,
+        # not work the user asked for — it never posts to the build feed.
+        syncer.stop("chore: partial preview fixes (run did not complete)")
 
         from app.core.build_errors import GENERIC_OPERATOR_MESSAGE, sanitize_build_error
         build_err = sanitize_build_error(exc)
@@ -1297,5 +1436,21 @@ def build_preview(self, project_id: str, user_id: str) -> dict:
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(_run_preview(project_id, user_id))
+    finally:
+        loop.close()
+
+
+@celery_app.task(name="app.workers.build_worker.publish_project", bind=True, max_retries=0)
+def publish_project(self, project_id: str, user_id: str) -> dict:
+    """Celery entry point — production deploy to the app's stable subdomain.
+
+    Same clone → compile → auto-fix pipeline as a preview, but the artifact ships
+    as a Cloudflare Pages *production* deployment and gets the
+    ``<slug>.<PUBLISH_BASE_DOMAIN>`` custom domain attached.
+    """
+    logger.info("Publish task started project=%s", project_id)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_run_preview(project_id, user_id, publish=True))
     finally:
         loop.close()

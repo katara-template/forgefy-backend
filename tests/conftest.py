@@ -90,6 +90,21 @@ def _default_under_quota():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_real_omnisend_calls():
+    """Block every test from reaching the real Omnisend API.
+
+    OMNISEND_API_KEY is a real credential in the local .env, and any test that
+    doesn't override Settings (most of them) picks it up verbatim. Without
+    this, a test that merely exercises registration/OAuth signup would write
+    a real contact into the live Omnisend account. Tests that want to assert
+    on the call still can — patch() calls inside a test body nest over this
+    and take priority for their scope.
+    """
+    with patch("app.integrations.omnisend.upsert_contact", new=AsyncMock()):
+        yield
+
+
 @pytest.fixture
 def test_user() -> User:
     """A minimal User object for auth-protected endpoint tests."""

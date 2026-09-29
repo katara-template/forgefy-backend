@@ -9,7 +9,14 @@ from typing import Any
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from app.core.build_model import VALID_BUILD_MODELS, get_effective_build_model, get_user_build_model
+from app.core.build_model import (
+    BuildModelDef,
+    coerce_build_model,
+    get_available_build_models,
+    get_effective_build_model,
+    get_user_build_model,
+    get_valid_build_model_keys,
+)
 from app.core.exceptions import ValidationError
 from app.deps import CurrentUser, DBSession
 
@@ -48,14 +55,34 @@ async def set_my_build_model(
 
     settings = get_settings()
 
-    if body.model is not None and body.model not in VALID_BUILD_MODELS:
-        raise ValidationError(f"Invalid model '{body.model}'. Choose from: {', '.join(VALID_BUILD_MODELS)}")
+    if body.model is not None:
+        valid = await get_valid_build_model_keys(db, settings)
+        if body.model not in valid:
+            raise ValidationError(
+                f"Invalid model '{body.model}'. Choose from: {', '.join(sorted(valid))}"
+            )
 
     await db.collection("users").document(str(user.id)).set(
         {"build_model": body.model}, merge=True
     )
     effective = body.model or await get_effective_build_model(db, settings, user_id=str(user.id))
     return BuildModelResponse(model=effective, is_custom=bool(body.model))
+
+
+@router.get("/build-models", response_model=list[BuildModelDef])
+async def list_my_available_build_models(
+    db: DBSession,
+    user: CurrentUser,
+) -> list[BuildModelDef]:
+    """Return the build models users can select from (admin-curated catalogue).
+
+    This is the single source of truth for the model picker in the user-facing
+    app — admins add/remove entries from the dashboard, and they show up here.
+    """
+    from app.config import get_settings
+
+    models = await get_available_build_models(db, get_settings())
+    return [coerce_build_model(m) for m in models]
 
 
 # ---------------------------------------------------------------------------

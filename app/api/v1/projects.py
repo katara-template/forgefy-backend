@@ -20,11 +20,56 @@ from app.schemas.project import (
     ChatResponse,
     ConnectSupabaseRequest,
     ProjectOut,
+    ProjectPatchRequest,
     UpdateProjectRequest,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _validate_agent(agent: str | None) -> str | None:
+    """Return a canonical agent key or raise a ValidationError.
+
+    ``None`` → caller keeps the current value. Unknown strings are rejected so a
+    typo surfaces as a 422-style validation error instead of being silently
+    stored and mis-routed at build time.
+    """
+    from app.build.agents import SUPPORTED_AGENTS
+
+    if agent is None:
+        return None
+    value = agent.strip().lower()
+    if value not in SUPPORTED_AGENTS:
+        raise ValidationError(
+            f"Invalid coding agent {agent!r}. Supported agents: {', '.join(SUPPORTED_AGENTS)}."
+        )
+    return value
+
+
+# Translation-proxy backends the Claude Code agent can drive. Each maps to an
+# Anthropic-compatible endpoint that converts Anthropic API calls to the target
+# provider. "anthropic" is direct; the rest go through a proxy (LiteLLM,
+# OpenRouter, Ollama, etc.).
+CLAUDE_CODE_BACKENDS: tuple[str, ...] = (
+    "anthropic",
+    "openrouter",
+    "ollama",
+    "litellm",
+    "custom",
+)
+
+
+def _validate_claude_code_backend(backend: str | None) -> str | None:
+    """Return a canonical Claude Code backend key or raise ValidationError."""
+    if backend is None:
+        return None
+    value = backend.strip().lower()
+    if value not in CLAUDE_CODE_BACKENDS:
+        raise ValidationError(
+            f"Invalid Claude Code backend {backend!r}. Supported backends: {', '.join(CLAUDE_CODE_BACKENDS)}."
+        )
+    return value
 
 
 def _doc_to_out(doc) -> ProjectOut:
@@ -43,6 +88,9 @@ def _doc_to_out(doc) -> ProjectOut:
         blueprint_id=uuid.UUID(d["blueprint_id"]) if d.get("blueprint_id") else None,
         preview_url=d.get("preview_url"),
         artifact_url=d.get("artifact_url"),
+        published_url=d.get("published_url"),
+        published_domain=d.get("published_domain"),
+        published_at=d.get("published_at"),
         is_updating=d.get("is_updating", False),
         build_error=d.get("build_error"),
         build_error_action=d.get("build_error_action"),
@@ -63,6 +111,9 @@ def _doc_to_out(doc) -> ProjectOut:
         db_schema_tables=d.get("db_schema_tables"),
         db_status=d.get("db_status"),
         db_schema_error=d.get("db_schema_error"),
+        agent=d.get("agent", "forgefy"),
+        claude_code_backend=d.get("claude_code_backend"),
+        claude_code_model=d.get("claude_code_model"),
     )
 
 
@@ -336,6 +387,12 @@ async def update_project(
     if project.is_updating:
         raise ValidationError("A build or update is already in progress.")
 
+    if body.agent is not None:
+        validated_agent = _validate_agent(body.agent)
+        await db.collection("projects").document(str(project_id)).update(
+            {"agent": validated_agent, "updated_at": datetime.now(UTC)}
+        )
+
     from app.workers.update_worker import apply_update
     await dispatch(
         apply_update,
@@ -343,6 +400,46 @@ async def update_project(
         queue="build",
     )
     return {"status": "queued"}
+
+
+@router.patch("/{project_id}", response_model=ProjectOut)
+async def patch_project(
+    project_id: uuid.UUID,
+    body: ProjectPatchRequest,
+    db: DBSession,
+    user: CurrentUser,
+) -> ProjectOut:
+    """Persist build-free project-field updates (e.g. the coding agent).
+
+    Unlike ``POST /{project_id}/update`` this never dispatches a build — it only
+    writes the fields that are actually present in ``body`` and returns the
+    updated project. Unknown/invalid values are rejected with a ValidationError
+    so the UI gets a clean 422 instead of a silent no-op.
+    """
+    project = await _get_owned(project_id, user.id, db)
+
+    if body.agent is not None:
+        validated_agent = _validate_agent(body.agent)
+        await db.collection("projects").document(str(project_id)).update(
+            {"agent": validated_agent, "updated_at": datetime.now(UTC)}
+        )
+        project = await _get_owned(project_id, user.id, db)
+    if body.claude_code_backend is not None:
+        validated_backend = _validate_claude_code_backend(body.claude_code_backend)
+        await db.collection("projects").document(str(project_id)).update(
+            {"claude_code_backend": validated_backend, "updated_at": datetime.now(UTC)}
+        )
+        project = await _get_owned(project_id, user.id, db)
+    if body.claude_code_model is not None:
+        model = body.claude_code_model.strip()
+        if not model:
+            raise ValidationError("Claude Code model cannot be empty.")
+        await db.collection("projects").document(str(project_id)).update(
+            {"claude_code_model": model, "updated_at": datetime.now(UTC)}
+        )
+        project = await _get_owned(project_id, user.id, db)
+
+    return project
 
 
 @router.post("/{project_id}/chat", response_model=ChatResponse)
@@ -366,6 +463,14 @@ async def chat_with_project(
 
     if not message:
         return ChatResponse(type="chat", response="I didn't catch that — what would you like to do?")
+
+    # Persist the selected coding agent (when provided) so any build/update this
+    # message queues uses it — and future rebuilds remember it.
+    if body.agent is not None:
+        validated_agent = _validate_agent(body.agent)
+        await db.collection("projects").document(str(project_id)).update(
+            {"agent": validated_agent, "updated_at": datetime.now(UTC)}
+        )
 
     db_connected = bool(
         project.supabase_project_ref or project.neon_project_id or project.firebase_project_id
@@ -556,6 +661,8 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
 
     log_fn("thinking", "Analysing your request…")
 
+    from app.core.build_model import deepseek_model_for, is_deepseek_key
+
     try:
         if settings.BUILD_MODEL == "Qwen3":
             import asyncio
@@ -633,6 +740,30 @@ OUTPUT — reply ONLY with valid JSON, no extra text:
                 return (resp.choices[0].message.content or "").strip()
 
             raw = await asyncio.to_thread(_openai_classify)
+
+        elif is_deepseek_key(settings.BUILD_MODEL or ""):
+            import asyncio
+
+            def _deepseek_classify():
+                # DeepSeek's own endpoint — the OpenAI-compatible API keyed by
+                # DEEPSEEK_API_KEY, not the OpenRouter route. Honours a
+                # `deepseek:<id>` pin the same way the build agent does.
+                from openai import OpenAI
+
+                from app.build.provider_loop import DEEPSEEK_BASE_URL
+
+                client = OpenAI(api_key=settings.DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+                resp = client.chat.completions.create(
+                    model=deepseek_model_for(settings.BUILD_MODEL, settings.DEEPSEEK_MODEL),
+                    max_tokens=4096,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": message},
+                    ],
+                )
+                return (resp.choices[0].message.content or "").strip()
+
+            raw = await asyncio.to_thread(_deepseek_classify)
 
         else:
             import anthropic
@@ -799,6 +930,46 @@ async def trigger_preview_build(
     from app.workers.build_worker import build_preview
     await dispatch(
         build_preview,
+        args=[str(project_id), str(user.id)],
+        queue="build",
+    )
+    return {"status": "queued"}
+
+
+@router.post("/{project_id}/publish", response_model=dict)
+async def publish_project_endpoint(
+    project_id: uuid.UUID,
+    db: DBSession,
+    settings: SettingsDep,
+    user: CurrentUser,
+) -> dict:
+    """Publish the project — a production deploy to its stable subdomain.
+
+    Unlike a preview, publishing is a real release: it ships a *production*
+    Cloudflare Pages deployment and attaches ``<app-slug>.<PUBLISH_BASE_DOMAIN>``
+    to the Pages project (see app/build/cloudflare_pages.py). Cloudflare
+    credentials are therefore required — the local preview server cannot serve a
+    public subdomain.
+    """
+    project = await _get_owned(project_id, user.id, db)
+
+    if project.is_updating:
+        raise ValidationError("A build or update is already in progress.")
+
+    if not project.github_url:
+        raise ValidationError("Project has no GitHub repository yet — wait for the initial build to finish.")
+
+    if project.template_key not in ("next", "react_native"):
+        raise ValidationError("Only web projects can be published.")
+
+    if not settings.CLOUDFLARE_ACCOUNT_ID or not settings.CLOUDFLARE_API_TOKEN:
+        raise ValidationError(
+            "Cloudflare Pages is not configured on this server, so publishing is unavailable."
+        )
+
+    from app.workers.build_worker import publish_project as publish_task
+    await dispatch(
+        publish_task,
         args=[str(project_id), str(user.id)],
         queue="build",
     )

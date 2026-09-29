@@ -25,10 +25,12 @@ from app.build import provider_loop as pl
 from app.build.provider_loop import (
     AnthropicAdapter,
     CacheStats,
+    DeepSeekAdapter,
     OllamaAdapter,
     OpenAIAdapter,
     TurnResult,
     _anthropic_cache_ctx,
+    _deepseek_cache_ctx,
     _gemini_cache_ctx,
     _openai_cache_ctx,
     run_agent_loop,
@@ -168,6 +170,33 @@ class TestCacheStatsNormalisation:
         stats = _gemini_cache_ctx({})
         assert stats.as_dict() == {"cached_tokens": 0, "uncached_tokens": 0}
 
+    def test_deepseek_uses_the_hit_and_miss_pair(self):
+        # DeepSeek reports prompt_cache_hit_tokens / prompt_cache_miss_tokens;
+        # input is their sum so the two halves always reconcile to the total.
+        usage = SimpleNamespace(prompt_tokens=1000, completion_tokens=200,
+                                prompt_cache_hit_tokens=800,
+                                prompt_cache_miss_tokens=200)
+        stats, inp, out = _deepseek_cache_ctx(usage)
+        assert stats.as_dict() == {"cached_tokens": 800, "uncached_tokens": 200}
+        assert (inp, out) == (1000, 200)
+
+    def test_deepseek_reads_extras_when_attributes_are_hidden(self):
+        # A pydantic usage model can park vendor extras on model_extra.
+        usage = SimpleNamespace(completion_tokens=5,
+                                model_extra={"prompt_cache_hit_tokens": 30,
+                                             "prompt_cache_miss_tokens": 70})
+        stats, inp, _ = _deepseek_cache_ctx(usage)
+        assert stats.as_dict() == {"cached_tokens": 30, "uncached_tokens": 70}
+        assert inp == 100
+
+    def test_deepseek_falls_back_to_the_openai_shape(self):
+        # Older/other DeepSeek responses only carry prompt_tokens_details.
+        usage = SimpleNamespace(prompt_tokens=500, completion_tokens=20,
+                                prompt_tokens_details=SimpleNamespace(cached_tokens=400))
+        stats, inp, out = _deepseek_cache_ctx(usage)
+        assert stats.as_dict() == {"cached_tokens": 400, "uncached_tokens": 100}
+        assert (inp, out) == (500, 20)
+
 
 class TestImageCapability:
     def test_native_multimodal_providers_declare_support(self):
@@ -183,6 +212,12 @@ class TestImageCapability:
 
     def test_ollama_does_not_declare_image_support(self):
         assert OllamaAdapter(base_url="http://x", model="m").supports_images is False
+
+    def test_deepseek_declares_vision_only_for_a_vision_capable_model(self):
+        # Per-model, not per-provider: flash accepts images, the pro model doesn't.
+        # Declaring either way at class level would be a lie for the other model.
+        assert DeepSeekAdapter(api_key="k", model="deepseek-flash").supports_images is True
+        assert DeepSeekAdapter(api_key="k", model="deepseek-v4-pro").supports_images is False
 
     def test_image_cost_tier_is_separate_from_capability(self):
         from app.build.provider_loop import GeminiAdapter
@@ -277,6 +312,7 @@ class TestAdapterFactory:
             ANTHROPIC_API_KEY="a", ANTHROPIC_MODEL="claude-test",
             GEMINI_API_KEY="g", GEMINI_MODEL="gemini-test",
             OPENAI_API_KEY="o", OPENAI_MODEL="gpt-test",
+            DEEPSEEK_API_KEY="d", DEEPSEEK_MODEL="deepseek-test",
             OPENROUTER_API_KEY="r",
             OLLAMA_TIMEOUT=300,
         )
@@ -285,12 +321,41 @@ class TestAdapterFactory:
         ("claude", "anthropic"),
         ("gemini", "gemini"),
         ("gpt", "openai"),
+        ("deepseek", "deepseek"),
     ])
     def test_cloud_backends_resolve(self, monkeypatch, build_model, expected):
         s = self._settings(build_model)
         monkeypatch.setattr("app.config.get_settings", lambda: s)
         adapter = build_agent._agent_adapter()
         assert adapter.name == expected
+
+    def test_deepseek_uses_its_own_key_and_endpoint(self, monkeypatch):
+        """deepseek must hit DeepSeek's API with DEEPSEEK_API_KEY — never the
+        OpenRouter route (a different account and a different bill)."""
+        s = self._settings("deepseek")
+        monkeypatch.setattr("app.config.get_settings", lambda: s)
+        adapter = build_agent._agent_adapter()
+        assert adapter.cfg["api_key"] == "d"
+        assert adapter.cfg["model"] == "deepseek-test"
+        assert adapter.cfg["base_url"] == "https://api.deepseek.com"
+
+    def test_bare_deepseek_key_uses_the_configured_model(self, monkeypatch):
+        s = self._settings("claude")
+        monkeypatch.setattr("app.config.get_settings", lambda: s)
+        adapter = build_agent._agent_adapter(build_model="deepseek")
+        assert adapter.name == "deepseek"
+        assert adapter.cfg["model"] == "deepseek-test"  # DEEPSEEK_MODEL
+
+    def test_pinned_deepseek_key_overrides_the_configured_model(self, monkeypatch):
+        """`deepseek:<id>` selects that model outright, so every model DeepSeek
+        ships is reachable without touching .env."""
+        s = self._settings("claude")
+        monkeypatch.setattr("app.config.get_settings", lambda: s)
+        adapter = build_agent._agent_adapter(build_model="deepseek:deepseek-v4-pro")
+        assert adapter.name == "deepseek"
+        assert adapter.cfg["model"] == "deepseek-v4-pro"
+        # The pinned model decides the image capability, not the class default.
+        assert adapter.supports_images is False
 
     def test_qwen3_resolves_to_ollama_when_fallback_disabled(self, monkeypatch):
         s = self._settings("Qwen3")
@@ -318,6 +383,12 @@ class TestAdapterFactory:
         s = self._settings("weird-new-model")
         monkeypatch.setattr("app.config.get_settings", lambda: s)
         assert build_agent._agent_adapter().name == "anthropic"
+
+    def test_deepseek_is_registered_not_a_silent_fallback(self):
+        # An unregistered key falls back to claude — which "works" while billing
+        # the wrong provider. deepseek must resolve to itself.
+        assert build_agent._build_model("deepseek") == "deepseek"
+        assert build_agent._build_model("weird-new-model") == "claude"
 
 
 # ── shared Ollama transport retries rate limits ───────────────────────────────
@@ -482,4 +553,65 @@ class TestOllamaOpenRouterFallback:
         composite = pl.OllamaOpenRouterFallback(primary, fallback)
         run_agent_loop(composite, system="SYS", stable="seed", workspace=tmp_path, max_iterations=5)
         assert primary.calls >= 1 and fallback.calls == 0
+
+
+class TestOpenRouterAdapterChainWalk:
+    """OpenRouterAdapter.send() must walk its whole model chain — a non-retryable
+    error on one model (e.g. a 404 for a retired :free slug) skips to the next
+    rather than failing the entire build on the first entry."""
+
+    class _StatusError(Exception):
+        def __init__(self, status: int) -> None:
+            super().__init__(f"HTTP {status}")
+            self.status_code = status
+
+    def _client_that_fails_then(self, monkeypatch, statuses: list[int | None], ok_model: str | None):
+        """Patch openai.OpenAI so create() raises for the first len(statuses)
+        models, then returns a minimal usable response for ok_model."""
+        seen: list[str] = []
+
+        class _Resp:
+            def __init__(self, model: str) -> None:
+                self.choices = [SimpleNamespace(
+                    message=SimpleNamespace(content="hi", tool_calls=None, reasoning=None),
+                    finish_reason="stop",
+                )]
+                self.usage = None
+                self.model = model
+
+        def _create(*, model, **kw):
+            seen.append(model)
+            idx = len(seen) - 1
+            if idx < len(statuses):
+                raise TestOpenRouterAdapterChainWalk._StatusError(statuses[idx] or 0)
+            return _Resp(model)
+
+        class _FakeOpenAI:
+            def __init__(self, **kw): self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=_create))
+
+        import openai
+        monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+        return seen
+
+    def test_404_on_first_model_falls_through_to_the_next(self, monkeypatch):
+        seen = self._client_that_fails_then(monkeypatch, [404], ok_model="m2")
+        adapter = pl.OpenRouterAdapter(api_key="k", chain=["m1-retired", "m2", "m3"])
+        result = adapter.send(system="s", messages=[], tools=[])
+        assert result.text == "hi"
+        assert seen == ["m1-retired", "m2"]  # walked past the 404, stopped at the winner
+
+    def test_auth_failure_stops_the_walk_immediately(self, monkeypatch):
+        seen = self._client_that_fails_then(monkeypatch, [401, 401, 401], ok_model=None)
+        adapter = pl.OpenRouterAdapter(api_key="k", chain=["m1", "m2", "m3"])
+        with pytest.raises(RuntimeError, match="OpenRouter build agent request failed"):
+            adapter.send(system="s", messages=[], tools=[])
+        assert seen == ["m1"]  # 401 → no point trying the rest
+
+    def test_all_models_failing_raises_with_the_last_error(self, monkeypatch):
+        seen = self._client_that_fails_then(monkeypatch, [404, 404, 400], ok_model=None)
+        adapter = pl.OpenRouterAdapter(api_key="k", chain=["m1", "m2", "m3"])
+        with pytest.raises(RuntimeError, match="OpenRouter build agent request failed"):
+            adapter.send(system="s", messages=[], tools=[])
+        assert seen == ["m1", "m2", "m3"]  # exhausted the chain
 

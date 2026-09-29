@@ -36,7 +36,9 @@ $ErrorActionPreference = 'Stop'
 
 # Declared as plaintext `vars` in wrangler.json. Uploading them as secrets too
 # would give the Worker two conflicting sources for the same name.
-$DeclaredAsVars = @('APP_ENV', 'PORT', 'WEB_CONCURRENCY', 'PYTHONUNBUFFERED')
+# VITE_API_URL is a front-end build-time public origin, not a backend secret; it
+# must never be duplicated as a Worker secret.
+$DeclaredAsVars = @('APP_ENV', 'PORT', 'WEB_CONCURRENCY', 'PYTHONUNBUFFERED', 'VITE_API_URL')
 
 if (-not (Test-Path $EnvFile)) {
     throw "Env file not found: $EnvFile"

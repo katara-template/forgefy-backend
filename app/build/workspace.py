@@ -55,6 +55,15 @@ def _kill_workspace_jobs(path: Path) -> None:
     except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
         logger.warning("Could not stop background jobs for %s: %s", path, exc)
 
+    # Also stop any Claude Code run still wedged in this workspace — the SDK owns
+    # the CLI process, and its force-stop registry is keyed by workspace path.
+    try:
+        from app.build.agents.claude_code import kill_workspace_claude
+
+        kill_workspace_claude(path)
+    except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
+        logger.warning("Could not stop Claude Code run for %s: %s", path, exc)
+
 
 def _redact(text: str) -> str:
     """Strip credentials embedded in any https:// URL in `text`."""
@@ -824,6 +833,16 @@ class EditWorkspace:
 
     def ensure(self) -> None:
         """Clone from GitHub if workspace doesn't exist; pull latest if it does."""
+        # An empty repo_full_name means the project was never pushed to GitHub
+        # (its first build didn't reach the push step). Without this guard the
+        # clone URL collapses to https://<token>@github.com/.git and git fails
+        # with an opaque "repository not found". Callers should catch this earlier;
+        # this is the backstop that names the real cause.
+        if not self.repo_full_name:
+            raise RuntimeError(
+                "EditWorkspace has no repo_full_name — the project was never "
+                "published to GitHub (its first build did not complete)."
+            )
         WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
         clone_url = f"https://{self.github_token}@github.com/{self.repo_full_name}.git"
 

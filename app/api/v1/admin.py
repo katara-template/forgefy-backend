@@ -7,10 +7,16 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from app.core.build_model import VALID_BUILD_MODELS
-from app.core.exceptions import ValidationError
+from app.core.build_model import (
+    BuildModelDef,
+    coerce_build_model,
+    deepseek_key_for,
+    get_available_build_models,
+    get_valid_build_model_keys,
+)
+from app.core.exceptions import NotFoundError, ValidationError
 from app.core.tiers import TIERS
-from app.deps import AdminUser, DBSession
+from app.deps import AdminUser, DBSession, SettingsDep
 
 router = APIRouter()
 
@@ -51,14 +57,192 @@ async def set_build_model_setting(
     db: DBSession,
     user: AdminUser,
 ) -> BuildModelResponse:
-    """Persist a new build model to Firestore (takes effect on the next build/update)."""
-    if body.model not in VALID_BUILD_MODELS:
-        raise ValidationError(f"Invalid model '{body.model}'. Choose from: {', '.join(VALID_BUILD_MODELS)}")
+    """Persist a new build model to Firestore (takes effect on the next build/update).
+
+    The model must be one of the models currently offered to users (the
+    admin-curated catalogue in ``system/config.build_models``), so an operator
+    can only flip the platform default onto a model users can actually select.
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+    valid = await get_valid_build_model_keys(db, settings)
+    if body.model not in valid:
+        raise ValidationError(
+            f"Invalid model '{body.model}'. Choose from: {', '.join(sorted(valid))}"
+        )
 
     await db.collection("system").document("config").set(
         {"build_model": body.model}, merge=True
     )
     return BuildModelResponse(model=body.model)
+
+
+# ── Build-model catalogue (the list users pick from) ──────────────────────────
+# Stored alongside the active ``build_model`` on the ``system/config`` document as
+# a ``build_models`` array of {model, label, provider, sub}. When unset, UIs and
+# validation fall back to ``DEFAULT_BUILD_MODELS`` in app/core/build_model.py.
+
+
+class BuildModelIn(BaseModel):
+    """Payload for adding a build model to the catalogue offered to users."""
+
+    model: str
+    label: str = ""
+    provider: str = ""
+    sub: str = ""
+
+
+def _config_doc(db: DBSession):
+    return db.collection("system").document("config")
+
+
+async def _read_catalogue(db: DBSession) -> list[dict]:
+    """Return the curated catalogue exactly as stored, or the defaults."""
+    from app.config import get_settings
+
+    return await get_available_build_models(db, get_settings())
+
+
+@router.get("/build-models", response_model=list[BuildModelDef])
+async def list_build_models(db: DBSession, user: AdminUser) -> list[BuildModelDef]:
+    """List the build models offered to users (admin-curated catalogue)."""
+    return [coerce_build_model(m) for m in await _read_catalogue(db)]
+
+
+@router.post("/build-models", response_model=list[BuildModelDef])
+async def add_build_model(
+    body: BuildModelIn,
+    db: DBSession,
+    user: AdminUser,
+) -> list[BuildModelDef]:
+    """Add a build model to the catalogue offered to users.
+
+    Added models become selectable in the user-facing model picker and
+    assignable as per-user / platform overrides. Models added outside
+    ``VALID_BUILD_MODELS`` are accepted by the API but the build worker only
+    has adapters for the shipped set, so a build resolving to an unknown
+    identifier falls back to the default model.
+    """
+    key = body.model.strip()
+    if not key:
+        raise ValidationError("Build model name cannot be empty.")
+    models = await _read_catalogue(db)
+    if any(coerce_build_model(m).model == key for m in models):
+        raise ValidationError(f"A build model '{key}' is already in the catalogue.")
+    models.append(
+        {"model": key, "label": (body.label or key), "provider": body.provider, "sub": body.sub}
+    )
+    await _config_doc(db).set({"build_models": models}, merge=True)
+    return [coerce_build_model(m) for m in models]
+
+
+@router.delete("/build-models/{model}", response_model=list[BuildModelDef])
+async def remove_build_model(
+    model: str,
+    db: DBSession,
+    user: AdminUser,
+) -> list[BuildModelDef]:
+    """Remove a build model from the catalogue offered to users."""
+    doc = await _config_doc(db).get()
+    config = (doc.to_dict() or {}) if doc.exists else {}
+    active = config.get("build_model")
+    if str(active) == model:
+        raise ValidationError(
+            f"Cannot remove '{model}' while it is the active platform build model. "
+            f"Set a different build model first."
+        )
+    models = await _read_catalogue(db)
+    filtered = [m for m in models if coerce_build_model(m).model != model]
+    if len(filtered) == len(models):
+        raise NotFoundError(f"Build model '{model}' is not in the catalogue.")
+    # An empty catalogue is stored as [] — reads fall back to the shipped
+    # defaults (see get_available_build_models), so no special-casing needed.
+    await _config_doc(db).set({"build_models": filtered}, merge=True)
+    return [coerce_build_model(m) for m in filtered]
+
+
+# ── DeepSeek model discovery (drives the admin portal's DeepSeek picker) ──────
+# The portal is where an operator switches build models, so it needs to offer
+# the models this deployment's key can *actually* reach. Proxying the provider's
+# own /models listing means a newly released model appears in the portal without
+# a backend change, instead of the operator hand-typing a `deepseek:<id>` key.
+# Nothing here mutates the catalogue — adding an entry is the existing POST above.
+
+
+class DeepSeekModelOut(BaseModel):
+    id: str
+    name: str = ""
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    supports_vision: bool = False
+    # Whether a catalogue entry pinning this model already exists, so the portal
+    # can show it as available rather than offering to add it again.
+    in_catalogue: bool = False
+
+
+class DeepSeekModelsResponse(BaseModel):
+    configured: bool  # is DEEPSEEK_API_KEY set on this server?
+    base_url: str
+    models: list[DeepSeekModelOut]
+    # Why the list is empty, when it is. Empty on success.
+    detail: str = ""
+
+
+@router.get("/deepseek-models", response_model=DeepSeekModelsResponse)
+async def list_deepseek_models(
+    db: DBSession,
+    user: AdminUser,
+    settings: SettingsDep,
+) -> DeepSeekModelsResponse:
+    """List the DeepSeek models this deployment's key can reach, live."""
+    from app.build.provider_loop import DEEPSEEK_BASE_URL
+
+    key = (settings.DEEPSEEK_API_KEY or "").strip()
+    if not key:
+        return DeepSeekModelsResponse(
+            configured=False,
+            base_url=DEEPSEEK_BASE_URL,
+            models=[],
+            detail="DEEPSEEK_API_KEY is not set on this server.",
+        )
+
+    catalogue = {coerce_build_model(m).model for m in await _read_catalogue(db)}
+
+    def _fetch() -> tuple[list[dict], str]:
+        import httpx
+
+        try:
+            resp = httpx.get(
+                f"{DEEPSEEK_BASE_URL}/models",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=15.0,
+            )
+        except Exception as exc:  # noqa: BLE001 — reported to the admin, not fatal
+            return [], f"Could not reach DeepSeek: {exc}"
+        if resp.status_code != 200:
+            return [], f"DeepSeek returned HTTP {resp.status_code}."
+        try:
+            rows = (resp.json() or {}).get("data") or []
+        except Exception as exc:  # noqa: BLE001
+            return [], f"Could not read DeepSeek's response: {exc}"
+        return [r for r in rows if isinstance(r, dict) and r.get("id")], ""
+
+    rows, error = await asyncio.to_thread(_fetch)
+    models = [
+        DeepSeekModelOut(
+            id=str(row["id"]),
+            name=str(row.get("name") or ""),
+            context_window=row.get("context_window"),
+            max_output_tokens=row.get("max_output_tokens"),
+            supports_vision="image" in (row.get("input_modalities") or []),
+            in_catalogue=deepseek_key_for(str(row["id"])) in catalogue,
+        )
+        for row in rows
+    ]
+    return DeepSeekModelsResponse(
+        configured=True, base_url=DEEPSEEK_BASE_URL, models=models, detail=error,
+    )
 
 
 class AlertOut(BaseModel):

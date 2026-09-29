@@ -15,7 +15,13 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request
 
-from app.core.api_keys import display_prefix, generate_api_key, hash_api_key
+from app.core.api_keys import (
+    MAX_ACTIVE_KEYS_PER_USER,
+    count_active_api_keys,
+    display_prefix,
+    generate_api_key,
+    hash_api_key,
+)
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.rate_limit import limiter
 from app.deps import CurrentUser, DBSession
@@ -23,10 +29,6 @@ from app.schemas.api_key import ApiKeyCreatedResponse, ApiKeyOut, CreateApiKeyRe
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-# Enough for any sane rotation scheme; a cap mostly guards against a runaway
-# script minting keys in a loop.
-_MAX_ACTIVE_KEYS_PER_USER = 10
 
 
 @router.post("", response_model=ApiKeyCreatedResponse, status_code=201)
@@ -38,11 +40,10 @@ async def create_api_key(
     user: CurrentUser,
 ) -> ApiKeyCreatedResponse:
     """Create an API key. The full key appears in this response and never again."""
-    docs = await db.collection("api_keys").where("owner_user_id", "==", str(user.id)).get()
-    active = sum(1 for d in docs if not (d.to_dict() or {}).get("revoked_at"))
-    if active >= _MAX_ACTIVE_KEYS_PER_USER:
+    active = await count_active_api_keys(db, str(user.id))
+    if active >= MAX_ACTIVE_KEYS_PER_USER:
         raise ValidationError(
-            f"Active API key limit reached ({_MAX_ACTIVE_KEYS_PER_USER}). "
+            f"Active API key limit reached ({MAX_ACTIVE_KEYS_PER_USER}). "
             "Revoke an unused key first."
         )
 

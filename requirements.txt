@@ -59,6 +59,9 @@ numpy==2.4.5
 openai==2.37.0
 orjson==3.11.9
 ormsgpack==1.12.2
+# Claude Code agent — official Agent SDK (bundles the Claude Code runtime,
+# typed Message/ResultMessage streaming, managed process lifecycle).
+claude-agent-sdk>=0.2.0
 packaging==26.2
 pathspec==1.1.1
 platformdirs==4.9.6

@@ -5,10 +5,12 @@ then by email (one-time linking of pre-Firebase accounts). The query mock's
 side_effect list maps to those calls in order.
 """
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from httpx import AsyncClient
 
+from app.config import Settings, get_settings
+from app.main import app
 from tests.conftest import make_doc_snapshot
 
 _FB_UID = "firebase-uid-1"
@@ -107,3 +109,43 @@ class TestOAuthSignIn:
         with patch("firebase_admin.auth.verify_id_token", return_value=decoded):
             resp = await client.post("/api/v1/auth/google", json={"id_token": "t"})
         assert resp.status_code == 200
+
+    async def test_new_user_synced_to_omnisend_per_opt_in(
+        self, client: AsyncClient, mock_db: MagicMock
+    ) -> None:
+        _set_query_results(mock_db, [], [])
+        app.dependency_overrides[get_settings] = lambda: Settings(OMNISEND_API_KEY="omni-test-key")
+        try:
+            with (
+                patch("firebase_admin.auth.verify_id_token", return_value=_decoded_token()),
+                patch("app.integrations.omnisend.upsert_contact", new=AsyncMock()) as mock_sync,
+            ):
+                resp = await client.post(
+                    "/api/v1/auth/oauth", json={"id_token": "t", "marketing_opt_in": True}
+                )
+        finally:
+            app.dependency_overrides.pop(get_settings, None)
+
+        assert resp.status_code == 200
+        mock_sync.assert_awaited_once_with(
+            "omni-test-key", email="dev@example.com", subscribed=True, tags=["forgefy-app"]
+        )
+
+    async def test_existing_bound_user_is_not_resynced_to_omnisend(
+        self, client: AsyncClient, mock_db: MagicMock
+    ) -> None:
+        """Signing in via OAuth must never re-touch an existing account's
+        marketing consent — the login flow carries no opt-in signal at all."""
+        _set_query_results(mock_db, [_user_snap()])
+        app.dependency_overrides[get_settings] = lambda: Settings(OMNISEND_API_KEY="omni-test-key")
+        try:
+            with (
+                patch("firebase_admin.auth.verify_id_token", return_value=_decoded_token()),
+                patch("app.integrations.omnisend.upsert_contact", new=AsyncMock()) as mock_sync,
+            ):
+                resp = await client.post("/api/v1/auth/oauth", json={"id_token": "t"})
+        finally:
+            app.dependency_overrides.pop(get_settings, None)
+
+        assert resp.status_code == 200
+        mock_sync.assert_not_called()

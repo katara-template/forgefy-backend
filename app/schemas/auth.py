@@ -8,6 +8,9 @@ from pydantic import BaseModel, EmailStr, field_validator
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
+    # Explicit marketing-email opt-in captured at signup (an unchecked
+    # checkbox on the register form) — never defaulted to true.
+    marketing_opt_in: bool = False
 
     @field_validator("password")
     @classmethod
@@ -22,12 +25,24 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class MessageResponse(BaseModel):
+    message: str
+
+
 class RefreshRequest(BaseModel):
     refresh_token: str
 
 
 class GoogleAuthRequest(BaseModel):
     id_token: str
+    # Same opt-in semantics as RegisterRequest — only applied when this call
+    # creates a brand-new account, never when it signs an existing one in.
+    marketing_opt_in: bool = False
 
 
 class TokenResponse(BaseModel):
