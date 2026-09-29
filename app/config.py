@@ -55,6 +55,16 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash"
 
+    # DeepSeek — its OWN direct API key against api.deepseek.com, not a proxy
+    # through OpenRouter or Ollama. DeepSeek serves an OpenAI-compatible
+    # chat-completions API, so the build agent reuses the OpenAI adapter with
+    # only a base_url override (see app/build/provider_loop.DeepSeekAdapter).
+    # `deepseek-flash` supports tool calls and JSON output, which the build agent
+    # requires; context caching is automatic and reported via
+    # prompt_cache_hit_tokens / prompt_cache_miss_tokens.
+    DEEPSEEK_API_KEY: str = ""
+    DEEPSEEK_MODEL: str = "deepseek-flash"
+
     # Ollama (Qwen3 via a local daemon, or the hosted service at ollama.com)
     OLLAMA_URL: str = "http://ollama:11434"
     OLLAMA_MODEL: str = "qwen3:8b"
@@ -86,7 +96,8 @@ class Settings(BaseSettings):
 
     # Blueprint generation backend (extraction + synthesis): "claude" | "gemini" | "Qwen3"
     BP_MODEL: str = "claude"
-    # App build backend (code generation): "claude" | "gemini" | "Qwen3" | "gpt"
+    # App build backend (code generation):
+    # "claude" | "gemini" | "Qwen3" | "gpt" | "deepseek"
     BUILD_MODEL: str = "gemini"
     # Route all provider build/update/fix loops through the single shared loop
     # behind a provider adapter (app/build/provider_loop.py) instead of the five
@@ -100,6 +111,41 @@ class Settings(BaseSettings):
     # the run on OpenRouter instead of dying. Needs OPENROUTER_API_KEY. Set false
     # to keep Ollama failures fatal.
     QWEN_FALLBACK_TO_OPENROUTER: bool = True
+
+    # ── Coding agent selection ────────────────────────────────────────────────
+    # WHICH coding agent performs the build/update work inside the workspace:
+    # "forgefy" (the original agent) or "claude_code" (the Claude Code CLI).
+    # This is independent of BUILD_MODEL (the model the Forgefy agent uses).
+    # AGENT here is a server-wide default; per-project selection is persisted on
+    # the project (and blueprint) as an "agent" field via the API/frontend.
+    AGENT: str = "forgefy"
+    # Claude Code agent
+    CLAUDE_CODE_ENABLED: bool = True
+    CLAUDE_CODE_COMMAND: str = "claude"
+    # Blank = Claude Code's own default model / provider.
+    CLAUDE_CODE_MODEL: str = ""
+    # Anthropic-compatible provider overrides for Claude Code. For Ollama set
+    #   CLAUDE_CODE_AUTH_TOKEN=ollama
+    #   CLAUDE_CODE_BASE_URL=http://localhost:11434
+    # and CLAUDE_CODE_MODEL to an Anthropic-compatible Ollama model (e.g. qwen3-coder).
+    CLAUDE_CODE_API_KEY: str = ""
+    CLAUDE_CODE_BASE_URL: str = ""
+    CLAUDE_CODE_AUTH_TOKEN: str = ""
+    # Optional explicit path to the Claude Code CLI. Blank = the CLI bundled in
+    # the claude-agent-sdk wheel, falling back to CLAUDE_CODE_COMMAND on PATH.
+    CLAUDE_CODE_CLI_PATH: str = ""
+    # Optional cap on agent turns (0/blank = unlimited).
+    CLAUDE_CODE_MAX_TURNS: int = 0
+    # Headless permission handling. "bypassPermissions" lets Claude Code act
+    # inside the (already isolated) project workspace without interactive prompts.
+    CLAUDE_CODE_PERMISSION_MODE: str = "bypassPermissions"
+    # Optional comma/space-separated allow-list for Claude Code tools.
+    CLAUDE_CODE_ALLOWED_TOOLS: str = ""
+    # Restrict Claude Code's tool access to the project workspace (recommended).
+    CLAUDE_CODE_ADD_DIR: bool = True
+    # Overall (wall-clock) and idle (no output) timeouts in seconds.
+    CLAUDE_CODE_TIMEOUT: int = 1800
+    CLAUDE_CODE_IDLE_TIMEOUT: int = 300
 
     # Pass --ignore-scripts to `npm install` in build workspaces. This stops
     # preinstall/postinstall hooks in a model-authored package.json from running
@@ -188,6 +234,33 @@ class Settings(BaseSettings):
     CLOUDFLARE_ACCOUNT_ID: str = ""
     CLOUDFLARE_API_TOKEN: str = ""
 
+    # ── Local static preview server (no-cloud alternative to Cloudflare) ──────
+    # When enabled, a web build whose Cloudflare deploy is skipped or fails is
+    # published to a local static file server instead and its URL is stored as
+    # preview_url. See app/build/preview_server.py. The URL is only reachable
+    # from wherever the worker runs — set LOCAL_PREVIEW_HOST=0.0.0.0 to expose it
+    # on the LAN (then browse the worker's IP, not 127.0.0.1). Port 0 picks a
+    # free port (useful in tests).
+    LOCAL_PREVIEW_ENABLED: bool = False
+    LOCAL_PREVIEW_HOST: str = "127.0.0.1"
+    LOCAL_PREVIEW_PORT: int = 8099
+    # Copied artifacts live here — outside the build workspace, which is deleted
+    # the moment a build finishes. Nothing evicts old previews.
+    LOCAL_PREVIEW_ROOT: str = "/tmp/forgefy_previews"
+
+    # ── Publish (production deploy to a stable subdomain) ─────────────────────
+    # Base domain a published app is served from: "forgefy.dev" →
+    # https://<app-slug>.forgefy.dev. Publishing also deploys to Cloudflare Pages
+    # as a production deployment and attaches that subdomain to the project via
+    # the Cloudflare REST API (see app/build/cloudflare_pages.py).
+    #
+    # For the DNS record to be created automatically, this zone must live on the
+    # same Cloudflare account as the Pages project. If it is not, or the
+    # subdomain is already taken, the published_url falls back to the project's
+    # *.pages.dev URL. Empty → publishing stays on *.pages.dev.
+    PUBLISH_BASE_DOMAIN: str = ""
+
+
     # Appetize.io (Flutter APK browser preview)
     APPETIZE_API_TOKEN: str = ""
 
@@ -245,6 +318,11 @@ class Settings(BaseSettings):
     # Notchpay (payments — card, MTN MoMo, Orange Money)
     NOTCHPAY_PUBLIC_KEY: str = ""   # pk_... from Notchpay dashboard
     NOTCHPAY_SECRET_HASH: str = ""  # hash secret for webhook verification
+
+    # Omnisend — marketing-email contact sync. Only contacts with explicit
+    # opt-in consent (captured at signup) are marked "subscribed"; the rest
+    # sync as "nonSubscribed" so nothing goes out without consent on file.
+    OMNISEND_API_KEY: str = ""
 
     # Sentry
     SENTRY_DSN: str = ""

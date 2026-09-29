@@ -2530,24 +2530,29 @@ def _plan_prefix(plan: dict[str, Any]) -> str:
 # Adapter resolution (Part L)
 #
 # BUILD_MODEL is resolved per user at runtime (app/core/build_model.py) across
-# ("claude", "Qwen3", "gemini", "gpt"). Every provider difference — wire format,
-# cache placement, model chain — lives behind its ProviderAdapter; nothing below
-# branches on the model again. This is the ONLY place that maps BUILD_MODEL to
-# an adapter.
+# ("claude", "Qwen3", "gemini", "gpt", "deepseek"). Every provider difference —
+# wire format, cache placement, model chain — lives behind its ProviderAdapter;
+# nothing below branches on the model again. This is the ONLY place that maps
+# BUILD_MODEL to an adapter.
 # ---------------------------------------------------------------------------
 
-_BUILD_MODELS = ("claude", "Qwen3", "gemini", "gpt")
+_BUILD_MODELS = ("claude", "Qwen3", "gemini", "gpt", "deepseek")
 
 
 def _build_model(override: str | None = None) -> str:
     """The BUILD_MODEL to use — an explicit per-user override (quota downgrades,
     per-user resolution from app/core/build_model.py) wins over the setting."""
     from app.config import get_settings
+    from app.core.build_model import is_deepseek_key
 
     raw = (override or getattr(get_settings(), "BUILD_MODEL", "") or "").strip()
     if raw in ("openai", "openrouter"):  # historical aliases for the gpt chain
         return "gpt"
-    return raw if raw in _BUILD_MODELS else "claude"
+    # deepseek:<model-id> is accepted by shape so a newly released DeepSeek model
+    # is selectable the moment it is added to the catalogue.
+    if raw in _BUILD_MODELS or is_deepseek_key(raw):
+        return raw
+    return "claude"
 
 
 def _agent_adapter(*, timeout: float | None = None, build_model: str | None = None):
@@ -2561,6 +2566,7 @@ def _agent_adapter(*, timeout: float | None = None, build_model: str | None = No
 
     from app.build.provider_loop import (
         AnthropicAdapter,
+        DeepSeekAdapter,
         GeminiAdapter,
         OllamaAdapter,
         OllamaOpenRouterFallback,
@@ -2569,6 +2575,7 @@ def _agent_adapter(*, timeout: float | None = None, build_model: str | None = No
         unified_loop_enabled,
     )
     from app.config import get_settings
+    from app.core.build_model import deepseek_model_for, is_deepseek_key
 
     if not unified_loop_enabled():
         # The legacy per-provider loops were deleted in Part L; the flag is kept
@@ -2585,6 +2592,14 @@ def _agent_adapter(*, timeout: float | None = None, build_model: str | None = No
         return GeminiAdapter(api_key=s.GEMINI_API_KEY, model=s.GEMINI_MODEL)
     if build_model == "gpt":
         return OpenAIAdapter(api_key=s.OPENAI_API_KEY, model=s.OPENAI_MODEL)
+    if is_deepseek_key(build_model):
+        # DeepSeek's own endpoint + key (api.deepseek.com) — never the OpenRouter
+        # route, which is a different account and a different bill. The model is
+        # either DEEPSEEK_MODEL (bare key) or pinned by a `deepseek:<id>` suffix.
+        return DeepSeekAdapter(
+            api_key=s.DEEPSEEK_API_KEY,
+            model=deepseek_model_for(build_model, s.DEEPSEEK_MODEL),
+        )
     if build_model == "claude":
         client = _anthropic.Anthropic(api_key=s.ANTHROPIC_API_KEY, timeout=timeout or 600.0)
         return AnthropicAdapter(api_key=s.ANTHROPIC_API_KEY, model=s.ANTHROPIC_MODEL, client=client)

@@ -59,6 +59,8 @@ Copy `.env.example` to `.env` and fill in your values. Below are the variables m
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-5` | Claude model for agent pipeline |
 | `GEMINI_API_KEY` | *(empty)* | Google Gemini API key |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model |
+| `DEEPSEEK_API_KEY` | *(empty)* | DeepSeek API key from platform.deepseek.com — used **directly** against `api.deepseek.com`, not via OpenRouter |
+| `DEEPSEEK_MODEL` | `deepseek-flash` | DeepSeek model (must support tool calls) |
 | `OLLAMA_URL` | `http://ollama:11434` | Ollama endpoint — use `http://localhost:11434` outside Docker. Ignored (defaults to `https://ollama.com`) when `OLLAMA_API_KEY` is set |
 | `OLLAMA_API_KEY` | _(empty)_ | Set to use [Ollama Cloud](https://ollama.com/settings/keys) instead of a local daemon — pair with a `-cloud` model tag |
 | `OLLAMA_MODEL` | `qwen3:8b` | Ollama model tag to use for blueprint generation — e.g. `nemotron-3-super` on Ollama Cloud |
@@ -136,6 +138,97 @@ The `BP_MODEL` env var controls which LLM is used to process Deepgram transcript
 | `Qwen3` | OpenRouter (hosted, per-action routing) **or** local Qwen3 via Ollama | `OPENROUTER_API_KEY`, else Ollama running |
 
 Switch backends by changing `BP_MODEL` in `.env`. No rebuild is needed — the value is read at runtime.
+
+---
+
+## Build Model Backends
+
+`BUILD_MODEL` selects the model that writes code (the build/update/fix agents).
+It is resolved per user at runtime, in priority order:
+
+    per-user override  >  Firestore system/config.build_model  >  .env BUILD_MODEL
+
+Every backend uses its **own vendor key directly** — none of them proxy through a
+third party (except `Qwen3`, which is the routed open-models option):
+
+| `BUILD_MODEL` value | Provider | Key it uses |
+|---|---|---|
+| `claude` (default fallback) | Anthropic Claude | `ANTHROPIC_API_KEY` |
+| `gemini` | Google Gemini | `GEMINI_API_KEY` |
+| `gpt` | OpenAI | `OPENAI_API_KEY` |
+| `deepseek` | DeepSeek (api.deepseek.com) | `DEEPSEEK_API_KEY` |
+| `Qwen3` | Ollama (local/Cloud) or OpenRouter | `OLLAMA_API_KEY` / `OPENROUTER_API_KEY` |
+
+The **catalogue users pick from** is separate from the resolver: it lives in
+Firestore `system/config.build_models` and is admin-editable in the dashboard
+(*Settings → Build model*). Unset, it falls back to `DEFAULT_BUILD_MODELS` in
+[`app/core/build_model.py`](app/core/build_model.py). Adding a model there makes
+it selectable in both frontends with no frontend deploy.
+
+The worker maps a build-model key to a provider adapter in exactly one place —
+[`_agent_adapter`](app/build/build_agent.py) → [`app/build/provider_loop.py`](app/build/provider_loop.py).
+A key the worker has no adapter for (e.g. one an admin typed by hand) still shows
+up in the picker, but a build resolving to it falls back to `claude`.
+
+### DeepSeek (direct)
+
+DeepSeek exposes an OpenAI-compatible endpoint, so it reuses the OpenAI adapter
+with only a base URL override (`DeepSeekAdapter`). A DeepSeek key alone — no
+OpenRouter account — is enough:
+
+```bash
+DEEPSEEK_API_KEY=sk-...
+DEEPSEEK_MODEL=deepseek-flash
+BUILD_MODEL=deepseek
+```
+
+`deepseek-flash` supports tool calls and JSON output, both required by the agent.
+Context caching is automatic and reported through `prompt_cache_hit_tokens` /
+`prompt_cache_miss_tokens`, which the adapter normalises into the same
+`{cached_tokens, uncached_tokens}` shape as every other provider.
+
+#### Switching DeepSeek models
+
+**Do it in the admin portal**, not in code. *Settings → DeepSeek models* lists the
+models your key can reach — fetched live from DeepSeek's own `/models`, so a newly
+released model shows up without any backend change — and gives you two actions
+per model:
+
+- **Add to catalogue** — creates a `deepseek:<model-id>` entry, which makes the
+  model selectable by users in the app's *Build model* picker.
+- **Use for builds** — makes it the platform default immediately.
+
+The existing *Build model* card above it is the manual equivalent, if you prefer
+the dropdown over the per-model buttons.
+
+The `deepseek:<model-id>` key is what both write. It is accepted by shape rather
+than from a fixed list, so the portal can offer any model DeepSeek returns.
+
+Behind the scenes, that key is resolved as follows — the bare `deepseek` key uses
+`DEEPSEEK_MODEL` from `.env` (a server-wide fallback, useful for a default that
+applies when nobody has picked a model):
+
+| Build-model key | Model actually used |
+|---|---|
+| `deepseek` | whatever `DEEPSEEK_MODEL` is set to (the server default) |
+| `deepseek:<model-id>` | exactly `<model-id>` — e.g. `deepseek:deepseek-v4-pro` |
+
+DeepSeek's current lineup (`GET /models`):
+
+| Model id | Display name | Context | Max output | Vision |
+|---|---|---|---|---|
+| `deepseek-flash` | DeepSeek-V4.1-Flash | 1,048,576 | 393,216 | text + image |
+| `deepseek-v4-pro` | DeepSeek-V4-Pro | 1,048,576 | 393,216 | text only |
+
+Both support tool calls, JSON output, and thinking mode (`reasoning_effort`:
+`low` / `high` / `max`, default `high`). `deepseek-v4-flash` and
+`deepseek-v4-flash-vision-exp` are retired aliases still accepted by the API —
+their requests are served by `deepseek-flash` and billed at the Flash price.
+
+The one thing that *does* stay in `.env` is the credential itself:
+`DEEPSEEK_API_KEY` is a server secret, so it can't be set from the portal. With
+it set, everything else — which models exist, which are offered to users, which
+one builds run on — is a portal operation.
 
 ---
 

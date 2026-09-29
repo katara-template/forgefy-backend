@@ -92,9 +92,11 @@ _FREE_ROUTES: dict[str, list[str]] = {
         "nvidia/nemotron-3-super-120b-a12b:free",
         "tencent/hy3:free",
     ],
-    # Qwen3-Coder is the strongest free coding model: 1M ctx and tool calling.
+    # qwen/qwen3-coder:free was retired by OpenRouter (paid-only now, returns
+    # 404 for the :free slug). qwen3-next-80b is the strongest remaining free
+    # model with 1M ctx + tool calling; the rest keep the loop alive.
     CODE: [
-        "qwen/qwen3-coder:free",
+        "qwen/qwen3-next-80b-a3b-instruct:free",
         "cohere/north-mini-code:free",
         "nvidia/nemotron-3-super-120b-a12b:free",
     ],
@@ -284,6 +286,55 @@ def _post(
     if not content.strip():
         raise OpenRouterError(f"{model} returned an empty message.")
     return content.strip()
+
+
+def post_chat(
+    model: str,
+    messages: list[dict],
+    *,
+    api_key: str,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict | None = None,
+    max_tokens: int = 4096,
+    timeout: int,
+    referer: str,
+    title: str,
+) -> dict:
+    """One raw chat completion: full message history, optional tool schema.
+
+    Unlike _post (single system+user turn, text-only, picks from a chain),
+    this forwards messages/tools/tool_choice as given for one exact model and
+    returns the parsed response body rather than extracted text — for callers
+    that need OpenAI-shaped fields (tool_calls, finish_reason, usage) intact,
+    like the CLI proxy (app/api/v1/cli.py).
+    """
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max(max_tokens, _MIN_MAX_TOKENS),
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice or "auto"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": referer,
+        "X-Title": title,
+    }
+
+    resp = requests.post(_CHAT_URL, json=payload, headers=headers, timeout=timeout)
+    if resp.status_code == 401:
+        raise OpenRouterError("OpenRouter rejected the API key (HTTP 401). Check OPENROUTER_API_KEY.")
+    if resp.status_code >= 400:
+        raise OpenRouterError(f"{model} returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+    body = resp.json()
+    # OpenRouter can return 200 with an error body when a provider fails mid-stream.
+    if err := body.get("error"):
+        raise OpenRouterError(f"{model} error: {str(err)[:200]}")
+    return body
 
 
 def chat_openrouter(

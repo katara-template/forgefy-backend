@@ -23,6 +23,12 @@ class ProjectOut(BaseModel):
     blueprint_id: uuid.UUID | None = None
     preview_url: str | None = None
     artifact_url: str | None = None
+    # Set once the user publishes: the live production URL — a
+    # <slug>.<PUBLISH_BASE_DOMAIN> subdomain when a base domain is configured,
+    # otherwise the project's *.pages.dev URL.
+    published_url: str | None = None
+    published_domain: str | None = None
+    published_at: datetime | None = None
     is_updating: bool = False
     build_error: str | None = None
     build_error_action: str | None = None  # "retry" | "user_fix" | "support"
@@ -47,10 +53,21 @@ class ProjectOut(BaseModel):
     db_schema_tables: list[str] | None = None
     db_status: str | None = None
     db_schema_error: str | None = None
+    # Which coding agent built this project: "forgefy" or "claude_code".
+    agent: str = "forgefy"
+    # Per-project Claude Code model/backend override (e.g. "anthropic", "openrouter",
+    # "ollama"). None → use the server-wide CLAUDE_CODE_* defaults.
+    claude_code_backend: str | None = None
+    # Per-project Claude Code model name (e.g. "claude-sonnet-4-5", "deepseek-coder",
+    # "qwen3-coder"). None → use the server-wide CLAUDE_CODE_MODEL default.
+    claude_code_model: str | None = None
 
 
 class UpdateProjectRequest(BaseModel):
     prompt: str
+    # Optional coding-agent selection ("forgefy" | "claude_code"). Omitted by
+    # existing clients → keeps the previously-selected/default agent.
+    agent: str | None = None
 
 
 class ConnectSupabaseRequest(BaseModel):
@@ -59,6 +76,25 @@ class ConnectSupabaseRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+    # Optional coding-agent selection, sent with the request that may queue a
+    # build/update so the selected agent is persisted on the project.
+    agent: str | None = None
+
+
+class ProjectPatchRequest(BaseModel):
+    """Build-free project-field updates from the settings UI.
+
+    Used by ``PATCH /{project_id}`` so changing a setting (e.g. the coding agent)
+    persists without dispatching a build the way ``POST /{project_id}/update``
+    does. Only the fields that are actually set are written.
+    """
+
+    # "forgefy" | "claude_code". None → leave the current selection untouched.
+    agent: str | None = None
+    # Per-project Claude Code backend override. None → leave untouched.
+    claude_code_backend: str | None = None
+    # Per-project Claude Code model override. None → leave untouched.
+    claude_code_model: str | None = None
 
 
 class ChatResponse(BaseModel):

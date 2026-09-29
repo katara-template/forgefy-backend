@@ -40,3 +40,16 @@ def display_prefix(key: str) -> str:
 def looks_like_api_key(token: str) -> bool:
     """Cheap shape check so JWT bearer tokens are never hashed and looked up."""
     return token.startswith(KEY_PREFIX)
+
+
+# Enough for any sane rotation scheme; a cap mostly guards against a runaway
+# script (or a repeatedly-approved CLI login) minting keys in a loop. Shared
+# by the dashboard's create_api_key (app/api/v1/keys.py) and the CLI device
+# login's auto-minted key (app/api/v1/device_auth.py) — one account-wide cap.
+MAX_ACTIVE_KEYS_PER_USER = 10
+
+
+async def count_active_api_keys(db, owner_user_id: str) -> int:
+    """Return how many of this user's API keys are not revoked."""
+    docs = await db.collection("api_keys").where("owner_user_id", "==", owner_user_id).get()
+    return sum(1 for d in docs if not (d.to_dict() or {}).get("revoked_at"))

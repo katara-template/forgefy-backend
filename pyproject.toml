@@ -37,6 +37,9 @@ dependencies = [
     "langgraph>=0.2.0",
     "langchain-core>=0.3.0",
     "openai>=1.50.0",
+    # Claude Code agent — official Agent SDK (bundles the Claude Code runtime,
+    # typed Message/ResultMessage streaming, managed process lifecycle).
+    "claude-agent-sdk>=0.2.0",
 
     # Transcription
     "deepgram-sdk>=3.7.0",

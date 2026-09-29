@@ -15,9 +15,10 @@ wire-format and cache-flag differences.
 
 ``cache_stats`` is part of the adapter contract: every adapter reports whatever
 its provider exposes (Anthropic cache_read/creation, Gemini
-cachedContentTokenCount, OpenAI/OpenRouter cached_tokens, Ollama prompt_eval)
-normalised to ``{cached_tokens, uncached_tokens}``. A provider that reports
-nothing returns zeros — the field is never omitted.
+cachedContentTokenCount, OpenAI/OpenRouter cached_tokens, DeepSeek
+prompt_cache_hit/miss_tokens, Ollama prompt_eval) normalised to
+``{cached_tokens, uncached_tokens}``. A provider that reports nothing returns
+zeros — the field is never omitted.
 """
 from __future__ import annotations
 
@@ -187,6 +188,33 @@ def _openai_cache_ctx(usage: Any) -> tuple[CacheStats, int, int]:
     return CacheStats(cached_tokens=cached, uncached_tokens=uncached), input_tokens, output_tokens
 
 
+def _deepseek_cache_ctx(usage: Any) -> tuple[CacheStats, int, int]:
+    """Normalise a DeepSeek usage object.
+
+    DeepSeek's context cache is on by default and reported as
+    ``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens``. It also mirrors
+    OpenAI's ``prompt_tokens_details.cached_tokens``, but the hit/miss pair is
+    the documented shape and the only one that stays correct when the SDK drops
+    unknown attributes — so prefer it and fall back to the OpenAI reader.
+
+    Returns (cache_stats, input_tokens, output_tokens). Input is hit + miss
+    rather than ``prompt_tokens`` so the two halves always sum to the total.
+    """
+    output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    hit = getattr(usage, "prompt_cache_hit_tokens", None)
+    miss = getattr(usage, "prompt_cache_miss_tokens", None)
+    if hit is None and miss is None:
+        # A pydantic usage model may keep vendor extras off the attribute path.
+        extra = getattr(usage, "model_extra", None) or {}
+        hit = extra.get("prompt_cache_hit_tokens")
+        miss = extra.get("prompt_cache_miss_tokens")
+    if hit is None and miss is None:
+        return _openai_cache_ctx(usage)
+    cached = int(hit or 0)
+    uncached = int(miss or 0)
+    return CacheStats(cached_tokens=cached, uncached_tokens=uncached), cached + uncached, output_tokens
+
+
 def _anthropic_cache_ctx(usage: Any) -> tuple[CacheStats, int, int]:
     """Normalise Anthropic's cache_read / cache_creation split."""
     fresh = int(getattr(usage, "input_tokens", 0) or 0)
@@ -197,7 +225,11 @@ def _anthropic_cache_ctx(usage: Any) -> tuple[CacheStats, int, int]:
     stats = CacheStats(cached_tokens=read, uncached_tokens=fresh + created)
     return stats, fresh + created + read, output
 
-# ── OpenAI / OpenRouter compatible wire format ────────────────────────────────
+# ── OpenAI / OpenRouter / DeepSeek compatible wire format ─────────────────────
+
+# DeepSeek serves the OpenAI chat-completions format from its own endpoint. This
+# is used directly with DEEPSEEK_API_KEY — it is not an OpenRouter route.
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 
 def _openai_wire_messages(system: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -325,18 +357,38 @@ def _repair_json_backslashes(s: str) -> str:
 class OpenAIAdapter(ProviderAdapter):
     """The ``gpt`` build backend. Caching is automatic above ~1024 tokens (no
     opt-in flag, Part E2) — the whole win is the byte-stable ANCHOR/STABLE
-    prefix, verified through ``usage.prompt_tokens_details.cached_tokens``."""
+    prefix, verified through ``usage.prompt_tokens_details.cached_tokens``.
+
+    Subclasses that speak the same wire format against a different endpoint
+    (e.g. ``DeepSeekAdapter``) override ``_cache_ctx`` only; the request/reply
+    handling is shared.
+    """
 
     name = "openai"
     supports_images = True   # natively multimodal (Part G note).
 
-    def __init__(self, *, api_key: str, model: str) -> None:
-        super().__init__(api_key=api_key, model=model)
+    def __init__(self, *, api_key: str, model: str, base_url: str = "") -> None:
+        super().__init__(api_key=api_key, model=model, base_url=base_url)
 
-    def send(self, **kw: Any) -> TurnResult:
+    def _cache_ctx(self, usage: Any) -> tuple[CacheStats, int, int]:
+        """Normalise this provider's usage object (overridable per endpoint)."""
+        return _openai_cache_ctx(usage)
+
+    def _client(self) -> Any:
+        """An OpenAI-SDK client pointed at this provider's endpoint.
+
+        ``base_url`` is empty for OpenAI itself (the SDK's own default) and set
+        for OpenAI-compatible vendors.
+        """
         from openai import OpenAI
 
-        client = OpenAI(api_key=self.cfg["api_key"])
+        kwargs: dict[str, Any] = {"api_key": self.cfg["api_key"]}
+        if self.cfg.get("base_url"):
+            kwargs["base_url"] = self.cfg["base_url"]
+        return OpenAI(**kwargs)
+
+    def send(self, **kw: Any) -> TurnResult:
+        client = self._client()
         messages = _openai_wire_messages(kw["system"], kw["messages"])
         tools = self.normalize_tools(kw["tools"])
         try:
@@ -355,7 +407,7 @@ class OpenAIAdapter(ProviderAdapter):
             {"id": tc.id, "name": tc.function.name, "arguments": _safe_args(tc.function.arguments)}
             for tc in (msg.tool_calls or [])
         ]
-        stats, in_tokens, out_tokens = _openai_cache_ctx(response.usage)
+        stats, in_tokens, out_tokens = self._cache_ctx(response.usage)
         if msg.content and kw.get("on_text"):
             kw["on_text"](msg.content)
         stop = "tool_use" if tool_calls else ("max_tokens" if response.choices[0].finish_reason == "length" else "end_turn")
@@ -368,6 +420,36 @@ class OpenAIAdapter(ProviderAdapter):
             cache_stats=stats,
             model=self.cfg["model"],
         )
+
+
+class DeepSeekAdapter(OpenAIAdapter):
+    """The ``deepseek`` build backend — DeepSeek's own direct API.
+
+    DeepSeek exposes an OpenAI-compatible chat-completions endpoint at
+    ``https://api.deepseek.com``, authenticated with the user's own
+    ``DEEPSEEK_API_KEY``. This is deliberately NOT an OpenRouter/Ollama route:
+    a DeepSeek key alone is enough to build on it.
+
+    Only the endpoint and the cache accounting differ from ``OpenAIAdapter``
+    (DeepSeek reports ``prompt_cache_hit_tokens`` /
+    ``prompt_cache_miss_tokens`` rather than ``prompt_tokens_details``).
+    """
+
+    name = "deepseek"
+
+    # DeepSeek's vision support is per-model, not per-provider: the docs mark
+    # `deepseek-flash` as vision-capable while the pro model is not. Derive the
+    # declared capability from the configured model so it stays truthful for
+    # whichever one an operator points DEEPSEEK_MODEL at. The build path itself
+    # only ever sends text.
+    _VISION_HINTS = ("flash", "vision")
+
+    def __init__(self, *, api_key: str, model: str, base_url: str = DEEPSEEK_BASE_URL) -> None:
+        super().__init__(api_key=api_key, model=model, base_url=base_url)
+        self.supports_images = any(h in model.lower() for h in self._VISION_HINTS)
+
+    def _cache_ctx(self, usage: Any) -> tuple[CacheStats, int, int]:
+        return _deepseek_cache_ctx(usage)
 
 
 class OpenRouterAdapter(OpenAIAdapter):
@@ -413,10 +495,17 @@ class OpenRouterAdapter(OpenAIAdapter):
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 status = getattr(exc, "status_code", None)
+                if status in {401, 403}:
+                    # Auth failure — every model in the chain rejects identically,
+                    # so walking further is pointless.
+                    break
                 if status in {408, 409, 429, 500, 502, 503, 504}:
                     time.sleep(3)
-                    continue
-                break
+                # Anything else (404 = model retired, 400 = model-specific reject,
+                # network error) is specific to THIS model — keep walking the
+                # chain instead of failing the whole build on the first entry.
+                logger.warning("openrouter: model %s failed (%s) — trying next", mdl, exc)
+                continue
         if resp_obj is None:
             raise RuntimeError(f"OpenRouter build agent request failed: {last_exc}")
 

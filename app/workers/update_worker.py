@@ -55,6 +55,23 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
     template_key: str = project.get("template_key", "")
     blueprint_context: dict = project.get("blueprint_context") or {}
 
+    # No GitHub repo means the initial build never reached the push step, so
+    # there is nothing to clone. Fail fast with a clear message instead of
+    # letting EditWorkspace.ensure() attempt `git clone https://…@github.com/.git`.
+    if not repo_full_name:
+        msg = (
+            "This project hasn't been published to GitHub yet — its first build "
+            "didn't finish. Re-run the build before requesting changes."
+        )
+        await _patch_project(project_id, {
+            "is_updating": False,
+            "build_error": msg,
+            "build_error_action": "retry",
+            "updated_at": datetime.now(UTC),
+        })
+        logger.warning("Update skipped — project %s has no repo_full_name", project_id)
+        return {"blocked": "no_repo"}
+
     # A previous run may have stopped with work outstanding. If so, a bare
     # "continue" resolves to that original request rather than being treated as
     # a new (and meaningless) instruction.
@@ -175,10 +192,17 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         contextual_prompt = resume_state.resume_context(unfinished) + contextual_prompt
 
         # One entry point for every BUILD_MODEL — the adapter resolves
-        # internally (Part L).
-        from app.build.build_agent import run_update_agent
+        # internally (Part L). Which agent runs the update (Forgefy or Claude
+        # Code) comes from the project's persisted "agent" field (default forgefy);
+        # both share the exact same pipeline.
+        from app.build.agents import get_coding_agent, resolve_agent
 
-        summary, tokens_used = run_update_agent(
+        agent_key = resolve_agent(project.get("agent"))
+        claude_code_model = project.get("claude_code_model") or None
+        # Persist the resolved agent so rebuilds and history know who coded it.
+        await _patch_project(project_id, {"agent": agent_key})
+        agent = get_coding_agent(agent_key)
+        summary, tokens_used = agent.run_update(
             workspace=workspace.path,
             prompt=contextual_prompt,
             blueprint=blueprint_context,
@@ -187,6 +211,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
             log_fn=log_fn,
             cancel_fn=cancel_fn,
             build_model=build_model,
+            claude_code_model=claude_code_model,
         )
         logger.info("Update agent used %d tokens project=%s", tokens_used, project_id)
         await record_usage(db, user_id, tokens_used, is_update=True)
@@ -279,7 +304,7 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
 
         if was_stopped:
             if pushed:
-                log_fn("warning", "Agent stopped — partial changes have been saved to GitHub.")
+                log_fn("warning", "Agent stopped — changes made so far were kept.")
             else:
                 log_fn("warning", "Agent stopped before any changes were made.")
             logger.info("Update stopped by user project=%s pushed=%s", project_id, pushed)
@@ -332,9 +357,9 @@ async def _run(project_id: str, prompt: str, user_id: str) -> dict:
         # Save whatever the agent produced before it failed. `finally` deletes
         # the workspace, so this is the last chance — and a partial update the
         # user can inspect beats spending their tokens for nothing.
+        # Silent by design: the workspace→GitHub sync is background data-safety,
+        # not work the user asked for — it never posts to the build feed.
         saved = syncer.stop("chore: partial update (run did not complete)")
-        if saved or syncer.pushed_anything:
-            log_fn("info", "Partial changes were saved to GitHub before the failure.")
 
         from app.core.build_errors import sanitize_build_error
         build_err = sanitize_build_error(exc)

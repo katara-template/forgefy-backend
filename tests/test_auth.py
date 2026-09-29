@@ -64,6 +64,14 @@ def firebase_settings():
     app.dependency_overrides.pop(get_settings, None)
 
 
+@pytest.fixture
+def omnisend_settings():
+    """Real Settings with the Omnisend API key set, so contact sync is 'configured'."""
+    app.dependency_overrides[get_settings] = lambda: Settings(OMNISEND_API_KEY="omni-test-key")
+    yield
+    app.dependency_overrides.pop(get_settings, None)
+
+
 # ── Register ──────────────────────────────────────────────────────────────────
 
 
@@ -122,6 +130,132 @@ class TestRegister:
         )
 
         assert resp.status_code == 422
+
+    async def test_marks_new_user_as_requiring_verification_and_sends_email(
+        self, client: AsyncClient, mock_db: MagicMock, firebase_settings
+    ) -> None:
+        _set_email_query_result(mock_db, [])
+
+        with (
+            patch("firebase_admin.auth.create_user"),
+            patch(
+                "app.api.v1.auth._firebase_password_signin_response",
+                new=AsyncMock(return_value={"localId": "uid-123", "idToken": "id-token-abc"}),
+            ),
+            patch(
+                "app.api.v1.auth._send_verification_email", new=AsyncMock()
+            ) as mock_send,
+        ):
+            resp = await client.post(
+                "/api/v1/auth/register",
+                json={"email": "new@example.com", "password": "password123"},
+            )
+
+        assert resp.status_code == 201
+        doc = mock_db.collection.return_value.document.return_value.set.call_args[0][0]
+        assert doc["requires_email_verification"] is True
+        mock_send.assert_awaited_once_with("test-key", "id-token-abc")
+
+    async def test_register_succeeds_even_if_verification_email_fails(
+        self, client: AsyncClient, mock_db: MagicMock, firebase_settings
+    ) -> None:
+        _set_email_query_result(mock_db, [])
+
+        with (
+            patch("firebase_admin.auth.create_user"),
+            patch(
+                "app.api.v1.auth._firebase_password_signin_response",
+                new=AsyncMock(side_effect=RuntimeError("network down")),
+            ),
+        ):
+            resp = await client.post(
+                "/api/v1/auth/register",
+                json={"email": "new@example.com", "password": "password123"},
+            )
+
+        assert resp.status_code == 201
+        assert "access_token" in resp.json()
+
+    async def test_syncs_opted_in_user_as_subscribed_to_omnisend(
+        self, client: AsyncClient, mock_db: MagicMock, omnisend_settings
+    ) -> None:
+        _set_email_query_result(mock_db, [])
+
+        with (
+            patch("firebase_admin.auth.create_user"),
+            patch("app.integrations.omnisend.upsert_contact", new=AsyncMock()) as mock_sync,
+        ):
+            resp = await client.post(
+                "/api/v1/auth/register",
+                json={"email": "new@example.com", "password": "password123", "marketing_opt_in": True},
+            )
+
+        assert resp.status_code == 201
+        mock_sync.assert_awaited_once_with(
+            "omni-test-key", email="new@example.com", subscribed=True, tags=["forgefy-app"]
+        )
+
+    async def test_syncs_non_opted_in_user_as_nonsubscribed_to_omnisend(
+        self, client: AsyncClient, mock_db: MagicMock, omnisend_settings
+    ) -> None:
+        _set_email_query_result(mock_db, [])
+
+        with (
+            patch("firebase_admin.auth.create_user"),
+            patch("app.integrations.omnisend.upsert_contact", new=AsyncMock()) as mock_sync,
+        ):
+            resp = await client.post(
+                "/api/v1/auth/register",
+                json={"email": "new@example.com", "password": "password123"},
+            )
+
+        assert resp.status_code == 201
+        doc = mock_db.collection.return_value.document.return_value.set.call_args[0][0]
+        assert doc["marketing_opt_in"] is False
+        mock_sync.assert_awaited_once_with(
+            "omni-test-key", email="new@example.com", subscribed=False, tags=["forgefy-app"]
+        )
+
+    async def test_skips_omnisend_sync_when_not_configured(
+        self, client: AsyncClient, mock_db: MagicMock
+    ) -> None:
+        _set_email_query_result(mock_db, [])
+        app.dependency_overrides[get_settings] = lambda: Settings(OMNISEND_API_KEY="")
+
+        try:
+            with (
+                patch("firebase_admin.auth.create_user"),
+                patch("app.integrations.omnisend.upsert_contact", new=AsyncMock()) as mock_sync,
+            ):
+                resp = await client.post(
+                    "/api/v1/auth/register",
+                    json={"email": "new@example.com", "password": "password123", "marketing_opt_in": True},
+                )
+        finally:
+            app.dependency_overrides.pop(get_settings, None)
+
+        assert resp.status_code == 201
+        mock_sync.assert_not_called()
+
+    async def test_register_succeeds_even_if_omnisend_sync_fails(
+        self, client: AsyncClient, mock_db: MagicMock, omnisend_settings
+    ) -> None:
+        _set_email_query_result(mock_db, [])
+
+        with (
+            patch("firebase_admin.auth.create_user"),
+            patch(
+                "app.integrations.omnisend.upsert_contact",
+                new=AsyncMock(side_effect=RuntimeError("omnisend down")),
+            ),
+        ):
+            resp = await client.post(
+                "/api/v1/auth/register",
+                json={"email": "new@example.com", "password": "password123", "marketing_opt_in": True},
+            )
+
+        assert resp.status_code == 201
+        assert "access_token" in resp.json()
 
 
 # ── Login ─────────────────────────────────────────────────────────────────────
@@ -316,6 +450,140 @@ class TestLogin:
             resp = await client.post(
                 "/api/v1/auth/login",
                 json={"email": "test@example.com", "password": "password123"},
+            )
+            assert resp.status_code == 422
+        finally:
+            app.dependency_overrides.pop(get_settings, None)
+
+
+# ── Email verification ───────────────────────────────────────────────────────
+
+
+class TestEmailVerification:
+    def _unverified_doc(self, email: str = "test@example.com") -> MagicMock:
+        doc_id = str(uuid.uuid4())
+        data = {
+            "email": email,
+            "hashed_password": "",
+            "firebase_uid": doc_id,
+            "tier": "free",
+            "requires_email_verification": True,
+            "created_at": datetime.now(UTC),
+            "updated_at": datetime.now(UTC),
+        }
+        snap = make_doc_snapshot(data, doc_id=doc_id)
+        snap.reference.set = AsyncMock()
+        return snap
+
+    async def test_login_blocked_when_flagged_and_not_verified(
+        self, client: AsyncClient, mock_db: MagicMock, firebase_settings
+    ) -> None:
+        doc = self._unverified_doc()
+        _set_email_query_result(mock_db, [doc])
+        fake_user_record = MagicMock(email_verified=False)
+
+        with (
+            patch(
+                "app.api.v1.auth._firebase_password_signin",
+                new=AsyncMock(return_value=doc.id),
+            ),
+            patch("firebase_admin.auth.get_user", return_value=fake_user_record),
+        ):
+            resp = await client.post(
+                "/api/v1/auth/login",
+                json={"email": doc.to_dict()["email"], "password": "correct_password"},
+            )
+
+        assert resp.status_code == 403
+        assert "verify" in resp.json()["detail"].lower()
+
+    async def test_login_succeeds_and_clears_flag_once_verified(
+        self, client: AsyncClient, mock_db: MagicMock, firebase_settings
+    ) -> None:
+        doc = self._unverified_doc()
+        _set_email_query_result(mock_db, [doc])
+        fake_user_record = MagicMock(email_verified=True)
+
+        with (
+            patch(
+                "app.api.v1.auth._firebase_password_signin",
+                new=AsyncMock(return_value=doc.id),
+            ),
+            patch("firebase_admin.auth.get_user", return_value=fake_user_record),
+        ):
+            resp = await client.post(
+                "/api/v1/auth/login",
+                json={"email": doc.to_dict()["email"], "password": "correct_password"},
+            )
+
+        assert resp.status_code == 200
+        assert "access_token" in resp.json()
+        mock_db.collection.return_value.document.return_value.update.assert_any_call(
+            {"requires_email_verification": False}
+        )
+
+    async def test_legacy_user_without_flag_is_not_blocked(
+        self, client: AsyncClient, mock_db: MagicMock, firebase_settings
+    ) -> None:
+        """Existing accounts predating this feature have no
+        requires_email_verification field and must be grandfathered in."""
+        doc = _user_doc(email="grandfathered@example.com")
+        _set_email_query_result(mock_db, [doc])
+
+        with (
+            patch(
+                "app.api.v1.auth._firebase_password_signin",
+                new=AsyncMock(return_value=doc.id),
+            ),
+            patch("firebase_admin.auth.get_user") as mock_get_user,
+        ):
+            resp = await client.post(
+                "/api/v1/auth/login",
+                json={"email": "grandfathered@example.com", "password": "correct_password"},
+            )
+
+        assert resp.status_code == 200
+        mock_get_user.assert_not_called()
+
+    async def test_resend_verification_sends_email_on_valid_credentials(
+        self, client: AsyncClient, firebase_settings
+    ) -> None:
+        with (
+            patch(
+                "app.api.v1.auth._firebase_password_signin_response",
+                new=AsyncMock(return_value={"localId": "uid-123", "idToken": "id-token-xyz"}),
+            ),
+            patch("app.api.v1.auth._send_verification_email", new=AsyncMock()) as mock_send,
+        ):
+            resp = await client.post(
+                "/api/v1/auth/resend-verification",
+                json={"email": "test@example.com", "password": "correct_password"},
+            )
+
+        assert resp.status_code == 200
+        assert "sent" in resp.json()["message"].lower()
+        mock_send.assert_awaited_once_with("test-key", "id-token-xyz")
+
+    async def test_resend_verification_rejects_wrong_password(
+        self, client: AsyncClient, firebase_settings
+    ) -> None:
+        with patch(
+            "app.api.v1.auth._firebase_password_signin_response",
+            new=AsyncMock(return_value=None),
+        ):
+            resp = await client.post(
+                "/api/v1/auth/resend-verification",
+                json={"email": "test@example.com", "password": "wrong_password"},
+            )
+
+        assert resp.status_code == 401
+
+    async def test_resend_verification_not_configured_returns_422(self, client: AsyncClient) -> None:
+        app.dependency_overrides[get_settings] = lambda: Settings(FIREBASE_WEB_API_KEY="")
+        try:
+            resp = await client.post(
+                "/api/v1/auth/resend-verification",
+                json={"email": "test@example.com", "password": "whatever123"},
             )
             assert resp.status_code == 422
         finally:

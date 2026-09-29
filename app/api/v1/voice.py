@@ -339,6 +339,8 @@ async def _call_llm(system: str, message: str, settings) -> str:
     """Call the configured LLM synchronously in a thread and return raw text."""
     import asyncio
 
+    from app.core.build_model import deepseek_model_for, is_deepseek_key
+
     if settings.BUILD_MODEL == "gemini":
         import requests as _req
 
@@ -388,6 +390,30 @@ async def _call_llm(system: str, message: str, settings) -> str:
             return (r.json().get("message") or {}).get("content", "").strip()
 
         return await asyncio.to_thread(_qwen)
+
+    if is_deepseek_key(settings.BUILD_MODEL or ""):
+        import asyncio as _asyncio
+
+        def _deepseek() -> str:
+            # DeepSeek's own OpenAI-compatible endpoint, keyed by
+            # DEEPSEEK_API_KEY — not the OpenRouter route. Honours a
+            # `deepseek:<id>` pin the same way the build agent does.
+            from openai import OpenAI
+
+            from app.build.provider_loop import DEEPSEEK_BASE_URL
+
+            client = OpenAI(api_key=settings.DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+            resp = client.chat.completions.create(
+                model=deepseek_model_for(settings.BUILD_MODEL, settings.DEEPSEEK_MODEL),
+                max_tokens=512,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": message},
+                ],
+            )
+            return (resp.choices[0].message.content or "").strip()
+
+        return await _asyncio.to_thread(_deepseek)
 
     # Default: Anthropic Claude
     import anthropic

@@ -27,6 +27,7 @@ from google.api_core.exceptions import ResourceExhausted
 
 from app.core.exceptions import (
     ConflictError,
+    EmailNotVerifiedError,
     ExternalServiceError,
     RateLimitedError,
     UnauthorizedError,
@@ -45,11 +46,14 @@ from app.core.security import (
     verify_password,
 )
 from app.deps import DBSession, RedisDep, SettingsDep
+from app.integrations import omnisend
 from app.schemas.auth import (
     GoogleAuthRequest,
     LoginRequest,
+    MessageResponse,
     RefreshRequest,
     RegisterRequest,
+    ResendVerificationRequest,
     TokenResponse,
 )
 
@@ -69,6 +73,43 @@ def _raise_for_firestore_quota(exc: Exception, *, context: str) -> None:
         raise RateLimitedError(
             f"The authentication service is temporarily unavailable while {context}. Please try again shortly."
         ) from exc
+
+
+async def _send_verification_email(api_key: str, id_token: str) -> None:
+    """Ask Firebase to email a verification link to the token's owner.
+
+    Goes through Identity Toolkit's sendOobCode so Firebase delivers the
+    email itself — no separate email-sending service needed. Delivery
+    failures are logged, not raised: a hiccup here shouldn't block account
+    creation, since the user can always request a resend later.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode",
+                params={"key": api_key},
+                json={"requestType": "VERIFY_EMAIL", "idToken": id_token},
+            )
+        if resp.status_code != 200:
+            logger.warning(
+                "Failed to send verification email: HTTP %s %s", resp.status_code, resp.text[:200]
+            )
+    except Exception:
+        logger.warning("Failed to send verification email", exc_info=True)
+
+
+async def _sync_omnisend_contact(api_key: str, *, email: str, marketing_opt_in: bool) -> None:
+    """Push a newly created user into Omnisend as a contact.
+
+    Failures are logged, not raised — a marketing-sync hiccup must never
+    block account creation or sign-in.
+    """
+    try:
+        await omnisend.upsert_contact(
+            api_key, email=email, subscribed=marketing_opt_in, tags=["forgefy-app"]
+        )
+    except Exception:
+        logger.warning("Could not sync new user %s to Omnisend", email, exc_info=True)
 
 
 @router.post("/register", response_model=TokenResponse, status_code=201)
@@ -117,13 +158,18 @@ async def register(
     except ValueError as e:
         raise ValidationError(str(e)) from e
 
-    # Write user to Firestore (hashed_password kept as "" for doc-shape compat)
+    # Write user to Firestore (hashed_password kept as "" for doc-shape compat).
+    # requires_email_verification gates the check added at login — set only
+    # for accounts created through this flow, so pre-existing accounts (which
+    # were never asked to verify) aren't retroactively locked out.
     try:
         await db.collection("users").document(user_id).set({
             "email": body.email,
             "hashed_password": "",
             "firebase_uid": user_id,
             "tier": "free",
+            "requires_email_verification": True,
+            "marketing_opt_in": body.marketing_opt_in,
             "created_at": now,
             "updated_at": now,
         })
@@ -134,6 +180,23 @@ async def register(
             await anyio.to_thread.run_sync(firebase_admin.auth.delete_user, user_id)
         raise
 
+    if settings.OMNISEND_API_KEY:
+        await _sync_omnisend_contact(
+            settings.OMNISEND_API_KEY, email=body.email, marketing_opt_in=body.marketing_opt_in
+        )
+
+    if settings.FIREBASE_WEB_API_KEY:
+        try:
+            signin = await _firebase_password_signin_response(
+                settings.FIREBASE_WEB_API_KEY, body.email, body.password
+            )
+            if signin and signin.get("idToken"):
+                await _send_verification_email(settings.FIREBASE_WEB_API_KEY, signin["idToken"])
+        except Exception:
+            logger.warning("Could not send verification email to new user %s", user_id, exc_info=True)
+    else:
+        logger.warning("FIREBASE_WEB_API_KEY not set — skipping verification email for %s", user_id)
+
     logger.info("User registered successfully: id=%s, email=%s", user_id, body.email)
     return TokenResponse(
         access_token=create_access_token(user_id, settings),
@@ -141,12 +204,13 @@ async def register(
     )
 
 
-async def _firebase_password_signin(api_key: str, email: str, password: str) -> str | None:
-    """Verify email+password against Firebase Auth; return the Firebase UID.
+async def _firebase_password_signin_response(api_key: str, email: str, password: str) -> dict | None:
+    """Verify email+password against Firebase Auth; return the full response body.
 
     Returns None on bad credentials / unknown user. The Admin SDK can't check
     passwords, so this goes through the Identity Toolkit REST API using the
-    public Web API key.
+    public Web API key. The response includes both `localId` (Firebase UID)
+    and `idToken` (needed to request a verification email as this user).
     """
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
@@ -155,7 +219,7 @@ async def _firebase_password_signin(api_key: str, email: str, password: str) -> 
             json={"email": email, "password": password, "returnSecureToken": True},
         )
     if resp.status_code == 200:
-        return resp.json().get("localId")
+        return resp.json()
     message = resp.json().get("error", {}).get("message", "")
     if any(
         code in message
@@ -163,6 +227,12 @@ async def _firebase_password_signin(api_key: str, email: str, password: str) -> 
     ):
         return None
     raise ExternalServiceError(f"Firebase Auth error during login (HTTP {resp.status_code}): {message[:200]}")
+
+
+async def _firebase_password_signin(api_key: str, email: str, password: str) -> str | None:
+    """Verify email+password against Firebase Auth; return the Firebase UID."""
+    data = await _firebase_password_signin_response(api_key, email, password)
+    return data.get("localId") if data else None
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -247,11 +317,46 @@ async def login(
             await user_doc.reference.set({"firebase_uid": firebase_uid}, merge=True)
 
     await clear_failed_attempts(redis, body.email)
+
+    # Only accounts created through /register carry this flag — pre-existing
+    # accounts (never asked to verify) are grandfathered in and skip the check.
+    if user_data and user_data.get("requires_email_verification"):
+        record = await anyio.to_thread.run_sync(firebase_admin.auth.get_user, firebase_uid)
+        if not record.email_verified:
+            raise EmailNotVerifiedError(
+                "Please verify your email before signing in. Check your inbox for the "
+                "verification link, or request a new one."
+            )
+        await db.collection("users").document(user_id).update({"requires_email_verification": False})
+
     logger.info("User logged in: id=%s", user_id)
     return TokenResponse(
         access_token=create_access_token(user_id, settings),
         refresh_token=create_refresh_token(user_id, settings),
     )
+
+
+@router.post("/resend-verification", response_model=MessageResponse)
+@limiter.limit("10/minute")
+async def resend_verification(
+    request: Request,
+    body: ResendVerificationRequest,
+    settings: SettingsDep,
+) -> MessageResponse:
+    """Re-send the Firebase email-verification link for an unverified account.
+
+    Requires the password so only the account owner can trigger a send —
+    without that, this endpoint would let anyone spam an arbitrary inbox.
+    """
+    if not settings.FIREBASE_WEB_API_KEY:
+        raise ValidationError("Email verification is not configured on this server.")
+
+    signin = await _firebase_password_signin_response(settings.FIREBASE_WEB_API_KEY, body.email, body.password)
+    if not signin or not signin.get("idToken"):
+        raise UnauthorizedError("Invalid email or password")
+
+    await _send_verification_email(settings.FIREBASE_WEB_API_KEY, signin["idToken"])
+    return MessageResponse(message="Verification email sent. Check your inbox.")
 
 
 @router.post("/refresh", response_model=TokenResponse)
@@ -350,10 +455,15 @@ async def oauth_auth(
             "hashed_password": "",
             "firebase_uid": firebase_uid,
             "tier": "free",
+            "marketing_opt_in": body.marketing_opt_in,
             "created_at": now,
             "updated_at": now,
         })
         logger.info("Firebase user created: id=%s email=%s provider=%s", user_id, email, provider)
+        if settings.OMNISEND_API_KEY:
+            await _sync_omnisend_contact(
+                settings.OMNISEND_API_KEY, email=email, marketing_opt_in=body.marketing_opt_in
+            )
 
     logger.info("Firebase user signed in: id=%s provider=%s", user_id, provider)
     return TokenResponse(
