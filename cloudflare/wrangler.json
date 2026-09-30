@@ -93,6 +93,10 @@
     // Unbuffered stdout so container logs reach Workers Logs promptly.
     "PYTHONUNBUFFERED": "1",
     // Public backend origin used by deployed front-end clients.
-    "VITE_API_URL": "https://server.forgefy.dev"
+    "VITE_API_URL": "https://server.forgefy.dev",
+    // Read by src/index.ts as JSON.parse(String(...)) — must stay a JSON
+    // string, not a native array (Cloudflare would hand the Worker an actual
+    // array, and String() on it joins with commas, breaking JSON.parse).
+    "CORS_ORIGINS": "[\"https://forgefy.dev\", \"https://app.forgefy.dev\", \"https://admin.forgefy.dev\"]"
   }
 }
