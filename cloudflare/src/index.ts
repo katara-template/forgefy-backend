@@ -446,6 +446,28 @@ export default {
       const api = await getRandom(workerEnv.API_CONTAINER, API_POOL_SIZE);
       const res = await api.fetch(request);
 
+      // Pass a WebSocket upgrade through exactly as the DO produced it — do NOT
+      // re-wrap it in a new Response.
+      //
+      // containerFetch() answers an upgrade with a 101 whose `.webSocket` is the
+      // client end of the pair it has already wired up for message forwarding
+      // (@cloudflare/containers: dist/lib/container.js returns
+      // `new Response(null, { status, webSocket: client, headers })`). That
+      // handle exists only on that Response object, and the Response
+      // constructor rejects a 101 status unless a `webSocket` is supplied — so
+      // the re-wrap below would both drop the handle and throw a RangeError,
+      // handing the client a 500 instead of a socket and breaking every /ws/*
+      // route.
+      //
+      // CORS headers are deliberately not attached here. A WebSocket handshake
+      // is not a CORS request — browsers never consult these headers for `new
+      // WebSocket(...)` — and each socket is authenticated by the app itself
+      // with the `?token=` JWT, which closes with 4001 on a bad token
+      // (app/api/ws/*). HTTP requests below keep their CORS treatment unchanged.
+      if (res.status === 101 || res.webSocket) {
+        return res;
+      }
+
       // Add CORS headers to the response
       const newHeaders = new Headers(res.headers);
       if (isAllowed) {
