@@ -412,19 +412,20 @@ export default {
     const startedAt = Date.now();
     const requestedUrl = request.url;
     const requestOrigin = request.headers.get("Origin");
-    const allowedOrigins = JSON.parse(String(workerEnv.CORS_ORIGINS ?? "[]")) as string[];
-    const isAllowedOrigin = !!requestOrigin && allowedOrigins.includes(requestOrigin);
 
     console.log(`[cf] request ${request.method} ${requestedUrl}`);
     try {
+      // Parsed inside the try so a malformed CORS_ORIGINS binding falls
+      // through to the catch block below rather than crashing the isolate
+      // before any CORS headers can be attached.
+      const allowedOrigins = JSON.parse(String(workerEnv.CORS_ORIGINS ?? "[]")) as string[];
+      const isAllowed = !!requestOrigin && allowedOrigins.includes(requestOrigin);
+      const origin = requestOrigin || "";
+
       const url = new URL(requestedUrl);
       if (url.pathname.startsWith("/__cf/")) {
         return await handleAdmin(request, workerEnv, url);
       }
-
-      // ── CORS ──
-      const origin = requestOrigin || "";
-      const isAllowed = isAllowedOrigin ?? false;
 
       // Handle preflight
       if (request.method === "OPTIONS") {
@@ -432,7 +433,10 @@ export default {
         if (isAllowed) {
           headers["Access-Control-Allow-Origin"] = origin;
           headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
-          headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With";
+          // Echo back whatever the browser asked to send, rather than a
+          // hardcoded list that silently rejects new frontend headers.
+          headers["Access-Control-Allow-Headers"] =
+            request.headers.get("Access-Control-Request-Headers") ?? "Content-Type, Authorization";
           headers["Access-Control-Allow-Credentials"] = "true";
           headers["Access-Control-Max-Age"] = "86400";
         }
@@ -456,11 +460,22 @@ export default {
         stack: err.stack,
         elapsedMs: Date.now() - startedAt,
       });
+
+      // Parse again defensively: if CORS_ORIGINS itself was what threw above,
+      // this still lets a well-formed binding produce CORS headers here.
+      let isAllowed = false;
+      try {
+        const allowedOrigins = JSON.parse(String(workerEnv.CORS_ORIGINS ?? "[]")) as string[];
+        isAllowed = !!requestOrigin && allowedOrigins.includes(requestOrigin);
+      } catch {
+        // CORS_ORIGINS is malformed — fall through with no CORS headers.
+      }
+
       return new Response(JSON.stringify({ error: err.message, stack: err.stack }), {
         status: 500,
         headers: {
           "content-type": "application/json",
-          ...(isAllowedOrigin && requestOrigin
+          ...(isAllowed && requestOrigin
             ? {
                 "Access-Control-Allow-Origin": requestOrigin,
                 "Access-Control-Allow-Credentials": "true",
